@@ -6335,7 +6335,7 @@ def test_gmail_a_message_with_an_attachment_nests_its_text_in_multipart_alternat
     assert att_h["Content-Type"] == 'text/plain; charset="US-ASCII"; name="notes.txt"'
     assert att_h["Content-Disposition"] == 'attachment; filename="notes.txt"'
     assert att_h["Content-Transfer-Encoding"] == "base64"
-    # one attachment was measured, so only the prefix and the Content-ID equality are pinned
+    # past `f_` the value is Backlot's, so only the prefix and the Content-ID equality are pinned
     assert att_h["X-Attachment-Id"].startswith("f_")
     assert att_h["Content-ID"] == f"<{att_h['X-Attachment-Id']}>"
 
@@ -6348,6 +6348,24 @@ def test_gmail_a_message_with_an_attachment_nests_its_text_in_multipart_alternat
         ("0", ["Content-Type"]),
         ("1", ["Content-Type"]),
     ]
+
+
+def test_gmail_two_attachments_carry_distinct_attachment_ids(gmail_shapes):
+    """Each of a message's two attachments carries its own `X-Attachment-Id`, and its `Content-ID`
+    is that value in angle brackets, as measured on 2026-10-09 and 2026-10-11 over a Google
+    Workspace mailbox: in each of the 11 messages whose two or more parts with an `attachmentId` all
+    carried the header, no value repeated."""
+    client, h = gmail_shapes
+    payload = client.get(
+        f"/gmail/v1/users/me/messages/{served_id('gmail', 'att2')}", headers=h
+    ).json()["payload"]
+    parts = [p for p in payload["parts"] if p.get("filename")]
+    assert [p["filename"] for p in parts] == ["a.txt", "b.txt"]
+    ids = [_hdrs(p)["X-Attachment-Id"] for p in parts]
+    assert len(set(ids)) == 2, f"attachments share X-Attachment-Id: {ids}"
+    for part in parts:
+        part_h = _hdrs(part)
+        assert part_h["Content-ID"] == f"<{part_h['X-Attachment-Id']}>"
 
 
 def _cte(client, h, doc: str) -> dict[str, str | None]:
