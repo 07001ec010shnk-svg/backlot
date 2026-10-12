@@ -333,6 +333,35 @@ def test_s3_a_head_at_the_service_root_is_the_405_without_its_body(live_server, 
     assert _signed(base_url, path, settings.admin_token).status_code == 200
 
 
+# The queries real answered alike at a bucket's path with and without a trailing slash, on a GET
+# and on a HEAD: the same status, header names and body once the request ids are set aside
+# (s3.amazonaws.com, us-east-1, 2026-10-11).
+_BUCKET_QUERIES = [
+    "",
+    "?list-type=2",
+    "?uploads",
+    "?versions",
+    "?logging",
+    "?encryption",
+    "?max-keys=abc",
+    "?acl",
+]
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize("query", _BUCKET_QUERIES)
+def test_s3_a_bucket_path_ending_in_a_slash_is_the_bucket(live_server, query, method):
+    """The bucket's own answer, not a key's: `/{bucket}/` is not the key `""` in that bucket."""
+    base_url, settings = live_server
+    bare, slashed = (
+        _signed(base_url, f"/s3/eng-artifacts{slash}{query}", settings.admin_token, method=method)
+        for slash in ("", "/")
+    )
+    assert slashed.status_code == bare.status_code
+    assert sorted(slashed.headers) == sorted(bare.headers)
+    assert _without_request_ids(slashed.text) == _without_request_ids(bare.text)
+
+
 def test_s3_every_bucket_selector_a_get_answers_is_declared():
     """What a bucket's GET answers is what its OpenAPI declares, so the tool `backlot mcp` hands an
     agent offers each operation the route serves (``backlot.openapi.qp``)."""
@@ -514,6 +543,8 @@ def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_ser
         ("GET", "/s3/people-vault/comp/bands.csv", 200),
         ("HEAD", "/s3/people-vault/comp/bands.csv", 200),
         ("HEAD", "/s3/people-vault", 200),
+        ("GET", "/s3/people-vault/", 200),
+        ("HEAD", "/s3/people-vault/", 200),
     ):
         headers = extra[0] if extra else None
         scoped = _signed(base_url, path, scoped_token, method=method, extra_headers=headers)
