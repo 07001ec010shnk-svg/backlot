@@ -211,6 +211,18 @@ def test_slack_auth_test_identifies_the_caller(client, admin_h, tokens):
     assert admin["user"] == "service-account" and admin["user_id"] == "USERVICE0"
 
 
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_slack_auth_test_answers_reals_members_in_reals_order(client, admin_h, tokens, method):
+    """A user token's `ok: true` answer has real's members in real's order (see the comment in
+    `auth_test`), and the admin token's answer carries `is_enterprise_install: false` too."""
+    user_h = {"Authorization": f"Bearer {tokens['ava@acme.com']}"}
+    me = getattr(client, method)("/slack/api/auth.test", headers=user_h).json()
+    assert list(me) == ["ok", "url", "team", "user", "team_id", "user_id", "is_enterprise_install"]
+    assert me["is_enterprise_install"] is False
+    admin = getattr(client, method)("/slack/api/auth.test", headers=admin_h).json()
+    assert (admin["ok"], admin["is_enterprise_install"]) == (True, False)
+
+
 def _a_channel_id(client, admin_h):
     return client.get("/slack/api/conversations.list", headers=admin_h, params={"limit": 1}).json()[
         "channels"
