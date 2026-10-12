@@ -2027,7 +2027,8 @@ def test_an_objects_subresource_refusals_sit_where_real_puts_them(
     live_server, where, query, headers, status, code, fragment
 ):
     """The parses before the bucket and the credential, the version and the header checks after
-    them and before the key, and the rest after the key, as in the table above."""
+    them and before the key, and the rest after the key, as in the table above, none of them
+    carrying the encryption header an object's own answer does."""
     import httpx
 
     base_url, settings = live_server
@@ -2041,6 +2042,7 @@ def test_an_objects_subresource_refusals_sit_where_real_puts_them(
     r = httpx.get(url, headers=signed)
     assert r.status_code == status
     assert f"<Code>{code}</Code>" in r.text and fragment in r.text
+    assert "x-amz-server-side-encryption" not in r.headers
 
 
 _FULL_RANGE = f"bytes 0-{len(OBJECT_TEXT) - 1}/{len(OBJECT_TEXT)}"
@@ -2078,9 +2080,10 @@ def test_an_objects_own_answer_is_what_real_sends_for_its_object(
     live_server, query, headers, status, content_range, checksum
 ):
     """On a GET and a HEAD, the bytes of the range named or of the whole object, its one part the
-    206 of its whole range, and in checksum mode the object's CRC-64/NVME beside an answer that
-    holds all of it and none beside one that holds less; a signed payload hash that is not the
-    empty body's, or that names an aws-chunked one, is not read."""
+    206 of its whole range, the default encryption ``backlot.routers.s3.object_get`` names, and in
+    checksum mode the object's CRC-64/NVME beside an answer that holds all of it and none beside one
+    that holds less; a signed payload hash that is not the empty body's, or that names an
+    aws-chunked one, is not read."""
     from backlot.routers import s3 as s3_router
 
     base_url, settings = live_server
@@ -2096,6 +2099,7 @@ def test_an_objects_own_answer_is_what_real_sends_for_its_object(
         assert r.headers["content-length"] == str(last - first + 1), method
         assert r.content == (OBJECT_TEXT[first : last + 1] if method == "GET" else b""), method
         assert r.headers["etag"] == etag, method
+        assert r.headers["x-amz-server-side-encryption"] == "AES256", method
         crc = s3_router._crc64nvme(OBJECT_TEXT) if checksum else None
         assert r.headers.get("x-amz-checksum-crc64nvme") == crc, method
         assert r.headers.get("x-amz-checksum-type") == ("FULL_OBJECT" if checksum else None), method
@@ -2749,8 +2753,10 @@ def test_s3_a_head_is_sent_chunked_as_xml_unless_it_is_the_objects_own(
     if length is None:
         assert "content-length" not in r.headers and r.headers["transfer-encoding"] == "chunked"
         assert r.headers["content-type"] == "application/xml"
-        # Nor a range, on a HEAD as on a GET (``backlot.routers.s3.object_get``).
+        # Nor a range or the encryption header, on a HEAD as on a GET
+        # (``backlot.routers.s3.object_get``).
         assert "content-range" not in r.headers
+        assert "x-amz-server-side-encryption" not in r.headers
     else:
         assert r.headers["content-length"] == str(length) and "transfer-encoding" not in r.headers
         assert r.headers["content-type"] == "text/markdown"
@@ -3188,7 +3194,9 @@ def test_boto3_reads_a_buckets_configuration_and_an_objects_and_gets_one_client_
     assert e.value.response["ResponseMetadata"]["RetryAttempts"] == 0
     assert s3.get_bucket_location(Bucket=bucket)["LocationConstraint"] is None  # us-east-1
     assert key in {o["Key"] for o in s3.list_objects_v2(Bucket=bucket)["Contents"]}
-    assert s3.get_object(Bucket=bucket, Key=key)["Body"].read() == OBJECT_TEXT
+    got = s3.get_object(Bucket=bucket, Key=key)
+    # The default the bucket's encryption names, as boto3 reads it off the object's answer.
+    assert (got["Body"].read(), got["ServerSideEncryption"]) == (OBJECT_TEXT, "AES256")
 
 
 # --- what real checks of a write before it performs it -----------------------------------------

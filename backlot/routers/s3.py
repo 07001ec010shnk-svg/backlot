@@ -1888,6 +1888,9 @@ async def object_get(request: Request, bucket: str, key: str):
         "ETag": synth.s3_etag(row["key"], row["content"]),
         "Last-Modified": synth.s3_http_date(ts),
         "Accept-Ranges": "bytes",
+        # SSE-S3, the default `_ANSWERED["encryption"]` declares, which real names on an object's
+        # own 200 and 206, GET and HEAD alike (measured in us-east-1 on 2026-10-11).
+        "x-amz-server-side-encryption": "AES256",
     }
     ctype = row["content_type"] or "text/plain"
     # Set Content-Type via the headers dict, not the `media_type=` kwarg: Starlette auto-appends
