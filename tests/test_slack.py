@@ -473,24 +473,6 @@ def test_slack_conversations_list_rejects_an_unknown_type(client, admin_h):
     assert mixed == {"ok": False, "error": "invalid_types"}
 
 
-@pytest.mark.parametrize(
-    "param, error", [("latest", "invalid_ts_latest"), ("oldest", "invalid_ts_oldest")]
-)
-@pytest.mark.parametrize(
-    "value", ["not-a-ts", "inf", "-inf", "nan", "Infinity", "-Infinity", "NaN"]
-)
-def test_slack_history_rejects_a_malformed_timestamp(client, admin_h, param, value, error):
-    """Real Slack answers 200 with the named error for each spelling, those `float()` refuses and
-    those it reads as infinite or NaN alike — `_slack_ts` records the measurement."""
-    r = client.get(
-        "/slack/api/conversations.history",
-        headers=admin_h,
-        params={"channel": _a_channel_id(client, admin_h), param: value},
-    )
-    assert r.status_code == 200
-    assert r.json() == {"ok": False, "error": error}
-
-
 @pytest.mark.parametrize("path", ["conversations.list", "users.list"])
 def test_slack_rejects_an_invalid_cursor(client, admin_h, path):
     """An undecodable cursor was treated as offset 0, so a client paginating with a corrupted
@@ -500,13 +482,43 @@ def test_slack_rejects_an_invalid_cursor(client, admin_h, path):
         assert j == {"ok": False, "error": "invalid_cursor"}, (path, bad)
 
 
-def test_slack_history_rejects_an_invalid_cursor(client, admin_h):
-    j = client.get(
+@pytest.mark.parametrize(
+    "params, error",
+    [
+        # One unreadable argument.
+        *(
+            ({param: value}, error)
+            for param, error in (("latest", "invalid_ts_latest"), ("oldest", "invalid_ts_oldest"))
+            for value in ("not-a-ts", "inf", "-inf", "nan", "Infinity", "-Infinity", "NaN")
+        ),
+        ({"cursor": "zzz"}, "invalid_cursor"),
+        # Two or more unreadable arguments.
+        ({"oldest": "abc", "latest": "abc"}, "invalid_ts_latest"),
+        ({"oldest": "abc", "cursor": "zzz"}, "invalid_ts_oldest"),
+        ({"latest": "abc", "cursor": "zzz"}, "invalid_ts_latest"),
+        ({"oldest": "abc", "latest": "abc", "cursor": "zzz"}, "invalid_ts_latest"),
+        ({"cursor": "zzz", "latest": "abc", "oldest": "abc"}, "invalid_ts_latest"),
+        ({"oldest": "inf", "latest": "inf"}, "invalid_ts_latest"),
+        ({"oldest": "abc", "latest": "inf"}, "invalid_ts_latest"),
+        ({"oldest": "inf", "latest": "abc"}, "invalid_ts_latest"),
+        ({"oldest": "nan", "cursor": "zzz"}, "invalid_ts_oldest"),
+        # An empty timestamp is none, and a channel that names nothing is answered first.
+        ({"latest": "", "cursor": "zzz"}, "invalid_cursor"),
+        ({"oldest": "", "cursor": "zzz"}, "invalid_cursor"),
+        ({"channel": "C00000000", "latest": "abc", "cursor": "zzz"}, "channel_not_found"),
+    ],
+)
+def test_slack_history_names_the_first_error_real_would(client, admin_h, params, error):
+    """Real Slack answers 200 with the named error for one unreadable argument, and for two or
+    more with the error of the argument it reads first. `_slack_ts` records the measured
+    spellings, and the comment above the checks in `conversations_history` records the order."""
+    r = client.get(
         "/slack/api/conversations.history",
         headers=admin_h,
-        params={"channel": _a_channel_id(client, admin_h), "cursor": "bogus"},
-    ).json()
-    assert j == {"ok": False, "error": "invalid_cursor"}
+        params={"channel": _a_channel_id(client, admin_h), **params},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"ok": False, "error": error}
 
 
 def test_slack_members_are_the_channels_own_speakers(client, admin_h, tokens, ro_conn):
