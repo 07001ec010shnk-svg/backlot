@@ -187,7 +187,13 @@ def test_atlassian_lists_only_the_containers_the_caller_can_open(tmp_path):
             ):
                 refused = c.get(f"/atlassian{path}", headers=ava)
                 assert refused.status_code == 404, path
-                assert refused.json()["message"] == "No space with the given key exists"
+                assert refused.json() == {
+                    "statusCode": 404,
+                    "message": (
+                        "org.springframework.web.server.ResponseStatusException: "
+                        f'404 NOT_FOUND "No space found with key : {spelling}"'
+                    ),
+                }
                 read = c.get(f"/atlassian{path}", headers=bob)
                 assert read.status_code == (200 if bob_reads else 404), path
         # ... and the roster she is refused names bob against that space.
@@ -1141,12 +1147,23 @@ def test_confluence_single_space_get(client, admin_h):
         "operation": "read",
         "targetType": "space",
     }
-    # An unknown space is the same atlassian-shaped 404 with the expansion and without it, so a
-    # space the caller cannot reach cannot be told apart from one that is not there.
-    for path in ("/wiki/rest/api/space/NOSUCH", "/wiki/rest/api/space/NOSUCH?expand=permissions"):
-        absent = client.get(f"/atlassian{path}", headers=admin_h)
-        assert absent.status_code == 404, path
-        assert absent.json()["message"] == "No space with the given key exists", path
+    # No space has these keys, and each is refused naming it as `errors_atlassian.space_not_found`
+    # records, with the expansion and without it.
+    for sent, named in (
+        ("NOSUCH", "NOSUCH"),
+        ("nosuch?expand=permissions", "nosuch"),
+        ("%20NOSUCH", " NOSUCH"),
+        ("NO%3FSUCH", "NO?SUCH"),
+    ):
+        absent = client.get(f"/atlassian/wiki/rest/api/space/{sent}", headers=admin_h)
+        assert absent.status_code == 404, sent
+        assert absent.json() == {
+            "statusCode": 404,
+            "message": (
+                "org.springframework.web.server.ResponseStatusException: "
+                f'404 NOT_FOUND "No space found with key : {named}"'
+            ),
+        }, sent
 
 
 # --- OpenAPI enrichment: atlassian (jira + confluence) ------------------------------------

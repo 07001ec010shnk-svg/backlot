@@ -283,6 +283,25 @@ def no_space_with_key(space_key: str) -> AtlassianError:
     return _service_refusal(404, "api.NotFoundException", f"No space with key : {space_key}")
 
 
+def space_not_found(space_key: str) -> AtlassianError:
+    """``space/{key}``'s refusal of a key naming no space, with ``expand`` and without: two
+    members, the message naming the key as the path decodes it, in the case it was sent in
+    (``space/nosuch`` names ``nosuch``, ``space/NO%20SUCH`` names ``NO SUCH``). Measured on
+    Confluence Cloud, 2026-10-11 and 2026-10-12. ``content`` refuses the same key with
+    :func:`no_space_with_key`.
+    """
+    return AtlassianError(
+        404,
+        {
+            "statusCode": 404,
+            "message": (
+                "org.springframework.web.server.ResponseStatusException: "
+                f'404 NOT_FOUND "No space found with key : {space_key}"'
+            ),
+        },
+    )
+
+
 def unknown_content_type(type_value: str) -> AtlassianError:
     """`content`'s refusal of a content type Confluence does not have, named as sent, when neither
     a space nor a title is given. The types it has, and the measurement, are

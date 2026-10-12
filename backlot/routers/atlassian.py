@@ -1301,10 +1301,11 @@ def _space_keys(request: Request) -> list[str] | None:
 def _require_space(request: Request, conn, key: str) -> str:
     """The container behind a space key the caller can reach — `_require_project` for Confluence.
 
-    Both space reads answer an unreachable key with the SAME ``404 {"message": "No space with the
-    given key exists"}`` a key naming nothing gets, so neither confirms the space exists — worth
-    withholding because ``?expand=permissions`` names a principal granted a space the caller cannot
-    open. Unmeasured for a scoped caller, see :func:`_reachable_spaces`.
+    Both space reads answer an unreachable key with the 404 a key naming nothing gets
+    (:func:`errors_atlassian.space_not_found`, which names only the key the caller sent), so neither
+    confirms the space exists — worth withholding because ``?expand=permissions`` names a principal
+    granted a space the caller cannot open. Unmeasured for a scoped caller, see
+    :func:`_reachable_spaces`.
     """
     ids = auth.visible_ids(request, _confluence_caller(request))
     container = _space_container_for_key(conn, key)
@@ -1315,7 +1316,7 @@ def _require_space(request: Request, conn, key: str) -> str:
         ids is None or store.has_visible_document(conn, "confluence", container, ids)
     ):
         return container
-    raise HTTPException(status_code=404, detail="No space with the given key exists")
+    raise errors_atlassian.space_not_found(key)
 
 
 # The thirteen keys real names under `_expandable` on a space, in real's own order. Measured on
