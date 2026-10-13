@@ -555,6 +555,8 @@ def test_s3_a_request_in_a_bucket_the_caller_cannot_see_is_nosuchbucket(live_ser
         ("DELETE", "/s3/people-vault/x.txt?tagging", 501),
         ("GET", "/s3/people-vault/comp/bands.csv", 200),
         ("HEAD", "/s3/people-vault/comp/bands.csv", 200),
+        ("GET", "/s3/people-vault/comp/bands.csv", 304, {"If-None-Match": "*"}),
+        ("HEAD", "/s3/people-vault/comp/bands.csv", 412, {"If-Match": '"0000"'}),
         ("HEAD", "/s3/people-vault", 200),
         ("GET", "/s3/people-vault/", 200),
         ("HEAD", "/s3/people-vault/", 200),
@@ -2075,6 +2077,8 @@ _OBJECT_ORDER_ROWS = [
     ("present", "response-content-type=a%22b&versionId=garbage", {}, *_OPEN_QUOTE),
     ("present", "response-content-type=a%22b", {"Range": "bytes=999-"}, *_OPEN_QUOTE),
     ("present", "response-content-type=a%22b", _GARBAGE_MODE, *_OPEN_QUOTE),
+    ("present", "response-content-type=a%22b", {"If-None-Match": "*"}, *_OPEN_QUOTE),
+    ("present", "response-content-type=a%22b", {"If-Match": '"0000"'}, *_OPEN_QUOTE),
     ("present", "response-content-type=%ED%95%9C&response-content-type=text/csv", {},
      *_NOT_LATIN_1),
     ("present", "response-content-disposition=attachment%3B%20filename%3D%22%ED%95%9C.txt%22", {},
@@ -6433,3 +6437,208 @@ def test_a_prefix_or_marker_no_character_steps_past_is_a_page_not_a_500(
         r = _s3_get(big_bucket_client, f"/s3/encoded-bucket?{query}", token)
         assert r.status_code == 200, (query, r.status_code, r.text[:200])
         assert ET.fromstring(r.text).tag == f"{{{S3NS}}}ListBucketResult", query
+
+
+_IM, _INM = "If-Match", "If-None-Match"
+_IMS, _IUS = "If-Modified-Since", "If-Unmodified-Since"
+_BAD_MODE = ("x-amz-checksum-mode", "bogus")
+_UNSATISFIABLE = ("Range", "bytes=100-200")
+_SIX_OVERRIDES = (
+    "response-content-type=text%2Fx-probe&response-content-language=ko"
+    "&response-expires=Thu%2C%2001%20Jan%202099%2000%3A00%3A00%20GMT"
+    "&response-cache-control=no-cache"
+    "&response-content-disposition=attachment%3B%20filename%3D%22a.txt%22"
+    "&response-content-encoding=identity"
+)
+
+# Real S3's answer to each condition (`_precondition` in `backlot.routers.s3` has the dates), which
+# a GET and a HEAD of a 12-byte object got alike: the headers sent, a header named twice sent as two
+# lines, the query, the status and the condition a 412 names. `{etag}` is the object's ETag,
+# `{bare}` the same unquoted and `{upper}` in upper case; `{lm}` is its Last-Modified, `{before}` a
+# day earlier, `{after}` a second later and `{prev}` the last day of the month before, each written
+# as the row formats it.
+# fmt: off
+_CONDITION_ROWS = [
+    # An ETag condition (`backlot.routers.s3._etag_matches`).
+    ([(_INM, "{etag}")], "", 304, None),
+    ([(_INM, "{bare}")], "", 304, None),
+    ([(_INM, "W/{etag}")], "", 304, None),
+    ([(_INM, "w/{etag}")], "", 304, None),
+    ([(_INM, "W/W/{etag}")], "", 304, None),
+    ([(_INM, "x{etag}y")], "", 304, None),
+    ([(_INM, "*")], "", 304, None),
+    ([(_INM, '"*"')], "", 304, None),
+    ([(_INM, '"0000", {etag}')], "", 304, None),
+    ([(_INM, '"0000" {bare}')], "", 304, None),
+    ([(_INM, '"0000";{etag}')], "", 304, None),
+    ([(_INM, '" {bare} "')], "", 304, None),
+    ([(_INM, 'W/"0000",{bare}')], "", 304, None),
+    ([(_INM, '"0000"'), (_INM, "{etag}")], "", 304, None),
+    ([(_INM, "W/{bare}")], "", 200, None),
+    ([(_INM, "W/*")], "", 200, None),
+    ([(_INM, '"0000";{bare}')], "", 200, None),
+    ([(_INM, "'{bare}'")], "", 200, None),
+    ([(_INM, "{upper}")], "", 200, None),
+    ([(_INM, '"0000"')], "", 200, None),
+    ([(_INM, "")], "", 200, None),
+    ([(_IM, "{etag}")], "", 200, None),
+    ([(_IM, "w/{etag}")], "", 200, None),
+    ([(_IM, '"*"')], "", 200, None),
+    ([(_IM, '"0000", {bare}')], "", 200, None),
+    ([(_IM, '"0000"'), (_IM, "{etag}")], "", 200, None),
+    ([(_IM, '"0000"')], "", 412, _IM),
+    ([(_IM, "W/{bare}")], "", 412, _IM),
+    ([(_IM, "W/*")], "", 412, _IM),
+    ([(_IM, '"0000";{bare}')], "", 412, _IM),
+    ([(_IM, "{upper}")], "", 412, _IM),
+    ([(_IM, "")], "", 412, _IM),
+    # A date (`backlot.routers.s3._http_date`), and an `If-Modified-Since` only up to now.
+    ([(_IMS, "{lm:%a, %d %b %Y %H:%M:%S GMT}")], "", 304, None),
+    ([(_IMS, "{lm:%A, %d-%b-%y %H:%M:%S GMT}")], "", 304, None),
+    ([(_IMS, "{lm:%a %b} {lm.day:2} {lm:%H:%M:%S %Y}")], "", 304, None),
+    ([(_IMS, "{lm:%a, %d %b %Y %H:%M:%S} GMT+00:00")], "", 304, None),
+    ([(_IMS, "{after:%a, %d %b %Y %H:%M:%S GMT}")], "", 304, None),
+    ([(_IMS, "{lm:%a, %d %b %y %H:%M:%S GMT}")], "", 200, None),
+    ([(_IMS, "{lm:%d %b %Y %H:%M:%S GMT}")], "", 200, None),
+    ([(_IMS, "{lm:%a, %d %b %Y %H:%M:%S} UT")], "", 200, None),
+    ([(_IMS, "{lm:%a, %d %b %Y %H:%M:%S} Z")], "", 200, None),
+    ([(_IMS, "{lm:%a, %d %b %Y %H:%M:%S}")], "", 200, None),
+    ([(_IMS, "{lm:%a, %d %b %Y %H:%M:%S GMT} xyz")], "", 200, None),
+    ([(_IMS, "{lm:%Y%m%dT%H%M%SZ}")], "", 200, None),
+    ([(_IMS, "{before:%a, %d %b %Y %H:%M:%S GMT}")], "", 200, None),
+    ([(_IMS, "Fri, 01 Jan 2100 00:00:00 GMT")], "", 200, None),
+    ([(_IMS, "Tue, 13 Oct 10000 00:00:00 GMT")], "", 200, None),
+    ([(_IMS, "garbage")], "", 200, None),
+    ([(_IMS, "garbage"), (_IMS, "{lm:%a, %d %b %Y %H:%M:%S GMT}")], "", 200, None),
+    ([(_IMS, "")], "", 200, None),
+    ([(_IUS, "{before:%a, %d %b %Y %H:%M:%S GMT}")], "", 412, _IUS),
+    ([(_IUS, "Thu, 32 {prev:%b %Y} 00:00:00 GMT")], "", 412, _IUS),
+    ([(_IUS, "Thu, 01 Jan 1970 00:00:00 GMT")], "", 412, _IUS),
+    ([(_IUS, "{lm:%a, %d %b %Y %H:%M:%S GMT}")], "", 200, None),
+    ([(_IUS, "{before:%a, %d %b %y %H:%M:%S GMT}")], "", 200, None),
+    ([(_IUS, "Wed, 31 Dec 1969 23:59:59 GMT")], "", 200, None),
+    ([(_IUS, "Thu, 01 Jan 1970 00:00:00 +0100")], "", 200, None),
+    ([(_IUS, "garbage")], "", 200, None),
+    ([(_IUS, "{before:%a, %d %b %Y %H:%M:%S GMT}"), (_IUS, "Fri, 01 Jan 2100 00:00:00 GMT")],
+     "", 412, _IUS),
+    # Two conditions at once, in RFC 9110's order.
+    ([(_IM, '"0000"'), (_IUS, "{lm:%a, %d %b %Y %H:%M:%S GMT}")], "", 412, _IM),
+    ([(_IM, "{etag}"), (_IUS, "Thu, 01 Jan 1970 00:00:00 GMT")], "", 200, None),
+    ([(_IM, "{etag}"), (_INM, "{etag}")], "", 304, None),
+    ([(_IM, '"0000"'), (_INM, "{etag}")], "", 412, _IM),
+    ([(_IUS, "{before:%a, %d %b %Y %H:%M:%S GMT}"), (_INM, "{etag}")], "", 412, _IUS),
+    ([(_INM, "{etag}"), (_IMS, "{before:%a, %d %b %Y %H:%M:%S GMT}")], "", 304, None),
+    ([(_INM, '"0000"'), (_IMS, "{lm:%a, %d %b %Y %H:%M:%S GMT}")], "", 200, None),
+    # Ahead of a range or a part the object lacks, and beside the ones it has.
+    ([(_IM, '"0000"'), _UNSATISFIABLE], "", 412, _IM),
+    ([(_INM, "{etag}"), _UNSATISFIABLE], "", 304, None),
+    ([(_INM, "{etag}"), ("Range", "bytes=0-3")], "", 304, None),
+    ([(_IM, "{etag}"), ("Range", "bytes=0-3")], "", 206, None),
+    ([(_IM, '"0000"')], "partNumber=2", 412, _IM),
+    ([(_INM, "{etag}")], "partNumber=2", 304, None),
+    ([(_INM, "{etag}")], "partNumber=1", 304, None),
+    ([(_INM, '"0000"')], "partNumber=1", 206, None),
+    ([(_INM, "{etag}")], "versionId=null", 304, None),
+    ([(_IM, '"0000"')], "versionId=null", 412, _IM),
+    # Beside the response overrides, which a 304 carries but the type and a 412 does not.
+    ([(_INM, "{etag}")], "response-content-type=text%2Fx-probe", 304, None),
+    ([(_INM, "{etag}")], _SIX_OVERRIDES, 304, None),
+    ([(_IMS, "{lm:%a, %d %b %Y %H:%M:%S GMT}")], _SIX_OVERRIDES, 304, None),
+    ([(_INM, "{etag}"), ("Range", "bytes=0-3")], _SIX_OVERRIDES, 304, None),
+    ([(_IM, '"0000"')], _SIX_OVERRIDES, 412, _IM),
+    ([(_IUS, "{before:%a, %d %b %Y %H:%M:%S GMT}")], _SIX_OVERRIDES, 412, _IUS),
+    # A good checksum mode is no obstacle, and a bad one is refused ahead of a 304 and a 412.
+    ([("x-amz-checksum-mode", "ENABLED"), (_INM, "{etag}")], "", 304, None),
+    ([("x-amz-checksum-mode", "ENABLED"), (_IM, '"0000"')], "", 412, _IM),
+    ([_BAD_MODE, (_IM, '"0000"')], "", 400, None),
+    ([_BAD_MODE, (_INM, "{etag}")], "", 400, None),
+    ([_BAD_MODE, (_IMS, "{lm:%a, %d %b %Y %H:%M:%S GMT}")], "", 400, None),
+    ([("x-amz-checksum-mode", ""), (_IM, '"0000"')], "", 400, None),
+    ([_BAD_MODE, (_IM, '"0000"'), _UNSATISFIABLE], "", 400, None),
+    ([_BAD_MODE, (_IM, '"0000"')], "partNumber=2", 400, None),
+]
+# fmt: on
+
+
+@pytest.mark.parametrize(
+    "sent, query, status, condition",
+    _CONDITION_ROWS,
+    ids=[
+        "&".join(f"{name}:{value}" for name, value in r[0]) + (f"?{r[1]}" if r[1] else "")
+        for r in _CONDITION_ROWS
+    ],
+)
+def test_an_objects_conditions_answer_as_real_s3_does(live_server, sent, query, status, condition):
+    """Each row on a GET and a HEAD: a 304 carries the ETag, the Last-Modified and the overrides
+    but the type, and none of the object's own headers, a 412 names its condition and carries no
+    override, a 400 the checksum mode, and the rest is the object's own answer."""
+    import httpx
+
+    base_url, settings = live_server
+    plain = _signed(base_url, OBJECT_PATH, settings.admin_token)
+    etag, lm = plain.headers["etag"], plain.headers["last-modified"]
+    moment = datetime.strptime(lm, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc)
+    values = {
+        "etag": etag,
+        "bare": etag.strip('"'),
+        "upper": etag.upper(),
+        "lm": moment,
+        "before": moment - timedelta(days=1),
+        "after": moment + timedelta(seconds=1),
+        "prev": moment.replace(day=1) - timedelta(days=1),
+    }
+    sent = [(name, value.format(**values)) for name, value in sent]
+    names = [name for name, _ in sent]
+    signed_headers = {name: value for name, value in sent if names.count(name) == 1}
+    repeated = [(name, value) for name, value in sent if names.count(name) > 1]
+    path = f"{OBJECT_PATH}?{query}" if query else OBJECT_PATH
+    # Each override but the type, under the header it names.
+    carried = {
+        name.removeprefix("response-"): value
+        for name, value in parse_qsl(query)
+        if name.startswith("response-") and name != "response-content-type"
+    }
+    for method in ("GET", "HEAD"):
+        url, signed = _sign_get(
+            base_url, path, settings.admin_token, method=method, extra_headers=signed_headers
+        )
+        r = httpx.request(method, url, headers=[*signed.items(), *repeated])
+        assert r.status_code == status, (method, r.text)
+        if status == 304:
+            assert r.content == b"", method
+            gateway = {"date", "server", "x-amz-request-id", "x-amz-id-2"}
+            own = {name: value for name, value in r.headers.items() if name not in gateway}
+            assert own == {"etag": etag, "last-modified": lm, **carried}, method
+        elif status in (400, 412):
+            assert r.headers["content-type"] == "application/xml", method
+            assert "x-amz-server-side-encryption" not in r.headers, method
+            assert not set(carried) & set(r.headers), method
+            if method == "HEAD":
+                assert r.content == b"" and "content-length" not in r.headers
+            elif status == 400:
+                assert (
+                    "<Code>InvalidRequest</Code><Message>Value for x-amz-checksum-mode header is "
+                    "invalid.</Message>" in r.text
+                )
+            else:
+                assert (
+                    "<Code>PreconditionFailed</Code><Message>At least one of the pre-conditions "
+                    f"you specified did not hold</Message><Condition>{condition}</Condition>"
+                    in r.text
+                )
+        else:
+            assert r.headers["etag"] == etag, method
+            assert r.headers["x-amz-server-side-encryption"] == "AES256", method
+            length = int(r.headers["content-length"])
+            assert r.content == (OBJECT_TEXT[:length] if method == "GET" else b""), method
+
+
+@pytest.mark.parametrize("selector", ["tagging", "acl"])
+@pytest.mark.parametrize("condition", [{"If-Match": '"0000"'}, {"If-None-Match": "*"}])
+def test_a_condition_is_not_read_beside_an_objects_subresource(live_server, selector, condition):
+    """A key's `?tagging` and `?acl` read no condition (`backlot.routers.s3.object_get`)."""
+    base_url, settings = live_server
+    r = _signed(
+        base_url, f"{OBJECT_PATH}?{selector}", settings.admin_token, extra_headers=condition
+    )
+    assert r.status_code == 200
