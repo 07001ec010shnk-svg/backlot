@@ -192,7 +192,8 @@ Message and thread ids are Gmail-shaped — 16 lowercase hex under 2^63, sharing
 real API does — and map back to the corpus document; an id the real API could not parse is refused
 the same way. On both listings a `pageToken` that does not parse is real's 400 `Invalid pageToken`
 and an empty one is the first page, refused where each listing refuses it beside `maxResults`
-(`backlot.routers.google._gmail_page`).
+(`backlot.routers.google._gmail_page`). A `HEAD` and a trailing slash are answered as on Drive,
+in the section below.
 
 ### Google Drive, Docs, Sheets, Slides — `/drive/v3` `/docs/v1` `/sheets/v4` `/slides/v1`
 
@@ -355,6 +356,17 @@ as `ROWS`. A data-filter body is written into the request message the way real's
 writes it: every value it cannot convert and every name the request message lacks is refused in one
 400, each named by its proto path where it has one. Measured against the live Sheets API on
 2026-10-04, and a non-ASCII letter's case on 2026-10-05.
+
+**A `HEAD` on Drive or Gmail is the `GET` with the body left off**, status for status, and declares
+a `content-length` only on a download's 200, where it is the length of the bytes the `GET` serves;
+every other answer declares none, as real's chunked answers do. `callback` does not reach a `HEAD`
+but as the 503 a download answers beside an uncallable name. A `HEAD` on Docs, Sheets or Slides is
+the host's 400 with an empty `text/html; charset=utf-8` body, ahead of the credential and of
+`$.xgafv`; real Sheets answers some `HEAD`s with its HTML 404 page instead, which is not modelled
+(`backlot.errors.google.head_refusal`). Trailing slashes are not part of a path on any of the five
+families — `files/`, `labels///` and `spreadsheets/{id}/` each answer what the path without them
+answers — while a doubled slash mid-path is kept, as a segment no route matches. Measured against
+the live Drive, Gmail, Sheets, Docs and Slides APIs on 2026-10-11.
 
 ### HubSpot — `/hubspot/crm/v3` `/hubspot/crm/v4`
 
