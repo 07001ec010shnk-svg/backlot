@@ -187,7 +187,8 @@ def _instance(path: str) -> str:
 
 
 def integer_conversion_failure(path: str, name: str, values: list[str]) -> AtlassianError:
-    """The 400 either product answers for a query parameter it cannot read as an ``int``.
+    """The 400 either product answers for a query parameter it cannot read as an ``int``, which
+    Jira also answers for one it cannot read as a boolean.
 
     Measured on brekkylab.atlassian.net, 2026-09-14, on `GET /rest/api/3/issue/{key}/comment` and
     `GET /wiki/rest/api/space`. The two bodies share no key: Jira's is RFC 7807 naming the

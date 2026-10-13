@@ -1750,11 +1750,127 @@ def test_jira_comma_joins_a_repeated_string_parameter_before_validating_it(paged
 
 
 @pytest.mark.parametrize("slash", ["", "/"])
-def test_jira_search_refuses_an_integer_parameter_it_cannot_convert(client, admin_h, slash):
-    r = client.get(f"/atlassian/rest/api/3/search/jql{slash}?maxResults=abc", headers=admin_h)
+@pytest.mark.parametrize(
+    "param,value", [("maxResults", "abc"), ("fieldsByKeys", "x"), ("reconcileIssues", "a")]
+)
+def test_jira_search_refuses_a_parameter_it_cannot_convert(client, admin_h, slash, param, value):
+    r = client.get(f"/atlassian/rest/api/3/search/jql{slash}?{param}={value}", headers=admin_h)
     assert r.status_code == 400, r.text
-    assert r.json()["detail"] == "Failed to convert 'maxResults' with value: 'abc'"
+    assert r.json()["detail"] == f"Failed to convert '{param}' with value: '{value}'"
     assert r.json()["instance"] == f"/rest/api/3/search/jql{slash}"
+
+
+_ANY_PROJECT = "jql=project%20is%20not%20EMPTY"
+_BOUNDED = f"{_ANY_PROJECT}&maxResults=1"
+
+
+@pytest.mark.parametrize(
+    "query,named",
+    [
+        # fieldsByKeys: the first value, Java's trim off it, matched in any case
+        (f"{_BOUNDED}&fieldsByKeys=true", None),
+        (f"{_BOUNDED}&fieldsByKeys=TRUE", None),
+        (f"{_BOUNDED}&fieldsByKeys=False", None),
+        (f"{_BOUNDED}&fieldsByKeys=yes", None),
+        (f"{_BOUNDED}&fieldsByKeys=ON", None),
+        (f"{_BOUNDED}&fieldsByKeys=no", None),
+        (f"{_BOUNDED}&fieldsByKeys=off", None),
+        (f"{_BOUNDED}&fieldsByKeys=1", None),
+        (f"{_BOUNDED}&fieldsByKeys=0", None),
+        (f"{_BOUNDED}&fieldsByKeys=", None),
+        (f"{_BOUNDED}&fieldsByKeys=%20true", None),
+        (f"{_BOUNDED}&fieldsByKeys=true%20", None),
+        (f"{_BOUNDED}&fieldsByKeys=%01true", None),
+        (f"{_BOUNDED}&fieldsByKeys=true%1F", None),
+        (f"{_BOUNDED}&fieldsByKeys=ye%C5%BF", None),
+        (f"{_BOUNDED}&fieldsByKeys=yes&fieldsByKeys=x", None),
+        (f"{_BOUNDED}&fieldsByKeys=yes&fieldsByKeys=%20", None),
+        (f"{_BOUNDED}&fieldsByKeys=x", ("fieldsByKeys", "x")),
+        (f"{_BOUNDED}&fieldsByKeys=null", ("fieldsByKeys", "null")),
+        (f"{_BOUNDED}&fieldsByKeys=2", ("fieldsByKeys", "2")),
+        (f"{_BOUNDED}&fieldsByKeys=y", ("fieldsByKeys", "y")),
+        (f"{_BOUNDED}&fieldsByKeys=n", ("fieldsByKeys", "n")),
+        (f"{_BOUNDED}&fieldsByKeys=%20", ("fieldsByKeys", " ")),
+        (f"{_BOUNDED}&fieldsByKeys=%01", ("fieldsByKeys", "\x01")),
+        (f"{_BOUNDED}&fieldsByKeys=tr%20ue", ("fieldsByKeys", "tr ue")),
+        (f"{_BOUNDED}&fieldsByKeys=%C2%A0true", ("fieldsByKeys", "\xa0true")),
+        (f"{_BOUNDED}&fieldsByKeys=%C2%85true", ("fieldsByKeys", "\x85true")),
+        (f"{_BOUNDED}&fieldsByKeys=%E2%80%80true", ("fieldsByKeys", "\u2000true")),
+        (f"{_BOUNDED}&fieldsByKeys=x&fieldsByKeys=yes", ("fieldsByKeys", None)),
+        (f"{_BOUNDED}&fieldsByKeys=&fieldsByKeys=yes", ("fieldsByKeys", None)),
+        # reconcileIssues: every value, the blank ones passed over
+        (f"{_BOUNDED}&reconcileIssues=1", None),
+        (f"{_BOUNDED}&reconcileIssues=-1", None),
+        (f"{_BOUNDED}&reconcileIssues=%2B1", None),
+        (f"{_BOUNDED}&reconcileIssues=%201", None),
+        (f"{_BOUNDED}&reconcileIssues=1%20", None),
+        (f"{_BOUNDED}&reconcileIssues=1%202", None),
+        (f"{_BOUNDED}&reconcileIssues=%D9%A1", None),
+        (f"{_BOUNDED}&reconcileIssues=9223372036854775807", None),
+        (f"{_BOUNDED}&reconcileIssues=-9223372036854775808", None),
+        (f"{_BOUNDED}&reconcileIssues=", None),
+        (f"{_BOUNDED}&reconcileIssues=%20", None),
+        (f"{_BOUNDED}&reconcileIssues=1&reconcileIssues=2", None),
+        (f"{_BOUNDED}&reconcileIssues=&reconcileIssues=1", None),
+        (f"{_BOUNDED}&reconcileIssues=%20&reconcileIssues=1", None),
+        (f"{_BOUNDED}&reconcileIssues=a", ("reconcileIssues", "a")),
+        (f"{_BOUNDED}&reconcileIssues=1.5", ("reconcileIssues", "1.5")),
+        (f"{_BOUNDED}&reconcileIssues=1%2C2", ("reconcileIssues", "1,2")),
+        (f"{_BOUNDED}&reconcileIssues=1_0", ("reconcileIssues", "1_0")),
+        (f"{_BOUNDED}&reconcileIssues=%C2%A01", ("reconcileIssues", "\xa01")),
+        (f"{_BOUNDED}&reconcileIssues=%011", ("reconcileIssues", "\x011")),
+        (
+            f"{_BOUNDED}&reconcileIssues=9223372036854775808",
+            ("reconcileIssues", "9223372036854775808"),
+        ),
+        (
+            f"{_BOUNDED}&reconcileIssues=-9223372036854775809",
+            ("reconcileIssues", "-9223372036854775809"),
+        ),
+        (f"{_BOUNDED}&reconcileIssues=1&reconcileIssues=a", ("reconcileIssues", None)),
+        (f"{_BOUNDED}&reconcileIssues=a&reconcileIssues=1", ("reconcileIssues", None)),
+        (
+            f"{_BOUNDED}&reconcileIssues=1&reconcileIssues=9223372036854775808",
+            ("reconcileIssues", None),
+        ),
+        # two refusals at once: the one real names
+        (f"{_ANY_PROJECT}&maxResults=abc&fieldsByKeys=x", ("maxResults", "abc")),
+        (f"{_ANY_PROJECT}&fieldsByKeys=x&maxResults=abc", ("maxResults", "abc")),
+        (f"{_ANY_PROJECT}&reconcileIssues=a&maxResults=abc", ("maxResults", "abc")),
+        (f"{_BOUNDED}&reconcileIssues=a&fieldsByKeys=x", ("fieldsByKeys", "x")),
+        (f"{_ANY_PROJECT}&fieldsByKeys=x&nextPageToken=bogus", ("fieldsByKeys", "x")),
+        (f"{_ANY_PROJECT}&reconcileIssues=a&maxResults=0", ("reconcileIssues", "a")),
+    ],
+)
+def test_jira_search_get_converts_fields_by_keys_and_reconcile_issues(
+    client, admin_h, query, named
+):
+    """Real's answers to the GET form, for the rules `_bool_param` and `_jira_long_list_param`
+    describe: ``named`` is the parameter a 400 names and the value it names as sent, or ``None``
+    where the parameter repeats and the 400 names the array (see
+    `test_jira_reports_the_whole_array_when_the_first_repeated_value_will_not_convert`). A row
+    without one is served."""
+    r = client.get(f"/atlassian/rest/api/3/search/jql?{query}", headers=admin_h)
+    if named is None:
+        assert r.status_code == 200, r.text
+        return
+    param, shown = named
+    assert r.status_code == 400, r.text
+    assert r.headers["content-type"] == "application/problem+json;charset=UTF-8"
+    body = r.json()
+    detail = body.pop("detail")
+    if shown is None:
+        assert re.fullmatch(
+            rf"Failed to convert '{param}' with value: '\[Ljava\.lang\.String;@[0-9a-f]+'", detail
+        ), detail
+    else:
+        assert detail == f"Failed to convert '{param}' with value: '{shown}'"
+    assert body == {
+        "type": "about:blank",
+        "title": "Bad Request",
+        "status": 400,
+        "instance": "/rest/api/3/search/jql",
+    }
 
 
 @pytest.mark.parametrize("param", ["limit", "start"])
