@@ -854,7 +854,9 @@ def _key_selected(q) -> list[str]:
     refusal is what most of them give and what a HEAD gets. At a bucket's path it is left to the
     listing, as real leaves it. `partNumber` beside a selector other than `uploadId` is the conflict
     too (`?partNumber=1&tagging` is "partNumber, tagging", same date); alone it is GetObject's
-    (``_part_refusal``), and beside `uploadId` UploadPart."""
+    (``_part_refusal``), and beside `uploadId` UploadPart.
+
+    An `OPTIONS` at a key's path reads them the same way (``_cors_preflight``)."""
     selected = _selected(q, _OBJECT_READ_SELECTORS)
     if "annotationName" in q and "annotation" not in q:
         selected = sorted([*selected, "annotationName"])
@@ -2483,7 +2485,17 @@ def _method_type(method: str, resource_type: str) -> str:
 
 
 def _cors_preflight(request: Request, message: str) -> Response:
-    """Real's answer to an `OPTIONS`, which its CORS front end gives before anything reads the path.
+    """Real's answer to an `OPTIONS` whose query is not refused first.
+
+    Three queries are refused ahead of it with the 400 a GET gets, with or without an `Origin` and
+    ahead of the 400 for an `Access-Control-Request-Method` real does not take: two selectors or
+    more at a bucket's path or a key's, a bucket's `partNumber` and a key's `annotationName` without
+    `annotation`. One selector otherwise, a key's `partNumber` and `partNumber` beside `uploadId`
+    at either path are this answer, and so was each query sent to the service root. Measured
+    2026-10-13 against s3.amazonaws.com (us-east-1), path-style, at `noaa-ghcn-pds`, a bucket name
+    nobody owns, a key in each and the service root: every selector of `_BUCKET_WRITE_SELECTORS`
+    and `_OBJECT_WRITE_SELECTORS` alone and beside `acl` at both paths unsigned, and the three
+    refusals signed and over a bad secret as well.
 
     Without an `Origin`, or with an empty one, it is the same 400 on a bucket, a key and the service
     root; with one it is a 403 whose message says which way the lookup failed, whose `ResourceType`
@@ -3075,10 +3087,14 @@ async def bucket_method_refusal(request: Request, bucket: str) -> Response:
     refusals are answered as real answers them, and its writes are the ones this server refuses
     instead."""
     method = request.method
-    if method == "OPTIONS":
-        return _cors_preflight(request, _CORS_DISABLED)
     q = request.query_params
     selected = _bucket_selected(q, frozenset(_BUCKET_WRITE_SELECTORS))
+    if method == "OPTIONS":
+        if len(selected) > 1:
+            return _conflict(selected)
+        if selected == ["partNumber"]:
+            return _error("InvalidRequest", _KEY_REQUIRED)
+        return _cors_preflight(request, _CORS_DISABLED)
     late = len(selected) == 1 and (method, selected[0]) in _VERSION_AFTER_THE_BUCKET
     if len(selected) <= 1 and selected != ["partNumber"]:
         skip = late or (method == "POST" and not selected)
@@ -3123,6 +3139,11 @@ async def object_method_refusal(request: Request, bucket: str, key: str) -> Resp
     `PATCH` and `POST` with the 405 that names `OBJECT`; with one, the selector decides."""
     method = request.method
     if method == "OPTIONS":
+        selected = _key_selected(request.query_params)
+        if len(selected) > 1:
+            return _conflict(selected)
+        if selected == ["annotationName"]:
+            return _argument_error("Unexpected query string parameter", "ResourceType", selected[0])
         return _cors_preflight(request, _CORS_DISABLED)
     q = request.query_params
     selected = _selected(q, frozenset(_OBJECT_PATH_WRITE_SELECTORS))

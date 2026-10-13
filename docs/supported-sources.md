@@ -530,9 +530,10 @@ is for directory buckets only and real S3 answers it with the listing on a gener
 sub-resource whose operations are all on another method, `?delete` and a key's `?restore` and
 `?select` among them, is the 405 a GET or a HEAD naming it gets, and a key's `?uploads` on a GET is
 real's 400. A `?partNumber` at a bucket's path, which names a part of an object, is real's 400 on a
-GET, a HEAD, a `PUT`, a `POST`, a `DELETE` and a `PATCH`, and beside `?uploadId` it is UploadPart's
-405. At a bucket's path `?torrent` is real's 405 and `?uploadId` real's 400 once the bucket is
-found. At a key's path `?accelerate`, `?cors`, `?inventory`, `?lifecycle`, `?location`,
+GET, a HEAD, a `PUT`, a `POST`, a `DELETE`, a `PATCH` and an `OPTIONS`. Beside `?uploadId` an
+`OPTIONS` reaches the CORS preflight, while a GET, a HEAD, a `POST`, a `DELETE` and a `PATCH` get
+UploadPart's 405. At a bucket's path `?torrent` is real's 405 and `?uploadId` real's 400 once the
+bucket is found. At a key's path `?accelerate`, `?cors`, `?inventory`, `?lifecycle`, `?location`,
 `?notification`, `?policy`, `?replication`, `?requestPayment`, `?versioning` and `?website` are the
 bucket's answer whatever the key, and `?logging` and `?versions` real's 400s; a bucket's other
 sub-resources are ignored there, as on real. A `versionId` at a bucket's path is real's 400 on a GET

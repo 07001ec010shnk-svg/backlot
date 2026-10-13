@@ -460,6 +460,145 @@ def test_s3_an_options_carrying_an_origin_answers_the_cors_refusal(
     assert f"<Method>{asked or 'OPTIONS'}</Method><ResourceType>BUCKET</ResourceType>" in r.text
 
 
+_OPTIONS_BUCKET_PATHS = [
+    "/s3/eng-artifacts",
+    "/s3/eng-artifacts/",
+    "/s3/no-such-bucket",
+    "/s3/no-such-bucket/",
+]
+_OPTIONS_KEY_PATHS = [_KEY, "/s3/no-such-bucket/readme.txt"]
+_OPTIONS_CONFLICTS = [
+    ("acl&versioning", "acl, versioning"),
+    ("versioning&acl", "acl, versioning"),
+    ("acl&delete", "acl, delete"),
+    ("uploads&acl", "acl, uploads"),
+    ("partNumber=1&acl", "acl, partNumber"),
+]
+# Each path conflicts over its own selectors only: beside `acl`, a bucket's `analytics` is the
+# preflight at a key, and a key's `retention` and `annotationName` at a bucket.
+_OPTIONS_BUCKET_CONFLICTS = [*_OPTIONS_CONFLICTS, ("acl&analytics", "acl, analytics")]
+_OPTIONS_KEY_CONFLICTS = [
+    *_OPTIONS_CONFLICTS,
+    ("acl&retention", "acl, retention"),
+    ("annotationName=x&acl", "acl, annotationName"),
+]
+_OPTIONS_QUERY_ROWS = [
+    *[
+        (
+            path,
+            query,
+            "InvalidArgument",
+            f"Conflicting query string parameters: {names}",
+            names.split(", ")[0],
+        )
+        for paths, conflicts in (
+            (_OPTIONS_BUCKET_PATHS, _OPTIONS_BUCKET_CONFLICTS),
+            (_OPTIONS_KEY_PATHS, _OPTIONS_KEY_CONFLICTS),
+        )
+        for path in paths
+        for query, names in conflicts
+    ],
+    *[
+        (path, f"partNumber={value}", "InvalidRequest", "Object must have a valid key name.", None)
+        for path in _OPTIONS_BUCKET_PATHS
+        for value in ("1", "abc", "")
+    ],
+    *[
+        (
+            path,
+            f"annotationName={value}",
+            "InvalidArgument",
+            "Unexpected query string parameter",
+            "annotationName",
+        )
+        for path in _OPTIONS_KEY_PATHS
+        for value in ("x", "")
+    ],
+    *[
+        (path, query, None, None, None)
+        for path in _OPTIONS_BUCKET_PATHS
+        for query in ("acl", "partNumber=1&uploadId=u", "acl&retention", "annotationName=x")
+    ],
+    *[
+        (path, query, None, None, None)
+        for path in _OPTIONS_KEY_PATHS
+        for query in (
+            "acl",
+            "partNumber=1",
+            "partNumber=abc",
+            "partNumber=1&uploadId=u",
+            "acl&analytics",
+        )
+    ],
+    *[
+        (path, query, None, None, None)
+        for path in ("/s3", "/s3/")
+        for query in (
+            "partNumber=1",
+            "partNumber=abc",
+            "acl&versioning",
+            "acl&delete",
+            "uploads&acl",
+            "partNumber=1&acl",
+            "acl",
+            "partNumber=1&uploadId=u",
+        )
+    ],
+]
+
+
+@pytest.mark.parametrize("path, query, code, message, value", _OPTIONS_QUERY_ROWS)
+@pytest.mark.parametrize("asked", [None, "GET", "put"], ids=["no-origin", "origin", "bad-method"])
+@pytest.mark.parametrize("tampered", [False, True], ids=["unsigned", "tampered"])
+def test_s3_an_options_refuses_its_query_before_the_preflight(
+    live_server, path, query, code, message, value, asked, tampered
+):
+    """The rows with a code are refused ahead of the preflight, with or without an `Origin`, ahead
+    of a method the preflight does not take, and unsigned and over a bad secret alike
+    (``backlot.routers.s3._cors_preflight``); the rest are the preflight itself."""
+    import httpx
+
+    base_url, settings = live_server
+    headers = {"Origin": "https://example.invalid", "Access-Control-Request-Method": asked}
+    headers = headers if asked else {}
+    url, headers = (
+        _sign_get(
+            base_url,
+            f"{path}?{query}",
+            settings.admin_token,
+            tamper=True,
+            method="OPTIONS",
+            extra_headers=headers,
+        )
+        if tampered
+        else (f"{base_url}{path}?{query}", headers)
+    )
+    r = httpx.request("OPTIONS", url, headers=headers)
+    status, expected = 400, {}
+    if value is not None:
+        expected = {"ArgumentName": "ResourceType", "ArgumentValue": value}
+    if code is None and asked == "GET":
+        status, code = 403, "AccessForbidden"
+        found = (
+            "Bucket not found"
+            if path in ("/s3", "/s3/")
+            else "CORS is not enabled for this bucket."
+        )
+        message = "CORSResponse: " + found
+        expected = {"Method": "GET", "ResourceType": "BUCKET"}
+    elif code is None and asked:
+        code, message = "BadRequest", f"Invalid Access-Control-Request-Method: {asked}"
+    elif code is None:
+        code, message = "BadRequest", "Insufficient information. Origin request header needed."
+    assert r.status_code == status
+    assert r.headers["content-type"] == "application/xml"
+    assert "allow" not in r.headers
+    fields = {node.tag: node.text for node in ET.fromstring(r.text)}
+    fields.pop("RequestId")
+    fields.pop("HostId")
+    assert fields == {"Code": code, "Message": message, **expected}
+
+
 @pytest.mark.parametrize("asked", ["put", "Get", "TRACE"])
 def test_s3_a_preflight_asking_about_a_method_real_does_not_accept_is_a_400(live_server, asked):
     """Measured: real's preflight takes `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH` and
