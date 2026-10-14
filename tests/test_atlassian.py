@@ -1751,7 +1751,8 @@ def test_jira_comma_joins_a_repeated_string_parameter_before_validating_it(paged
 
 @pytest.mark.parametrize("slash", ["", "/"])
 @pytest.mark.parametrize(
-    "param,value", [("maxResults", "abc"), ("fieldsByKeys", "x"), ("reconcileIssues", "a")]
+    "param,value",
+    [("maxResults", "abc"), ("fieldsByKeys", "x"), ("failFast", "x"), ("reconcileIssues", "a")],
 )
 def test_jira_search_refuses_a_parameter_it_cannot_convert(client, admin_h, slash, param, value):
     r = client.get(f"/atlassian/rest/api/3/search/jql{slash}?{param}={value}", headers=admin_h)
@@ -1762,6 +1763,15 @@ def test_jira_search_refuses_a_parameter_it_cannot_convert(client, admin_h, slas
 
 _ANY_PROJECT = "jql=project%20is%20not%20EMPTY"
 _BOUNDED = f"{_ANY_PROJECT}&maxResults=1"
+_RECONCILE_TOO_MANY = {
+    "errorMessages": ["The max number of issues to reconcile is 50."],
+    "errors": {},
+}
+
+
+def _ids(n: int) -> str:
+    """``n`` distinct `reconcileIssues` values, as a query string."""
+    return "&".join(f"reconcileIssues={10000 + i}" for i in range(n))
 
 
 @pytest.mark.parametrize(
@@ -1796,8 +1806,23 @@ _BOUNDED = f"{_ANY_PROJECT}&maxResults=1"
         (f"{_BOUNDED}&fieldsByKeys=%C2%A0true", ("fieldsByKeys", "\xa0true")),
         (f"{_BOUNDED}&fieldsByKeys=%C2%85true", ("fieldsByKeys", "\x85true")),
         (f"{_BOUNDED}&fieldsByKeys=%E2%80%80true", ("fieldsByKeys", "\u2000true")),
+        (f"{_BOUNDED}&fieldsByKeys=o%EF%AC%80", ("fieldsByKeys", "o\ufb00")),
         (f"{_BOUNDED}&fieldsByKeys=x&fieldsByKeys=yes", ("fieldsByKeys", None)),
         (f"{_BOUNDED}&fieldsByKeys=&fieldsByKeys=yes", ("fieldsByKeys", None)),
+        # failFast: read by the same rule
+        (f"{_BOUNDED}&failFast=TRUE", None),
+        (f"{_BOUNDED}&failFast=", None),
+        (f"{_BOUNDED}&failFast=%00true", None),
+        (f"{_BOUNDED}&failFast=ye%C5%BF", None),
+        (f"{_BOUNDED}&failFast=yes&failFast=x", None),
+        (f"{_BOUNDED}&failFast=x", ("failFast", "x")),
+        (f"{_BOUNDED}&failFast=null", ("failFast", "null")),
+        (f"{_BOUNDED}&failFast=2", ("failFast", "2")),
+        (f"{_BOUNDED}&failFast=%20", ("failFast", " ")),
+        (f"{_BOUNDED}&failFast=%C2%A0true", ("failFast", "\xa0true")),
+        (f"{_BOUNDED}&failFast=o%EF%AC%80", ("failFast", "o\ufb00")),
+        (f"{_BOUNDED}&failFast=x&failFast=yes", ("failFast", None)),
+        (f"{_BOUNDED}&failFast=&failFast=yes", ("failFast", None)),
         # reconcileIssues: every value, the blank ones passed over
         (f"{_BOUNDED}&reconcileIssues=1", None),
         (f"{_BOUNDED}&reconcileIssues=-1", None),
@@ -1840,19 +1865,47 @@ _BOUNDED = f"{_ANY_PROJECT}&maxResults=1"
         (f"{_BOUNDED}&reconcileIssues=a&fieldsByKeys=x", ("fieldsByKeys", "x")),
         (f"{_ANY_PROJECT}&fieldsByKeys=x&nextPageToken=bogus", ("fieldsByKeys", "x")),
         (f"{_ANY_PROJECT}&reconcileIssues=a&maxResults=0", ("reconcileIssues", "a")),
+        (f"{_ANY_PROJECT}&maxResults=abc&failFast=x", ("maxResults", "abc")),
+        (f"{_ANY_PROJECT}&failFast=x&maxResults=abc", ("maxResults", "abc")),
+        (f"{_BOUNDED}&failFast=x&fieldsByKeys=x", ("fieldsByKeys", "x")),
+        (f"{_BOUNDED}&failFast=x&reconcileIssues=a", ("failFast", "x")),
+        (f"{_BOUNDED}&reconcileIssues=a&failFast=x", ("failFast", "x")),
+        (f"{_ANY_PROJECT}&failFast=x&nextPageToken=bogus", ("failFast", "x")),
+        (f"{_ANY_PROJECT}&failFast=x&maxResults=0", ("failFast", "x")),
+        ("failFast=x", ("failFast", "x")),
+        # the cap: more than 50 values, a blank one counted, after the conversions and the page
+        # token and before the range and the unbounded JQL
+        (f"{_BOUNDED}&{_ids(50)}", None),
+        (f"{_BOUNDED}&{_ids(49)}&reconcileIssues=", None),
+        (f"{_BOUNDED}&{_ids(51)}", _RECONCILE_TOO_MANY),
+        (f"{_BOUNDED}&" + "&".join(["reconcileIssues=1"] * 51), _RECONCILE_TOO_MANY),
+        (f"{_BOUNDED}&{_ids(50)}&reconcileIssues=", _RECONCILE_TOO_MANY),
+        (f"{_BOUNDED}&{_ids(50)}&reconcileIssues=%20", _RECONCILE_TOO_MANY),
+        (f"{_BOUNDED}&{_ids(50)}&reconcileIssues=a", ("reconcileIssues", None)),
+        (f"{_BOUNDED}&fieldsByKeys=x&{_ids(51)}", ("fieldsByKeys", "x")),
+        (f"{_BOUNDED}&failFast=x&{_ids(51)}", ("failFast", "x")),
+        (f"{_BOUNDED}&failFast=yes&{_ids(51)}", _RECONCILE_TOO_MANY),
+        (f"{_ANY_PROJECT}&maxResults=abc&{_ids(51)}", ("maxResults", "abc")),
+        (f"{_ANY_PROJECT}&nextPageToken=bogus&{_ids(51)}", errors_atlassian.bad_page_token().body),
+        (f"{_ANY_PROJECT}&maxResults=0&{_ids(51)}", _RECONCILE_TOO_MANY),
+        (_ids(51), _RECONCILE_TOO_MANY),
     ],
 )
-def test_jira_search_get_converts_fields_by_keys_and_reconcile_issues(
+def test_jira_search_get_reads_fields_by_keys_fail_fast_and_reconcile_issues(
     client, admin_h, query, named
 ):
     """Real's answers to the GET form, for the rules `_bool_param` and `_jira_long_list_param`
-    describe: ``named`` is the parameter a 400 names and the value it names as sent, or ``None``
-    where the parameter repeats and the 400 names the array (see
-    `test_jira_reports_the_whole_array_when_the_first_repeated_value_will_not_convert`). A row
-    without one is served."""
+    describe and the cap on `reconcileIssues`: ``named`` is the parameter a 400 names and the value
+    it names as sent, or ``None`` where the parameter repeats and the 400 names the array (see
+    `test_jira_reports_the_whole_array_when_the_first_repeated_value_will_not_convert`), or the
+    whole body of a 400 that names no parameter. A row without one is served."""
     r = client.get(f"/atlassian/rest/api/3/search/jql?{query}", headers=admin_h)
     if named is None:
         assert r.status_code == 200, r.text
+        return
+    if isinstance(named, dict):
+        assert (r.status_code, r.json()) == (400, named), r.text
+        assert r.headers["content-type"] == "application/json;charset=UTF-8"
         return
     param, shown = named
     assert r.status_code == 400, r.text
@@ -2932,6 +2985,7 @@ def test_jira_search_post_refuses_an_unknown_body_field(client, admin_h, bogus):
         ("fields", ["summary"]),
         ("fields", [1, None, True]),
         ("fieldsByKeys", True),
+        ("failFast", True),
         ("expand", "names"),
         ("properties", ["prop1"]),
         ("reconcileIssues", [1, 2]),
@@ -2963,15 +3017,17 @@ def _properties_null(index: int) -> dict:
     return {"message": f"at index {index}", "status-code": 500, "stack-trace": ""}
 
 
-# What real answers for a value of each of the four bean members Backlot does not act on, alone and
-# beside a second refusal: the rules are `_jira_fields_by_keys_ok`, `_jira_reconcile_issue_ok` and
-# where `jira_search` raises the two 500s. `None` is a 200. The one value of each that
+# What real answers for a value of each of the five bean members other than `fields` that Backlot
+# does not act on, alone and beside a second refusal: the rules are `_jira_bean_boolean_ok`,
+# `_jira_reconcile_issue_ok`, the cap on `reconcileIssues` and where `jira_search` raises the two
+# 500s. `None` is a 200. The one value of each that
 # `test_jira_search_post_accepts_every_field_the_vendors_bean_declares` serves is left to that test.
 _BEAN_MEMBER_ROWS = [
     *[(_bean(f'"expand": {v}'), None) for v in ('"bogus"', '""', "1", "1.5", "true", "null")],
     *[(_bean(f'"expand": {v}'), _BEAN_REFUSED) for v in ("[]", '["names"]', "[1]", "{}")],
     *[
-        (_bean(f'"fieldsByKeys": {v}'), None)
+        (_bean(f'"{member}": {v}'), None)
+        for member in ("fieldsByKeys", "failFast")
         for v in (
             *("false", "null", "0", "2", "-1", "9223372036854775808"),
             *('"true"', '"True"', '"TRUE"', '"false"', '"False"', '"FALSE"', '" TRUE "'),
@@ -2980,7 +3036,8 @@ _BEAN_MEMBER_ROWS = [
         )
     ],
     *[
-        (_bean(f'"fieldsByKeys": {v}'), _BEAN_REFUSED)
+        (_bean(f'"{member}": {v}'), _BEAN_REFUSED)
+        for member in ("fieldsByKeys", "failFast")
         for v in (
             *('"yes"', '"x"', '"tRuE"', '"NULL"', '"1"', '"\\u00a0true"'),
             *("1.5", "1.0", "[]", "{}"),
@@ -3054,6 +3111,41 @@ _BEAN_MEMBER_ROWS = [
             _bean('"reconcileIssues": null, "properties": [null]'),
         )
     ],
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(50)]}'),
+        None,
+    ),
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}'),
+        _RECONCILE_TOO_MANY,
+    ),
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}', jql=None),
+        _RECONCILE_TOO_MANY,
+    ),
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}, "maxResults": 0'),
+        _RECONCILE_TOO_MANY,
+    ),
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}, "nextPageToken": "bogus"'),
+        errors_atlassian.bad_page_token().body,
+    ),
+    # A null or an empty element counts toward the cap; a 500 and a binding refusal come first.
+    *[
+        (_bean('"reconcileIssues": ' + json.dumps(ids)), want)
+        for ids, want in (
+            ([10000 + i for i in range(50)] + [None], _RECONCILE_TOO_MANY),
+            ([10000 + i for i in range(50)] + [""], _RECONCILE_TOO_MANY),
+            ([None] * 50, None),
+            ([None] * 51, _RECONCILE_TOO_MANY),
+        )
+    ],
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}, "properties": [null]'),
+        _properties_null(0),
+    ),
+    (_bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}, "failFast": "x"'), _BEAN_REFUSED),
 ]
 
 
