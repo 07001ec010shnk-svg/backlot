@@ -278,7 +278,8 @@ refused credential get is in [supported-sources.md](supported-sources.md#amazon-
 **Signature Version 2 is verified too**, in the header and in the query, since real S3 still
 verifies it; botocore signs that way with `Config(signature_version="s3")`, though its signature for
 a bucket's own operations is the mismatch real answers it with. The two refuse differently and each
-refuses as real does.
+refuses as real does. Reading an object's `?annotation` takes SigV4 or SigV4a, as on real
+([supported-sources.md](supported-sources.md#amazon-s3--s3)).
 
 **So is SigV4a** (`AWS4-ECDSA-P256-SHA256`), in the header and in the query, with the key botocore's
 CRT signer derives from the same secret: install `awscrt` and pass
