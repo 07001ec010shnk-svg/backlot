@@ -415,6 +415,12 @@ def _require_project(request: Request, conn, key: str) -> str:
     ecosystem.atlassian.net, whose `AA` is public, and brekkylab.atlassian.net, which has no such
     key, on 2026-09-04. An unreachable project is reported as an absent one, the way
     `issue/{key}` reports an issue the caller cannot see.
+
+    The 404 calls the segment an `id` when it is one to eighteen ASCII digits with no leading zero,
+    and a `key` otherwise. Measured against Jira Cloud on 2026-10-14, with and without a credential,
+    on `role` and `role/10002`: `1`, `10002` and `999999999999999999` are ids; `0`, `007`, `-1`,
+    `1000000000000000000` (nineteen digits, still a Java `long`) and `1２` (a full-width `２`) are
+    keys.
     """
     ids = auth.visible_ids(request, _jira_caller(request))
     container = _jira_container_for_key(conn, key, request)
@@ -426,7 +432,8 @@ def _require_project(request: Request, conn, key: str) -> str:
         ids is None or store.has_visible_document(conn, "jira", container, ids)
     ):
         return container
-    raise HTTPException(status_code=404, detail=f"No project could be found with key '{key}'.")
+    kind = "id" if re.fullmatch(r"[1-9][0-9]{0,17}", key) else "key"
+    raise HTTPException(status_code=404, detail=f"No project could be found with {kind} '{key}'.")
 
 
 @router.get("/rest/api/3/project/{key}/role")

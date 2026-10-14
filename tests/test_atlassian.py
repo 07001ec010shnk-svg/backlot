@@ -205,19 +205,33 @@ def test_atlassian_lists_only_the_containers_the_caller_can_open(tmp_path):
 
 
 @pytest.mark.parametrize("headers", UNRESOLVABLE)
-def test_jira_404s_a_project_role_an_anonymous_caller_cannot_see(client, headers):
+@pytest.mark.parametrize(
+    "segment,kind",
+    [
+        pytest.param(synth.jira_project_key("payments"), "key", id="corpus-key"),
+        pytest.param("NOSUCHKEY", "key", id="no-such-key"),
+        pytest.param("1", "id", id="one-digit"),
+        pytest.param("999999999999999999", "id", id="eighteen-digits"),
+        pytest.param("1000000000000000000", "key", id="nineteen-digits"),
+        pytest.param("0", "key", id="zero"),
+        pytest.param("007", "key", id="leading-zero"),
+        pytest.param("1２", "key", id="full-width-digit"),
+    ],
+)
+def test_jira_404s_a_project_role_an_anonymous_caller_cannot_see(client, headers, segment, kind):
     """A role read is the one Jira route that keeps refusing an anonymous caller, and which of the
     two refusals it gives is decided by the project: on the site where the key names a project
     anonymous can see it is 401 ("You cannot edit the configuration of this project."), and on the
     site where it names nothing it is 404. Anonymous sees no Backlot project, so it is always the
-    404 here — the corpus's own project key gets the answer a key naming nothing would."""
-    from backlot import synth
-
-    key = synth.jira_project_key("payments")
-    for path in (f"/rest/api/3/project/{key}/role", f"/rest/api/3/project/{key}/role/10002"):
+    404 here — the corpus's own project key gets the answer a key naming nothing would. The 404
+    calls the segment an id or a key by the rule `_require_project` records."""
+    for path in (
+        f"/rest/api/3/project/{segment}/role",
+        f"/rest/api/3/project/{segment}/role/10002",
+    ):
         r = client.get(f"/atlassian{path}", headers=headers)
         assert r.status_code == 404, path
-        assert r.json()["errorMessages"] == [f"No project could be found with key '{key}'."]
+        assert r.json()["errorMessages"] == [f"No project could be found with {kind} '{segment}'."]
 
 
 def test_jira_refuses_a_bearer_it_cannot_read_as_a_connect_token(client):
