@@ -96,9 +96,11 @@ def test_hubspot_archived_parameter_reads_its_first_value_and_only_true_as_true(
             assert (got.status_code, got.json()["id"]) == (200, rid)
             assert (batch.status_code, [x["id"] for x in batch.json()["results"]]) == (200, [rid])
         else:
-            assert (got.status_code, got.json()) == (
+            gone = client.get(f"{url}/{missing}", headers=admin_h)
+            assert (got.status_code, got.headers["content-type"], got.content) == (
                 404,
-                client.get(f"{url}/{missing}", headers=admin_h).json(),
+                gone.headers["content-type"],
+                gone.content,
             )
             assert (batch.status_code, json.loads(batch.text.replace(rid, missing))) == (
                 207,
@@ -433,6 +435,14 @@ def test_hubspot_missing_record_is_404(client, admin_h):
     )
 
 
+_MISSING_RECORD_PAGE = (
+    b"<html>\n<head>\n"
+    b'<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
+    b"<title>Error 404 Not Found</title>\n</head>\n"
+    b"<body><h2>HTTP ERROR 404</h2>\n<p>Resource not found</p>\n</body>\n</html>\n"
+)
+
+
 def test_hubspot_unauth_is_401(client):
     assert client.get("/hubspot/crm/v3/objects/companies").status_code == 401
 
@@ -457,9 +467,11 @@ def test_hubspot_acl_hides_restricted_record(client, tokens_yaml, admin_h):
         for r in crawl_hubspot(client, admin_h, "companies")
         if r["properties"].get("name") == "Stealth Health Co"
     )
-    url = f"/hubspot/crm/v3/objects/companies/{secret['id']}"
-    assert client.get(url, headers=ava_h).status_code == 404
-    assert client.get(url, headers=hana_h).status_code == 200
+    for record in (secret["id"], "0" + secret["id"]):
+        url = f"/hubspot/crm/v3/objects/companies/{record}"
+        hidden = client.get(url, headers=ava_h)
+        assert (hidden.status_code, hidden.content) == (404, _MISSING_RECORD_PAGE), record
+        assert client.get(url, headers=hana_h).status_code == 200, record
 
 
 def test_hubspot_associations_v4(client, admin_h):
@@ -497,7 +509,20 @@ def _cannot_infer(name):
 
 
 _EMPTY = {"results": []}
-_NOT_FOUND = {"status": "error", "message": "resource not found", "category": "OBJECT_NOT_FOUND"}
+
+
+def _not_looked_up(record, why):
+    """Real's 404 for an id it won't look up: `why` is "numeric" or "positive"."""
+    message = {
+        "numeric": "Object not found.  objectId are usually numeric.",
+        "positive": "Object not found. objectId is usually positive.",
+    }[why]
+    return {
+        "status": "error",
+        "message": message,
+        "context": {"id": [record]},
+        "category": "OBJECT_NOT_FOUND",
+    }
 
 
 @pytest.mark.parametrize(
@@ -515,13 +540,50 @@ _NOT_FOUND = {"status": "error", "message": "resource not found", "category": "O
         (_assoc("9223372036854775807"), 200, _EMPTY),
         (_assoc("0" * 25 + "1"), 200, _EMPTY),
         (_assoc("{ava}", source="deals"), 200, _EMPTY),
-        (_assoc("abc"), 404, _NOT_FOUND),
-        (_assoc("1.0"), 404, _NOT_FOUND),
-        (_assoc("\u0661"), 404, _NOT_FOUND),
-        (_assoc("0"), 404, _NOT_FOUND),
-        (_assoc("-1"), 404, _NOT_FOUND),
-        (_assoc("9223372036854775808"), 404, _NOT_FOUND),
-        (_assoc("abc") + "?after=bogus", 404, _NOT_FOUND),
+        (_assoc("0{ava}"), 200, _assoc("{ava}")),
+        (_assoc("abc"), 404, _not_looked_up("abc", "numeric")),
+        (_assoc("1.0"), 404, _not_looked_up("1.0", "numeric")),
+        (_assoc("+1"), 404, _not_looked_up("+1", "numeric")),
+        (_assoc("\u0661"), 404, _not_looked_up("\u0661", "numeric")),
+        (_assoc("0"), 404, _not_looked_up("0", "positive")),
+        (_assoc("-1"), 404, _not_looked_up("-1", "positive")),
+        (_assoc("9223372036854775808"), 404, _not_looked_up("9223372036854775808", "numeric")),
+        (_assoc("abc") + "?after=bogus", 404, _not_looked_up("abc", "numeric")),
+        ("/crm/v3/objects/contacts/0{ava}", 200, "/crm/v3/objects/contacts/{ava}"),
+        ("/crm/v3/objects/contacts/abc", 404, _not_looked_up("abc", "numeric")),
+        ("/crm/v3/objects/contacts/1.0", 404, _not_looked_up("1.0", "numeric")),
+        ("/crm/v3/objects/contacts/+1", 404, _not_looked_up("+1", "numeric")),
+        ("/crm/v3/objects/contacts/\u0661", 404, _not_looked_up("\u0661", "numeric")),
+        (
+            "/crm/v3/objects/contacts/99999999999999999999999",
+            404,
+            _not_looked_up("99999999999999999999999", "numeric"),
+        ),
+        (
+            "/crm/v3/objects/contacts/9223372036854775808",
+            404,
+            _not_looked_up("9223372036854775808", "numeric"),
+        ),
+        ("/crm/v3/objects/contacts/0", 404, _not_looked_up("0", "positive")),
+        ("/crm/v3/objects/contacts/-1", 404, _not_looked_up("-1", "positive")),
+        ("/crm/v3/objects/contacts/00", 404, _not_looked_up("00", "positive")),
+        ("/crm/v3/objects/contacts/-00", 404, _not_looked_up("-00", "positive")),
+        (
+            "/crm/v3/objects/contacts/-9223372036854775808",
+            404,
+            _not_looked_up("-9223372036854775808", "positive"),
+        ),
+        (
+            "/crm/v3/objects/contacts/-9223372036854775809",
+            404,
+            _not_looked_up("-9223372036854775809", "numeric"),
+        ),
+        # longer than `int` converts (4300 digits): the 23-digit row's answer, not a server error
+        ("/crm/v3/objects/contacts/" + "9" * 5000, 404, _not_looked_up("9" * 5000, "numeric")),
+        ("/crm/v3/objects/nosuch/abc", 400, _cannot_infer("nosuch")),
+        ("/crm/v3/objects/contacts/1", 404, _MISSING_RECORD_PAGE),
+        ("/crm/v3/objects/contacts/9223372036854775807", 404, _MISSING_RECORD_PAGE),
+        ("/crm/v3/objects/deals/{ava}", 404, _MISSING_RECORD_PAGE),
         (_assoc("1") + "?after=bogus", 400, _assoc("{ava}") + "?after=bogus"),
         (_assoc("{ava}", source="deals") + "?after=bogus", 400, _assoc("{ava}") + "?after=bogus"),
     ],
@@ -529,17 +591,22 @@ _NOT_FOUND = {"status": "error", "message": "resource not found", "category": "O
 def test_hubspot_object_types_resolve_as_real_resolves_them(
     client, admin_h, ava, path, status, want
 ):
-    """Each row is one that `_canonical`, `get_object` and `list_associations` record as measured.
-    Where `want` is a path, the row answers what that path does, here and on real: the target under
-    its plural, for another spelling of it; and Ava's own associations, for a bad `after`, since the
-    cursor is refused before a missing or mismatched record is an empty page."""
+    """Each row is one that `_canonical`, `_record_id`, `get_object` and `list_associations` record
+    as measured. Where `want` is a path, the row answers what that path does, here and on real: the
+    target under its plural, for another spelling of it; Ava's own associations, for a bad `after`,
+    since the cursor is refused before a missing or mismatched record is an empty page; and Ava
+    herself, or her associations, for her id with a leading zero. Where `want` is bytes, it is the
+    HTML page, under real's Latin-1 content type. A JSON answer's members come in real's order."""
     r = client.get("/hubspot" + path.format(ava=ava), headers=admin_h)
     assert r.status_code == status, path
+    if isinstance(want, bytes):
+        assert (r.headers["content-type"], r.content) == ("text/html;charset=iso-8859-1", want)
+        return
     if isinstance(want, str):
         twin = client.get("/hubspot" + want.format(ava=ava), headers=admin_h).json()
         assert twin != _EMPTY
         want = twin
-    assert r.json() == want
+    assert list(r.json().items()) == list(want.items())
 
 
 def test_hubspot_search_filter_groups(client, admin_h):
