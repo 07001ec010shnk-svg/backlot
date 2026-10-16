@@ -2913,9 +2913,9 @@ def _operations(rows) -> tuple[tuple[str, re.Pattern[str]], ...]:
 
 def _published_not_served(source: str) -> tuple[tuple[str, re.Pattern[str]], ...]:
     """The operations the vendor publishes and no route here serves: the baseline's ``missing``
-    operations, read off the file the way ``backlot.routers.notion`` reads its own, so an operation
-    the vendor adds reaches :func:`unmatched_path` once the baseline acknowledges it; a route added
-    here wins over :func:`unmatched_path` whatever the file says."""
+    operations, read off the file as ``backlot.published`` reads them, so an operation the vendor
+    adds reaches :func:`unmatched_path` once the baseline acknowledges it; a route added here wins
+    over :func:`unmatched_path` whatever the file says."""
     baseline = _PACKAGE / "fidelity" / "baseline" / f"{source}.json"
     entries = json.loads(baseline.read_text())["operations"]
     return _operations(e["operation"] for e in entries if e["status"] == "missing")

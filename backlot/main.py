@@ -203,12 +203,19 @@ async def _validation_exception_handler(request: Request, exc: RequestValidation
 
 
 def _some_github_route_matches(scope: Scope) -> bool:
-    """Whether some mounted route matches this scope's path, whatever the method.
+    """Whether some mounted route matches this scope's path, whatever the method."""
+    return any(route.matches(scope)[0] is not Match.NONE for route in app.router.routes)
 
-    A 404 for a path no route matches at all carries no version echo, and carries the five
-    `x-ratelimit-*` headers only for a request that sent no `Authorization` header at all — the
-    same line `refuse_a_trailing_slash_on_github` draws for the trailing-slash spelling of such a
-    path, which real draws for every spelling. Measured against api.github.com 2026-09-21:
+
+def _github_routes(scope: Scope) -> bool:
+    """Whether real routes this scope: some mounted route matches its path, whatever the method
+    (:func:`_some_github_route_matches`), or its method and path are an operation GitHub publishes
+    and no route here serves (``backlot.routers.github.is_an_unserved_operation``).
+
+    A 404 for a path real does not route carries no version echo, and carries the five
+    `x-ratelimit-*` headers only for a request that sent no `Authorization` header at all — the same
+    line `refuse_a_trailing_slash_on_github` draws for the trailing-slash spelling of such a path,
+    which real draws for every spelling. Measured against api.github.com 2026-09-21:
     `/repos/psf/requests/<unmatched>`, its trailing-slash spelling and a top-level `/<unmatched>`
     all answered 404 with no echo, where `/repos/psf/requests/issues/<missing>` — a route that DOES
     match, on a resource that does not exist — carried both for either caller. With no
@@ -216,9 +223,36 @@ def _some_github_route_matches(scope: Scope) -> bool:
     Every header value carried none of them and moved no window: a valid token (whose `used` read 0
     before three of them and 0 after), a bad bearer, `Basic Zm9vOmJhcg==` and a scheme-less value —
     so what real reads here is that a credential arrived, not that one resolved, where the same
-    unparseable `Basic` on a route that matches is served and counted.
+    `Basic` value, which names no token, on a route that matches is served and counted.
     """
-    return any(route.matches(scope)[0] is not Match.NONE for route in app.router.routes)
+    return _some_github_route_matches(scope) or github.is_an_unserved_operation(
+        scope["method"], scope["path"]
+    )
+
+
+def _a_github_route_serves(scope: Scope) -> bool:
+    """Whether a GitHub route serves this scope's method and path. Asked of
+    ``backlot.routers.github.router``, which holds the GitHub routes and nothing else."""
+    return any(route.matches(scope)[0] is Match.FULL for route in github.router.routes)
+
+
+@app.middleware("http")
+async def refuse_an_unserved_github_operation(request: Request, call_next):
+    """An operation GitHub publishes that no route here serves under the request's method is
+    refused as a served route refuses before it runs, ahead of the router's 404 or 405
+    (``backlot.routers.github.refuse_an_unserved_operation``).
+
+    Registered before the other GitHub middlewares, which makes it the innermost of them: it reads
+    the path ``resolve_github_id_paths`` rewrote and a `HEAD` as the GET it is rewritten to, and
+    its refusal leaves through the version echo and the rate-limit headers as a served route's 401
+    does.
+    """
+    if request.scope["path"].startswith("/github/") and not _a_github_route_serves(request.scope):
+        try:
+            await github.refuse_an_unserved_operation(request)
+        except StarletteHTTPException as exc:
+            return await _http_exception_handler(request, exc)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -235,16 +269,17 @@ async def echo_github_api_version(request: Request, call_next):
     ``selected_api_version``, the same call the router's 400 is raised from. Code search gets no
     echo either, whatever it pinned: real's code search backend does not read the header, and
     neither does `/rate_limit` asked with no `Authorization` header (see
-    ``github.honours_api_version``). Nor does a 404 for a path no route matches at all, whatever
-    the caller's credential — see ``_some_github_route_matches`` — nor real's "Bad credentials"
-    401 (``github.refused_a_credential``).
+    ``github.honours_api_version``). Nor does a 404 for a path real does not route, whatever the
+    caller's credential — see ``_github_routes`` — nor real's "Bad credentials" 401
+    (``github.refused_a_credential``), nor the 401s ``github.refused_an_unserved_operation`` names.
     """
     response = await call_next(request)
     if (
         request.url.path.startswith("/github")
         and github.honours_api_version(request)
-        and _some_github_route_matches(request.scope)
+        and _github_routes(request.scope)
         and not github.refused_a_credential(request)
+        and not github.refused_an_unserved_operation(request)
     ):
         version = github.selected_api_version(request)
         if version is not None:
@@ -286,23 +321,25 @@ async def report_github_rate_limit(request: Request, call_next):
     so a `HEAD` runs through here as the GET it is rewritten to and counts once, as it does on real
     (`remaining` 46 → 45 across one `HEAD`, measured 2026-09-09), and the head copies the five
     with the rest of the GET's headers. A path outside `/github` gets nothing: the other vendors'
-    rate-limit answers are not measured. A 404 for a path no route matches at all gets them only
-    for a request that carried no `Authorization` header at all — see ``_some_github_route_matches``
-    — and a credential that did not resolve, with a space after its scheme, gets them on no path at
-    all (``github.refused_without_a_window``); the refusal check shares that same gate, so neither
-    is ever refused by it.
+    rate-limit answers are not measured. A 404 for a path real does not route gets them only for a
+    request that carried no `Authorization` header at all — see ``_github_routes`` — and a
+    credential that did not resolve gets them on no path at all but those
+    ``github.refused_without_a_window`` leaves out; the refusal check shares that same gate, so
+    neither is ever refused by it. Of the 401s an operation no route here serves gets for
+    its credential, the ones ``github.refused_an_unserved_operation_uncounted`` names get none
+    either and count nothing.
     """
     gated = (
         request.url.path.startswith("/github")
         and not github.refused_without_a_window(request)
-        and (_some_github_route_matches(request.scope) or "authorization" not in request.headers)
+        and (_github_routes(request.scope) or "authorization" not in request.headers)
     )
     if gated:
         refusal = github.rate_limit_refusal(request)
         if refusal is not None:
             return refusal
     response = await call_next(request)
-    if gated:
+    if gated and not github.refused_an_unserved_operation_uncounted(request):
         for name, value in github.rate_limit_headers(request, response.status_code).items():
             response.headers[name] = value
     return response
@@ -351,8 +388,8 @@ async def refuse_a_trailing_slash_on_github(request: Request, call_next):
     address, ahead of and independent of routing, where a credential's window only starts once a
     route is reached (anonymous `/repos/psf/requests/` answered `used` 45, 46 then 47 across a pair
     of bad-bearer 404s that carried no headers and moved no window between them, measured
-    2026-09-17) — see `_some_github_route_matches` for the unparseable-credential and matched-route
-    cases, which draw the same line.
+    2026-09-17) — see `_github_routes` for a header real reads as no credential and
+    for a matched route, which draw the same line.
 
     `redirect_slashes` is a setting of the whole app's `Router`, shared by every vendor mounted
     here, and the vendors measured answer a trailing slash each their own way (Notion, Atlassian and
