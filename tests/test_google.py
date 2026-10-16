@@ -4846,12 +4846,26 @@ def test_docs_get_returns_paragraph_text(base, admin_h):
     [{}, {"suggestionsViewMode": "PREVIEW_WITHOUT_SUGGESTIONS"}, {"includeTabsContent": "true"}],
     ids=["plain", "preview-without-suggestions", "tabs-content"],
 )
-def test_docs_get_serves_comments_view_mode(base, admin_h, params):
-    """A document read carries `commentsViewMode` as its last member, with the value real serves."""
+def test_docs_get_serves_members_in_reals_order(base, admin_h, params):
+    """A document read serves its members in real's order, `commentsViewMode` last with the value
+    real serves. The tabbed shape `includeTabsContent=true` selects is not served, so that row
+    checks the last member alone.
+    """
     fid, _ = _drive_by_mime(base, admin_h, "application/vnd.google-apps.document")
     r = httpx.get(f"{base}/docs/v1/documents/{fid}", headers=admin_h, params=params)
     assert r.status_code == 200
     assert list(r.json().items())[-1] == ("commentsViewMode", "COMMENTS_VIEW_MODE_OMITTED")
+    if "includeTabsContent" not in params:
+        assert list(r.json()) == [
+            "title",
+            "body",
+            "documentStyle",
+            "namedStyles",
+            "revisionId",
+            "suggestionsViewMode",
+            "documentId",
+            "commentsViewMode",
+        ]
 
 
 _DOCS_SUGGESTIONS = "type.googleapis.com/google.apps.docs.v1.SuggestionsViewMode"
