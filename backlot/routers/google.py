@@ -2672,6 +2672,12 @@ async def drive_files_export(file_id: str, request: Request):
     ids = auth.visible_ids(request, caller)
     row = store.gdrive_by_id(conn, file_id, visible_ids=ids)
     if row is None:
+        # A folder is synthesized rather than stored, so the lookup misses it. Measured 2026-10-09
+        # and 2026-10-15: real refuses the export of a folder the caller can see with the 403 a PDF
+        # gets, and of one it cannot see with the 404 an id that names nothing gets.
+        name = _drive_folder_name_by_id(conn, file_id)
+        if name is not None and store.drive_folder_has_visible(conn, name, ids):
+            raise gerr.not_exportable()
         raise gerr.not_found_file(file_id)
     native = _native(row)
     if native is None or native[2] is None:  # binary or folder — not exportable
