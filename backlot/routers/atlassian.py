@@ -2745,13 +2745,21 @@ def _confluence_carried(
     it was sent in beside `expand` (measured 2026-10-12).
 
     ``own`` names what the route writes into its links itself, so it is not carried as well.
+
+    Each parameter is carried as the request spelt it, name and value, from the raw query string.
+    Measured on `content` and `space` on 2026-10-15: a bare or escaped comma, a lower-case `%2c`,
+    `+`, `%7E`, `~`, `;` and an escaped name (`%65xpand`) came back as sent, a name sent without
+    `=` came back with one, and an empty part or name was dropped. The names compared here are the
+    spelt ones too, as real's are: `l%69mit=1` is read as `limit` and still carried, and
+    `%65xpand` and `sp%61ceKey`, read as `expand` and `spaceKey`, land where other names do
+    (measured 2026-10-16).
     """
     front, lead, trail = [], [], []
-    for name, value in request.query_params.multi_items():
-        if name in ("limit", "start", "next", "prev", *own):
+    for part in request.scope["query_string"].decode("latin-1").split("&"):
+        name, _, value = part.partition("=")
+        if not name or name in ("limit", "start", "next", "prev", *own):
             continue
-        pair = f"{name}={quote(str(value), safe='')}"
-        (front if name in head else lead if name in first else trail).append(pair)
+        (front if name in head else lead if name in first else trail).append(f"{name}={value}")
     return (
         "&".join(front) + "&" if front else "",
         "&".join(lead) + "&" if lead else "",

@@ -2451,8 +2451,8 @@ _CARRIED_ROWS = [
     (
         "/space?expand=description&spaceKey={po},{hb}&limit=1",
         "next",
-        "/rest/api/space?spaceKey={po}%2C{hb}&next=true&expand=description&limit=1&start=1",
-        "/space?spaceKey={po}%2C{hb}&expand=description",
+        "/rest/api/space?spaceKey={po},{hb}&next=true&expand=description&limit=1&start=1",
+        "/space?spaceKey={po},{hb}&expand=description",
     ),
     (
         "/space?spaceKey={po}&spaceKey={hb}&expand=description&limit=1&start=1",
@@ -2460,17 +2460,69 @@ _CARRIED_ROWS = [
         "/rest/api/space?spaceKey={po}&spaceKey={hb}&expand=description&prev=true&limit=1&start=0",
         "/space?spaceKey={po}&spaceKey={hb}&expand=description",
     ),
+    (
+        "/content?expand=version,space&limit=1",
+        "next",
+        "/rest/api/content?next=true&expand=version,space&limit=1&start=1",
+        "/content?expand=version,space",
+    ),
+    (
+        "/content?expand=version%2cspace&limit=1",
+        "next",
+        "/rest/api/content?next=true&expand=version%2cspace&limit=1&start=1",
+        "/content?expand=version%2cspace",
+    ),
+    (
+        "/space?expand=version%2Cspace&limit=1&start=1",
+        "prev",
+        "/rest/api/space?expand=version%2Cspace&prev=true&limit=1&start=0",
+        "/space?expand=version%2Cspace",
+    ),
+    (
+        "/content?limit=1&bogus=a+b,%7E~;&flag&&=x",
+        "next",
+        "/rest/api/content?next=true&limit=1&start=1&bogus=a+b,%7E~;&flag=",
+        "/content?bogus=a+b,%7E~;&flag=",
+    ),
+    (
+        "/space?l%69mit=1",
+        "next",
+        "/rest/api/space?next=true&limit=1&start=1&l%69mit=1",
+        "/space?l%69mit=1",
+    ),
+    (
+        "/space?limit=1&next=true&start=1",
+        "prev",
+        "/rest/api/space?prev=true&limit=1&start=0",
+        "/space",
+    ),
+    (
+        "/space?limit=1&start=1&prev=x",
+        "prev",
+        "/rest/api/space?prev=true&limit=1&start=0",
+        "/space",
+    ),
+    (
+        "/content?%65xpand=version,space&limit=1",
+        "next",
+        "/rest/api/content?next=true&limit=1&start=1&%65xpand=version,space",
+        "/content?%65xpand=version,space",
+    ),
+    (
+        "/content?limit=1&bogus=a=b",
+        "next",
+        "/rest/api/content?next=true&limit=1&start=1&bogus=a=b",
+        "/content?bogus=a=b",
+    ),
 ]
 
 
 @pytest.mark.parametrize("request_path, which, link, self_path", _CARRIED_ROWS)
-def test_confluence_a_carried_parameter_sits_where_it_was_measured(
+def test_confluence_a_carried_parameter_is_spelt_and_placed_as_measured(
     client, admin_h, request_path, which, link, self_path
 ):
-    """`expand` leads `limit`/`start`, `spaceKey` leads the marker and `expand` on `space`, and a
-    name real does not read trails `start`: the placement
-    :func:`backlot.routers.atlassian._confluence_carried` chose, since real's own for the last is
-    no rule a client can rely on."""
+    """Each row's links as :func:`backlot.routers.atlassian._confluence_carried` spells and places
+    their parameters."""
     api = "/atlassian/wiki/rest/api"
     links = client.get(api + request_path.format(**_SPACE_KEYS), headers=admin_h).json()["_links"]
     assert links[which] == link.format(**_SPACE_KEYS)
