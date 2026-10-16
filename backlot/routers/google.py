@@ -649,18 +649,27 @@ _GMAIL_KEYS = {
     "has",
     "newer_than",
     "older_than",
+    "newer",
+    "older",
 }
+# Real reads `newer:` as `after:` and `older:` as `before:`, so each is folded into the operator
+# it is another name for. Measured on a Workspace mailbox on 2026-10-15: messages.list and
+# threads.list answered `newer:X` with the ids `after:X` answers, and `older:X` with those of
+# `before:X`, for each value X tried, read as a date or not. An empty `newer:` is the search term
+# `newer`, as an empty `after:` is `after`, and `_GMAIL_OP` leaves both in the free text.
+_GMAIL_KEY_ALIASES = {"newer": "after", "older": "before"}
 
 
 def _parse_gmail_q(q: str) -> tuple[str, dict]:
     """Split a Gmail search `q` into (free_text, operators). Honors from:/to:/cc:/bcc:/subject:/
-    after:/before:/newer_than:/older_than:/label:/in:/has: — the rest is free text matched
-    full-text."""
+    after:/before:/newer:/older:/newer_than:/older_than:/label:/in:/has: — the rest is free text
+    matched full-text."""
     ops: dict[str, list[str]] = {}
 
     def _take(m):
         key = m.group(1).lower()
         if key in _GMAIL_KEYS:
+            key = _GMAIL_KEY_ALIASES.get(key, key)
             ops.setdefault(key, []).append(m.group(2).strip('"'))
             return " "
         return m.group(0)
