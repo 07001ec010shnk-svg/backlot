@@ -263,7 +263,7 @@ def test_github_a_directory_readme_is_that_directorys_and_acl_scoped(tmp_path):
     with client_for(s, reload=True) as c:
         admin = {"Authorization": f"Bearer {s.admin_token}"}
         org = c.get("/_meta/users", headers=admin).json()["org"]
-        tokens = yaml.safe_load(s.tokens_path.read_text())["users"]
+        tokens = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))["users"]
         outsider = next(u["token"] for u in tokens if u["email"] == "outsider@x.com")
         url = f"/github/repos/{org}/scoped/readme/docs"
         got = c.get(url, headers=admin).json()
@@ -330,7 +330,7 @@ def test_github_the_redirect_does_not_precede_the_repository(tmp_path):
     with client_for(s, reload=True) as c:
         admin = {"Authorization": f"Bearer {s.admin_token}"}
         org = c.get("/_meta/users", headers=admin).json()["org"]
-        tokens = yaml.safe_load(s.tokens_path.read_text())["users"]
+        tokens = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))["users"]
         outsider = next(u["token"] for u in tokens if u["email"] == "outsider@x.com")
 
         def slash(owner_repo, headers):
@@ -550,7 +550,7 @@ def gh_labelled(tmp_path_factory):
         for i, (title, labels, kind, visibility) in enumerate(rows)
     ]
     with corpus_client(tmp_path_factory.mktemp("gh_labelled"), records) as (c, settings):
-        tokens = yaml.safe_load(settings.tokens_path.read_text())
+        tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
         org = c.get("/_meta/users").json()["org"]
         yield (
             c,
@@ -1174,7 +1174,7 @@ def gh_org(gh_client):
 @pytest.fixture(scope="module")
 def gh_user_tokens(gh_client):
     _, settings = gh_client
-    data = yaml.safe_load(settings.tokens_path.read_text())
+    data = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
     return {"admin": data["admin_token"], **{u["email"]: u["token"] for u in data["users"]}}
 
 
@@ -3787,7 +3787,7 @@ def test_github_a_container_only_repo_reaches_the_admin_and_no_scoped_caller(tmp
     settings = build_corpus(tmp_path, _GH_CONTAINER_ONLY_DOCS)
     with client_for(settings, reload=True) as c:
         org = c.get("/_meta/users").json()["org"]
-        tokens = yaml.safe_load(settings.tokens_path.read_text())
+        tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
         admin = {"Authorization": f"Bearer {tokens['admin_token']}"}
         ava = {"Authorization": f"Bearer {tok(tokens, 'ava@acme.com')}"}
 
@@ -4466,14 +4466,15 @@ def test_github_pull_diff_reverse_applies_with_real_git(
         ).text
         dest = wt / e["path"]
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(raw)
-    (wt / "pr.diff").write_text(diff)
+        dest.write_text(raw, encoding="utf-8")
+    (wt / "pr.diff").write_text(diff, encoding="utf-8")
     r = subprocess.run(
         ["git", "apply", "--reverse", "--check", "-v", "pr.diff"],
         cwd=wt,
         capture_output=True,
         text=True,
         check=False,
+        encoding="utf-8",
     )
     assert r.returncode == 0, f"git rejected the diff:\n{r.stderr}\n---\n{diff}"
 
@@ -4592,14 +4593,15 @@ def test_github_diff_never_emits_a_file_header_with_no_body(tmp_path):
     wt = tmp_path / "wt"
     wt.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=wt, check=True)
-    (wt / "ok.txt").write_text("hello\n")
-    (wt / "pr.diff").write_text(diff)
+    (wt / "ok.txt").write_text("hello\n", encoding="utf-8")
+    (wt / "pr.diff").write_text(diff, encoding="utf-8")
     r = subprocess.run(
         ["git", "apply", "--reverse", "--check", "pr.diff"],
         cwd=wt,
         capture_output=True,
         text=True,
         check=False,
+        encoding="utf-8",
     )
     assert r.returncode == 0, r.stderr
 

@@ -50,6 +50,7 @@ pytest.importorskip("mcp")
 from backlot import mcp as backlot_mcp  # noqa: E402
 from backlot import store, synth  # noqa: E402
 from backlot.acl import Acl  # noqa: E402
+from tests._helpers import python_child_env  # noqa: E402
 
 
 def _docker_available() -> bool:
@@ -161,7 +162,7 @@ def test_mcp_atlassian_acl_enforced(live_server):
     test the same way and would leave it green with the ACL doing nothing; the third read is the
     control that rules that out."""
     base, settings = live_server
-    user = yaml.safe_load(settings.tokens_path.read_text())["users"][0]
+    user = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"][0]
     row, email = _restricted_doc(settings, user["token"], "jira")
     assert row is not None, f"no Jira issue is ACL-restricted from {email} in the sample corpus"
     key = row["key"]  # the stored column: jira is probed, so a re-derived hash can disagree
@@ -196,7 +197,7 @@ def test_mcp_atlassian_acl_enforced(live_server):
 @pytest.mark.skipif(shutil.which("npx") is None, reason="npx (Node) not available")
 def test_mcp_notion_acl_enforced(live_server):
     base, settings = live_server
-    user = yaml.safe_load(settings.tokens_path.read_text())["users"][0]
+    user = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"][0]
     row, email = _restricted_doc(settings, user["token"], "notion", "subtype IS NOT 'database'")
     assert row is not None, f"no Notion page is ACL-restricted from {email} in the sample corpus"
     # The row's own `id`, not a fresh `synth.notion_id(row["doc_id"])`: notion never
@@ -337,7 +338,7 @@ _BRIDGE_CASES = [
         # the org the CORPUS produced, which tokens.yaml records — not `settings.org_name`, still
         # the unloaded default here. The GitHub surface 404s any other owner.
         lambda row, st: {
-            "owner": yaml.safe_load(st.tokens_path.read_text())["org"],
+            "owner": yaml.safe_load(st.tokens_path.read_text(encoding="utf-8"))["org"],
             "repo": row["repo"],
             "number": row["number"],
         },
@@ -417,7 +418,7 @@ def test_mcp_bridge_enforces_the_acl(live_server, source, where, tool_pred, buil
     including S3, whose calls are signed rather than bearer-authenticated."""
     pytest.importorskip("fastmcp")
     base, settings = live_server
-    user = yaml.safe_load(settings.tokens_path.read_text())["users"][0]
+    user = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"][0]
     doc_source = {"gdrive": "google_drive", "atlassian": "jira"}.get(source, source)
     row, email = _restricted_doc(settings, user["token"], doc_source, where)
     assert row is not None, f"no {doc_source} document is ACL-restricted from {email} in SAMPLE"
@@ -469,7 +470,7 @@ def test_mcp_atlassian_bridge_authenticates_basic_for_the_resolved_user(live_ser
     apart."""
     pytest.importorskip("fastmcp")
     base, settings = live_server
-    email = yaml.safe_load(settings.tokens_path.read_text())["users"][0]["email"]
+    email = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"][0]["email"]
     creds = backlot_mcp.resolve(base, email)
     row, _ = _visible_doc(settings, creds.token, "jira")
     assert row is not None, f"no Jira issue is readable by {email} in the sample corpus"
@@ -490,7 +491,7 @@ def test_mcp_s3_bridge_signs_for_the_resolved_user(live_server):
     user's own keys sign a readable object successfully, so the refusal above is the ACL's."""
     pytest.importorskip("fastmcp")
     base, settings = live_server
-    email = yaml.safe_load(settings.tokens_path.read_text())["users"][0]["email"]
+    email = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"][0]["email"]
     creds = backlot_mcp.resolve(base, email)
     conn = store.connect_ro(settings.db_path)
     acl = Acl.load(settings.tokens_path, settings.admin_token, settings.org_name)
@@ -551,7 +552,7 @@ def test_mcp_graphql_bridge_enforces_the_acl(live_server, source, tool_name, dep
     scoped user — a field error for Linear's non-null `Issue!`, a null for Fireflies."""
     pytest.importorskip("fastmcp")
     base, settings = live_server
-    user = yaml.safe_load(settings.tokens_path.read_text())["users"][0]
+    user = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"][0]
     row, email = _restricted_doc(settings, user["token"], source)
     assert row is not None, f"no {source} document is ACL-restricted from {email} in SAMPLE"
 
@@ -1148,7 +1149,7 @@ def test_backlot_mcp_scopes_every_tool_call_to_the_user(live_server):
     """Over the real command, `--user` is who each call answers as: the same search finds the
     restricted message for the admin (no --user) and not for the person named."""
     base, settings = live_server
-    user = yaml.safe_load(settings.tokens_path.read_text())["users"][0]
+    user = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"][0]
 
     def finds_it(*who):
         return asyncio.run(
@@ -1169,7 +1170,7 @@ def test_resolve_matches_an_email_case_insensitively(live_server):
     shape a Jira page displays it resolves to the same person — and carries the corpus's own
     spelling onward, which is what Atlassian's Basic header sends."""
     base, settings = live_server
-    email = yaml.safe_load(settings.tokens_path.read_text())["users"][0]["email"]
+    email = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"][0]["email"]
     assert email == email.lower(), email
     for spelling in (email, email.upper(), email.capitalize()):
         assert backlot_mcp.resolve(base, spelling).email == email, spelling
@@ -1181,9 +1182,11 @@ def test_backlot_mcp_refuses_an_email_the_corpus_does_not_know(live_server):
     base, _ = live_server
     out = subprocess.run(
         [sys.executable, "-m", "backlot", "mcp", "--url", base, "--user", "nobody@example.com"],
+        env=python_child_env(),
         capture_output=True,
         text=True,
         timeout=120,
+        encoding="utf-8",
     )
     assert out.returncode == 1, out
     assert "nobody@example.com" in out.stderr and "not one of the" in out.stderr, out.stderr
@@ -1205,11 +1208,11 @@ def test_backlot_mcp_starts_a_server_when_none_answers(tmp_path):
 
     errlog = tmp_path / "stderr.txt"
     params = _mcp_params(
-        "--source", "slack", env={**os.environ, "BACKLOT_DATA_DIR": str(tmp_path / "data")}
+        "--source", "slack", env=python_child_env(BACKLOT_DATA_DIR=str(tmp_path / "data"))
     )
 
     async def _list_channels():
-        with open(errlog, "w") as f:
+        with open(errlog, "w", encoding="utf-8") as f:
             async with stdio_client(params, errlog=f) as (r, w):
                 async with ClientSession(r, w) as sess:
                     await sess.initialize()
@@ -1219,7 +1222,7 @@ def test_backlot_mcp_starts_a_server_when_none_answers(tmp_path):
     body = json.loads(asyncio.run(_list_channels()))
     assert body["ok"] is True and body["channels"], body
 
-    err = errlog.read_text()
+    err = errlog.read_text(encoding="utf-8")
     assert "bundled hello-world corpus" in err, err
     up = re.search(r"Backlot is up at http://127\.0\.0\.1:(\d+)", err)
     assert up, err
@@ -1241,12 +1244,14 @@ def test_backlot_mcp_reports_an_unusable_corpus_and_exits(tmp_path):
     """When the data dir holds something that is not a corpus, the server the command starts dies
     before answering. What reaches the terminal is that server's own diagnosis — which file, and
     the `backlot import` that would fix it — as an exit, not a traceback through contextlib."""
-    (tmp_path / "db.sqlite").write_text("not a database")
+    (tmp_path / "db.sqlite").write_text("not a database", encoding="utf-8")
     out = subprocess.run(
         [sys.executable, "-m", "backlot", "mcp", "--source", "slack", "--data-dir", str(tmp_path)],
+        env=python_child_env(),
         capture_output=True,
         text=True,
         timeout=120,
+        encoding="utf-8",
     )
     assert out.returncode == 1, out
     assert "no usable corpus" in out.stderr and "backlot import" in out.stderr, out.stderr
@@ -1258,9 +1263,11 @@ def test_backlot_mcp_refuses_an_unreachable_url():
     server, and quietly serving a different corpus in its place would be the wrong kind of help."""
     out = subprocess.run(
         [sys.executable, "-m", "backlot", "mcp", "--url", "http://127.0.0.1:1"],
+        env=python_child_env(),
         capture_output=True,
         text=True,
         timeout=60,
+        encoding="utf-8",
     )
     assert out.returncode == 1, out
     assert "no Backlot server answers at http://127.0.0.1:1" in out.stderr

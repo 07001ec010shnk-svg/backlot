@@ -129,7 +129,7 @@ def spy_erb_export(monkeypatch):
 
 def test_import_defaults_to_byo_and_loads_the_corpus(tmp_path, monkeypatch):
     corpus = tmp_path / "corpus.jsonl"
-    corpus.write_text(json.dumps(_record()) + "\n")
+    corpus.write_text(json.dumps(_record()) + "\n", encoding="utf-8")
     monkeypatch.setenv("BACKLOT_DATA_DIR", str(tmp_path / "data"))
 
     assert cli.main(["import", str(corpus)]) == 0
@@ -138,7 +138,7 @@ def test_import_defaults_to_byo_and_loads_the_corpus(tmp_path, monkeypatch):
 
 def test_import_dry_run_validates_without_writing_a_db(tmp_path, monkeypatch, capsys):
     corpus = tmp_path / "corpus.jsonl"
-    corpus.write_text(json.dumps(_record()) + "\n")
+    corpus.write_text(json.dumps(_record()) + "\n", encoding="utf-8")
     monkeypatch.setenv("BACKLOT_DATA_DIR", str(tmp_path / "data"))
 
     assert cli.main(["import", str(corpus), "--dry-run"]) == 0
@@ -158,7 +158,7 @@ def test_a_corpus_the_importer_rejects_reports_its_reason_and_exits_1(
     hole was exactly here.
     """
     corpus = tmp_path / "bad.jsonl"
-    corpus.write_text('{"source_type": "slack", "id": "x"}\nthis is not json\n')
+    corpus.write_text('{"source_type": "slack", "id": "x"}\nthis is not json\n', encoding="utf-8")
     monkeypatch.setenv("BACKLOT_DATA_DIR", str(tmp_path / "data"))
 
     assert cli.main(["import", str(corpus)]) == 1
@@ -169,7 +169,7 @@ def test_a_corpus_the_importer_rejects_reports_its_reason_and_exits_1(
 
 def test_a_dry_run_of_an_invalid_corpus_exits_non_zero(tmp_path, monkeypatch):
     corpus = tmp_path / "bad.jsonl"
-    corpus.write_text(json.dumps({"source_type": "slack"}) + "\n")  # no content
+    corpus.write_text(json.dumps({"source_type": "slack"}) + "\n", encoding="utf-8")  # no content
     monkeypatch.setenv("BACKLOT_DATA_DIR", str(tmp_path / "data"))
 
     assert cli.main(["import", str(corpus), "--dry-run"]) == 1
@@ -307,7 +307,7 @@ def test_export_rejects_a_destination_it_cannot_create(tmp_path, monkeypatch, ca
     """Named, and BEFORE the ~1GB fetch. The destination was first touched inside `export_byo`, i.e.
     after the download, so a mistyped path cost the whole wait and then a pathlib traceback."""
     not_a_dir = tmp_path / "afile"
-    not_a_dir.write_text("")
+    not_a_dir.write_text("", encoding="utf-8")
     called = _spy(monkeypatch, erb, "run_export")
 
     assert cli.main(["export", str(not_a_dir / "out")]) == 2
@@ -461,7 +461,7 @@ def test_data_dir_overrides_the_environment(tmp_path, monkeypatch):
     """The flag has to win over BACKLOT_DATA_DIR, or the two ways to say it would disagree."""
     monkeypatch.setenv("BACKLOT_DATA_DIR", str(tmp_path / "from-env"))
     corpus = tmp_path / "corpus.jsonl"
-    corpus.write_text(json.dumps(_record()) + "\n")
+    corpus.write_text(json.dumps(_record()) + "\n", encoding="utf-8")
 
     assert cli.main(["import", str(corpus), "--data-dir", str(tmp_path / "from-flag")]) == 0
     assert (tmp_path / "from-flag" / "db.sqlite").exists()

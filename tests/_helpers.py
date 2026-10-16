@@ -195,7 +195,7 @@ def build_corpus(
         records = [
             complete(**r) if isinstance(r, dict) and "source_type" in r else r for r in records
         ]
-    corpus.write_text("\n".join(json.dumps(r) for r in records))
+    corpus.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
     load(corpus, settings)
     return settings
 
@@ -226,6 +226,11 @@ def client_for(settings: Settings, *, reload: bool = True):
             os.environ.pop("BACKLOT_DATA_DIR", None)
         else:
             os.environ["BACKLOT_DATA_DIR"] = prev
+
+
+def python_child_env(**extra: str) -> dict[str, str]:
+    """The environment for a Python child process whose output a test reads as UTF-8."""
+    return {**os.environ, "PYTHONIOENCODING": "utf-8", **extra}
 
 
 def gql(client, path: str, query: str, token: str | None = None, **variables):

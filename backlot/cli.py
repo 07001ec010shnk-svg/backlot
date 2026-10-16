@@ -598,7 +598,7 @@ def status(data_dir: DataDir = None) -> None:
     if settings.tokens_path.exists():
         import yaml
 
-        data = yaml.safe_load(settings.tokens_path.read_text()) or {}
+        data = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8")) or {}
         users = data.get("users") or {}
         typer.echo(
             f"tokens:   {len(users)} in {settings.tokens_path.name}, org {data.get('org', '?')}"
