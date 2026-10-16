@@ -636,7 +636,10 @@ async def gmail_label_get(user_id: str, label_id: str, request: Request):
     return _label_obj(label_id, (messages, threads) if label_id == _GMAIL_DEFAULT_LABEL else (0, 0))
 
 
-_GMAIL_OP = re.compile(r'(\w+):("[^"]*"|\S+)')
+# The lookbehinds are the four `_GMAIL_ADDRESS_KEYS`; their comment says why.
+_GMAIL_OP = re.compile(
+    r'(\w+):(?:(?:(?<=\bfrom:)|(?<=\bto:)|(?<=\bcc:)|(?<=\bbcc:))\s*)?("[^"]*"|\S*)', re.IGNORECASE
+)
 # operators we honor; anything else stays as free text
 _GMAIL_KEYS = {
     "from",
@@ -660,6 +663,15 @@ _GMAIL_KEYS = {
 # `before:X`, for each value X tried, read as a date or not. An empty `newer:` is the search term
 # `newer`, as an empty `after:` is `after`, and `_GMAIL_OP` leaves both in the free text.
 _GMAIL_KEY_ALIASES = {"newer": "after", "older": "before"}
+# The address operators. A Gmail search ignores one with no value rather than searching it as free
+# text, and reads the word after whitespace as its value. Measured on a Workspace mailbox: `to:`,
+# `from:` and `bcc:` with no value answered every message, as no `q` does (2026-10-14), and so did
+# `cc:`, `from:""` and `to:""` (2026-10-16). On 2026-10-16, `from: <word>`, `bcc: <word>`,
+# `to:<tab><word>`, `From: <word>` and `TO: <word>` answered the ids the operator answers with no
+# whitespace, and `to: from: bcc:` answered nothing. `has: attachment` and `newer_than: 7d` answered
+# nothing where `has:attachment` and `newer_than:7d` answered 160 and 36 messages, so `_GMAIL_OP`
+# reads across whitespace for these four alone.
+_GMAIL_ADDRESS_KEYS = {"from", "to", "cc", "bcc"}
 
 
 def _parse_gmail_q(q: str) -> tuple[str, dict]:
@@ -672,7 +684,10 @@ def _parse_gmail_q(q: str) -> tuple[str, dict]:
         key = m.group(1).lower()
         if key in _GMAIL_KEYS:
             key = _GMAIL_KEY_ALIASES.get(key, key)
-            ops.setdefault(key, []).append(m.group(2).strip('"'))
+            raw = m.group(2)
+            if not raw and key not in _GMAIL_ADDRESS_KEYS:
+                return m.group(0)
+            ops.setdefault(key, []).append(raw.strip('"'))
             return " "
         return m.group(0)
 
@@ -735,8 +750,8 @@ _GMAIL_ADDRESS = re.compile(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+")
 
 
 def _gmail_address_match(header: str | None, value: str) -> bool:
-    """Whether a `Cc` or `Bcc` header answers a `cc:` or `bcc:` value as Gmail answers it, in any
-    case. A value shaped like one address matches an address in the header exactly: `lena@acme.com`
+    """Whether an address header answers an address search value as Gmail answers it, in any case.
+    A value shaped like one address matches an address in the header exactly: `lena@acme.com`
     does, `lena@acme` names no address and matches nothing. Any other value matches when its words
     come one after another among the header's words, display names included: `lena`, `acme`,
     `acme.com`, `@acme.com` and `lena@` match `Lena Park <lena@acme.com>`, and so does `park`,
@@ -748,7 +763,12 @@ def _gmail_address_match(header: str | None, value: str) -> bool:
     Measured on a Workspace mailbox of 595 messages on 2026-10-15: 113 searches on `cc:` and
     `bcc:`, compared with the headers of every message, all match this rule, and of the 32 ASCII
     punctuation marks sent alone as a `cc:` value, `_` and `&` match nothing and the other 30 match
-    every message. On 2026-10-14, `cc:<a local part>+x` read `+x` as a search term of its own."""
+    every message. On the same mailbox at 601 messages on 2026-10-16, 122 of 124 `from:` and `to:`
+    searches built from its own addresses, local parts, domains and display-name words match this
+    rule over `From`, and over `To`, `Cc` and `Bcc` together; `to:me` counts the four messages
+    where the caller is in `Bcc` alone. The other two are a hyphenated value, which real also reads
+    joined (`no-reply` finds `noreply@` as well as `no-reply@`), and part of a Korean display
+    name. On 2026-10-14, `cc:<a local part>+x` read `+x` as a search term of its own."""
     header = (header or "").lower()
     value = value.lower()
     if _GMAIL_ONE_ADDRESS.fullmatch(value):
@@ -761,10 +781,10 @@ def _gmail_address_match(header: str | None, value: str) -> bool:
 
 def _gmail_op_match(row, ops: dict) -> bool:
     for v in ops.get("from", []):
-        if v.lower() not in (row["author_email"] or "").lower():
+        if not _gmail_address_match(row["author_email"], v):
             return False
     for v in ops.get("to", []):
-        if v.lower() not in (row["to_addr"] or "").lower():
+        if not any(_gmail_address_match(row[k], v) for k in ("to_addr", "cc", "bcc")):
             return False
     for key in ("cc", "bcc"):
         for v in ops.get(key, []):
@@ -802,7 +822,7 @@ def _gmail_query(conn, mailbox, ids, q: str, caller_email: str | None = None) ->
     present; otherwise the mailbox listing). The caller paginates the returned rows."""
     free, ops = _parse_gmail_q(q)
     if caller_email:
-        for key in ("cc", "bcc"):
+        for key in ("from", "to", "cc", "bcc"):
             if key in ops:
                 ops[key] = [caller_email if v.lower() == "me" else v for v in ops[key]]
     ops = _resolve_relative_dates(ops)  # newer_than:/older_than: -> absolute after:/before: bounds
