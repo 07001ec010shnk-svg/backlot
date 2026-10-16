@@ -61,6 +61,8 @@ all = ["backlot[dev,official-sdk,mcp,llamaindex,mirage,fsspec]"]
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.6",
+    # scripts/invariance.py records coverage to hold a test-only change to the lines it executed.
+    "pytest-cov>=6",
     # starlette 1.6's TestClient wants httpx2; the httpx the tests also call directly is a core
     # dependency.
     "httpx2",
@@ -188,6 +190,12 @@ extend-select = [
     "S611",  # RawSQL
     "S612",  # logging.config.listen
 ]
+
+[tool.coverage.run]
+# Follow the uvicorn subprocess `live_server` and `backlot.serve` start, which most of the S3 and SDK
+# tests talk to; `backlot.serve` stops it with SIGTERM, which coverage saves nothing on unless told.
+patch = ["subprocess"]
+sigterm = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
