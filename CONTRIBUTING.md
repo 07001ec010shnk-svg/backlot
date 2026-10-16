@@ -100,9 +100,9 @@ Windows, where the default text encoding is the locale's code page (cp1252 on `w
 rather than UTF-8, has its own workflow (`.github/workflows/windows.yml`). It runs on a pull request
 once a maintainer adds the `windows` label: the README's first command, the test files that read
 and write Backlot's own files, and the tests marked `windows` or xfail. On `main` it runs the whole
-suite of a `dev` install once a day. A test that fails on Windows for a known, deterministic reason
-is marked `xfail(strict=True)` there and `windows`, so the pull request that fixes it removes the
-first mark and that run keeps the test.
+suite of a `dev` and `mcp` install once a day. A test that fails on Windows for a known,
+deterministic reason is marked `xfail(strict=True)` there and `windows`, so the pull request that
+fixes it removes the first mark and that run keeps the test.
 
 Every file Backlot ships, writes and reads back is UTF-8, so a text file (and a text-mode subprocess
 pipe, with `PYTHONIOENCODING=utf-8` for a Python child) is always opened with `encoding="utf-8"`.

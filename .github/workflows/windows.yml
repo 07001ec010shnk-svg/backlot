@@ -48,7 +48,7 @@ jobs:
         with:
           enable-cache: true
       - name: Install
-        run: uv sync --extra dev --locked --python 3.14
+        run: uv sync --extra dev --extra mcp --locked --python 3.14
       - name: The locale is not UTF-8
         run: >
           uv run --no-sync python -c "import locale, sys; e = locale.getencoding();

@@ -144,14 +144,17 @@ def _interpreter(env: dict[str, str]) -> tuple[str, dict[str, str]]:
 
 
 def _terminate(proc: subprocess.Popen, timeout: float = 10) -> None:
-    """Stop ``proc`` and reap it. A bare ``kill()`` can still leave a zombie if nothing calls
-    ``wait()`` afterward — this always does, even on the SIGTERM-ignoring fallback path."""
+    """Stop ``proc``, reap it, and close the pipe to its stdin if it has one. A bare ``kill()`` can
+    still leave a zombie if nothing calls ``wait()`` afterward — this always does, even on the
+    SIGTERM-ignoring fallback path."""
     proc.terminate()
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    if proc.stdin is not None:
+        proc.stdin.close()
 
 
 # Every server `serve()` has started and not yet stopped. Between `Popen` returning and the context
@@ -160,6 +163,20 @@ def _terminate(proc: subprocess.Popen, timeout: float = 10) -> None:
 # exactly where a client that gives up on a slow start sends its signal. `stop_children` is the
 # way out of that window; the normal path stays the context manager's own `finally`.
 _CHILDREN: list[subprocess.Popen] = []
+
+
+def _close_server_pipes_in_a_fork() -> None:
+    """In a child forked from this process, close its copy of each server's stdin pipe. The servers
+    are this process's: a copy the child kept would hold each one up after this process ended,
+    until the child ended too (measured on macOS on 2026-10-13, with a child of
+    ``multiprocessing``'s "fork" start method still sleeping)."""
+    for proc in _CHILDREN:
+        if proc.stdin is not None:
+            proc.stdin.close()
+
+
+if hasattr(os, "register_at_fork"):  # POSIX; on Windows a child cannot inherit the pipe's handle
+    os.register_at_fork(after_in_child=_close_server_pipes_in_a_fork)
 
 
 def stop_children() -> None:
@@ -315,11 +332,17 @@ def serve(
                     str(port),
                     "--log-level",
                     "warning",
+                    "--exit-on-stdin-close",
                 ],
                 env=server_env,
-                # The server reads nothing from stdin, and must not inherit the caller's: when
-                # the caller is `backlot mcp`, that is the MCP protocol pipe.
-                stdin=subprocess.DEVNULL,
+                # A pipe of this process's own rather than the caller's stdin, which under
+                # `backlot mcp` is the MCP protocol pipe. Nothing is written to it: its write end
+                # closes when this process ends, however it ends (a child forked from it closes its
+                # copy, `_close_server_pipes_in_a_fork`), and `--exit-on-stdin-close` stops the
+                # server at that end of file: its port closed within a second of the holding
+                # process ending on SIGTERM, SIGHUP or SIGKILL on macOS, or by `TerminateProcess` on
+                # Windows 11 (measured 2026-10-13).
+                stdin=subprocess.PIPE,
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
             )
