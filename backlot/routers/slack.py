@@ -543,6 +543,8 @@ async def conversations_list(request: Request):
     limit, err = _limit(request)
     if err is not None:
         return err
+    if limit < 0:  # every item, as for no `limit` (see `_limit`)
+        limit = get_settings().default_page_size
     types = _slack_types(request)
     if types is None:
         return _err("invalid_types")
@@ -614,6 +616,8 @@ async def conversations_history(request: Request):
     limit, err = _limit(request)
     if err is not None:
         return err
+    if limit < 0:  # one message (see `_limit`)
+        limit = 1
     name = _channel_name(conn, _param(request, "channel") or "")
     ids = auth.visible_ids(request, caller)
     # A channel this caller cannot see is `channel_not_found`, exactly as in conversations.info —
@@ -811,6 +815,8 @@ async def conversations_members(request: Request):
     limit, err = _limit(request)
     if err is not None:
         return err
+    if limit < 0:  # every item, as for no `limit` (see `_limit`)
+        limit = get_settings().default_page_size
     name = _channel_name(conn, _param(request, "channel") or "")
     # Membership is derived from who has spoken in the channel, so this list is a projection of the
     # very messages the ACL withholds — behind the same `channel_not_found` conversations.info
@@ -845,6 +851,20 @@ async def users_list(request: Request):
     limit, err = _limit(request)
     if err is not None:
         return err
+    if limit < 0:  # see `_limit`
+        sent = _param(request, "cursor")
+        if decode_cursor_or_none(sent) is None:
+            return _err("invalid_cursor")
+        if limit < -1:
+            return _err("fatal_error")
+        if sent:
+            return _err("internal_error")
+        total = len(store.all_user_emails(conn))
+        return {
+            "ok": True,
+            "members": [],
+            "response_metadata": {"next_cursor": next_cursor(0, 1, total)},
+        }
     # The roster is the registered user principals — the employee directory plus internal mail/doc
     # authors. Slack transcript speakers are NOT added, and that is a limitation of the upstream
     # dataset rather than a modelling choice, so it is stated plainly here and in the README.
@@ -1380,13 +1400,21 @@ _SLACK_NUMBER = re.compile(r"-?(?:[0-9]+(?:[.][0-9]+)?|[.][0-9]+)(?:[eE]-?[0-9]+
 
 def _slack_number(key: str, raw: str) -> int | None:
     """The value of one numeric argument by the rule on `_SLACK_INTEGER`, or None where real
-    refuses it. A `limit` is its integer part (`1.5` is 1, `3.99999` is 3), and one too large for a
-    float (`1e400`) is zero, which `_limit` serves as no `limit`, as real served every item."""
+    refuses it. A `limit` is its integer part (`1.5` is 1, `3.99999` is 3, `-1.5` is -1), and one
+    too large for a float (`1e400`) is zero, which `_limit` serves as no `limit`, as real served
+    every item. An integer part at or past 2**63 wraps around 2**64, so `9223372036854775808` and
+    `1e19` are negative and `1e300` is zero, and one below -2**63 stays negative: the reading that
+    every row of the measurement on `_limit` agrees with."""
     if key == "limit":
         if not _SLACK_NUMBER.fullmatch(raw):
             return None
+        if _SLACK_INTEGER.fullmatch(raw) and -(2**63) <= int(raw) < 2**63:
+            return int(raw)
         x = float(raw)
-        return int(x) if math.isfinite(x) else 0
+        if not math.isfinite(x):
+            return 0
+        n = int(x)
+        return (n + 2**63) % 2**64 - 2**63 if n >= 2**63 else n
     if not _SLACK_INTEGER.fullmatch(raw):
         return None
     n = int(raw)
@@ -1432,7 +1460,16 @@ def _limit(request: Request) -> tuple[int, JSONResponse | None]:
     2026-10-11). A `limit` read as zero is read as no `limit` at all: on `conversations.list`,
     `users.list`, `conversations.members` and `conversations.history`, `0` (measured 2026-10-03
     and 2026-10-05) and `00` (2026-10-05) answered what the same request without `limit`
-    answers, every item and an empty `next_cursor`, on collections of 8 to 21."""
+    answers, every item and an empty `next_cursor`, on collections of 8 to 21.
+
+    A negative `limit` is returned as it is, for each method to serve as real does (measured
+    2026-10-12, one workspace of 21 members and 8 public channels, `-1` to `-1e19`):
+    `conversations.list` and `conversations.members` serve every item, as for no `limit`;
+    `conversations.history` serves one message; `users.list` serves no members and a cursor for
+    `-1`, and answers `fatal_error` for anything lower. On `users.list`, measured 2026-10-16 on the
+    same workspace, the cursor `-1` serves goes on from the second member, as the one `limit=1`
+    serves does; `-1` beside a cursor that decodes is `internal_error`; and a cursor that does not
+    decode is `invalid_cursor` ahead of the other two (`cursor=bogus&limit=-2`)."""
     default = get_settings().default_page_size
     values, err = _numbers(request, ("limit", default))
     return values["limit"] or default, err

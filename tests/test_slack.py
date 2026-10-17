@@ -1025,6 +1025,117 @@ def test_slack_numeric_arguments_are_read_as_real_reads_them(client, admin_h, me
         assert any(v for v in same.values() if isinstance(v, list)), same
 
 
+_EVERY = "<every item, as with no limit>"
+_FATAL = "<fatal_error>"
+# A channel of three messages and three members beside a second channel, so that one item, every
+# item and none differ on each of the four methods.
+_PAGED_SLACK = [
+    *(
+        {
+            "source_type": "slack",
+            "channel": "general",
+            "content": f"message {n}",
+            "author_email": f"{who}@x.com",
+            "visibility": "public",
+            "created": f"2026-03-0{n}T09:00:00Z",
+        }
+        for n, who in enumerate(("ava", "bo", "cy"), start=1)
+    ),
+    {
+        "source_type": "slack",
+        "channel": "random",
+        "content": "hi",
+        "author_email": "ava@x.com",
+        "visibility": "public",
+        "created": "2026-03-04T09:00:00Z",
+    },
+]
+
+
+@pytest.fixture(scope="module")
+def paged_slack(tmp_path_factory):
+    s = tiny_corpus(tmp_path_factory.mktemp("paged-slack"), _PAGED_SLACK)
+    with client_for(s, reload=True) as c:
+        yield c, {"Authorization": f"Bearer {s.admin_token}"}
+
+
+@pytest.mark.parametrize(
+    "method, limit, want",
+    [
+        *(
+            (m, v, _EVERY)
+            for m in ("conversations.list", "conversations.members")
+            for v in ("-1", "-1.5", "-5", "-9223372036854775809", "-1e19", "1e19", "9.3e18")
+        ),
+        *(
+            ("conversations.history", v, 1)
+            for v in ("-1", "-1.5", "-2", "-9223372036854775808", "-1e19", "1e19", "9.3e18")
+        ),
+        *(("users.list", v, 0) for v in ("-1", "-1.5")),
+        *(
+            ("users.list", v, _FATAL)
+            for v in ("-2", "-5", "-9223372036854775808", "-9223372036854775809", "-1e19")
+            + ("9223372036854775808", "9.3e18", "1e19")
+        ),
+        *(
+            (m, v, _EVERY)
+            for m in ("users.list", "conversations.history")
+            for v in ("9223372036854775807", "9.2e18", "1e300")
+        ),
+        *((m, "1", 1) for m in ("conversations.list", "conversations.members", "users.list")),
+    ],
+)
+def test_slack_negative_and_out_of_range_limits(paged_slack, method, limit, want):
+    """A negative `limit`, and one past a signed 64-bit integer, as slack.com/api answered each:
+    the rows of the measurement on `_limit`, with `limit=1` as the control."""
+    client, admin_h = paged_slack
+    channels = client.get("/slack/api/conversations.list", headers=admin_h).json()["channels"]
+    general = next(ch["id"] for ch in channels if ch["name"] == "general")
+    channel = (
+        {"channel": general} if method in ("conversations.history", "conversations.members") else {}
+    )
+
+    def get(**ps):
+        r = client.get(f"/slack/api/{method}", headers=admin_h, params={**channel, **ps})
+        assert r.status_code == 200
+        return r.json()
+
+    got = get(limit=limit)
+    if want == _FATAL:
+        assert got == {"ok": False, "error": "fatal_error"}
+        return
+    assert got["ok"] is True
+    if want == _EVERY:
+        assert got == get()
+    elif want == 0:  # no members, and the cursor `limit=1` would give
+        assert got["members"] == []
+        assert got["response_metadata"] == get(limit="1")["response_metadata"]
+    else:  # one item, as `limit=1` serves, which is not every item
+        assert got == get(limit="1") != get()
+
+
+@pytest.mark.parametrize(
+    "cursor, limit, error",
+    [
+        ("bogus", "-1", "invalid_cursor"),
+        ("bogus", "-2", "invalid_cursor"),
+        ("<the -1 page's>", "-1", "internal_error"),
+        ("<the -1 page's>", "-1.5", "internal_error"),
+        ("<the -1 page's>", "-5", "fatal_error"),
+    ],
+)
+def test_slack_users_list_reads_the_cursor_before_a_negative_limit(
+    client, admin_h, cursor, limit, error
+):
+    """The refusals `_limit` records for a negative `limit` beside a cursor on `users.list`."""
+    users = "/slack/api/users.list"
+    if cursor != "bogus":
+        page = client.get(users, headers=admin_h, params={"limit": "-1"}).json()
+        cursor = page["response_metadata"]["next_cursor"]
+    r = client.get(users, headers=admin_h, params={"cursor": cursor, "limit": limit})
+    assert r.json() == {"ok": False, "error": error}
+
+
 def test_slack_search_all(client, admin_h):
     # slack-go's Search()/SearchContext() hits search.all; it must return both messages + files.
     j = client.post("/slack/api/search.all", headers=admin_h, data={"query": "the"}).json()
