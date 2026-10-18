@@ -3725,10 +3725,10 @@ def test_the_characters_the_serializer_escapes():
     [
         ("\t", "\\t"),
         ("\\", "\\\\"),
-        ("", "\\u007f"),
-        ("­", "\\u00ad"),
-        ("​", "\\u200b"),
-        (" ", "\\u2028"),
+        ("\u007f", "\\u007f"),
+        ("\u00ad", "\\u00ad"),
+        ("\u200b", "\\u200b"),
+        ("\u2028", "\\u2028"),
         ("\U0001d173", "\\ud834\\udd73"),
         ("\U000e0001", "\\udb40\\udc01"),
     ],
@@ -3750,10 +3750,10 @@ def test_a_callback_name_reaches_the_wrapper_escaped(client, admin_h, ch, writte
 @pytest.mark.parametrize(
     "ch, written",
     [
-        ("­", "\\u00ad"),
-        ("", "\\u007f"),
-        ("​", "\\u200b"),
-        (" ", "\\u2028"),
+        ("\u00ad", "\\u00ad"),
+        ("\u007f", "\\u007f"),
+        ("\u200b", "\\u200b"),
+        ("\u2028", "\\u2028"),
         ("\U0001d173", "\\ud834\\udd73"),
     ],
 )
@@ -5308,14 +5308,10 @@ def test_editor_apis_reject_a_folder(base, admin_h):
 
 
 def test_editor_apis_distinguish_hidden_type_permission_and_missing(tmp_path):
-    """Sheets and Docs resolve a stored file's type before its visibility (`_editor_doc`). A hidden
-    file of the API's own type is permission-denied, another native type is not-found, an Office
-    file of the API's own family is a failed precondition, and a PDF or an Office file of the other
-    family is an invalid argument. Slides resolves visibility first, so a hidden presentation is
-    not-found there, as an id that does not exist is on Sheets and Docs. The files the scoped token
-    can see are served. At `$.xgafv=1` the 403's entry is ``forbidden`` and the Office 400's
-    ``failedPrecondition``."""
-    hidden = ("spreadsheet", "document", "presentation", "pdf", "xlsx", "docx")
+    """Each editor API's answers for the files a scoped token cannot see, as `_editor_doc` reads
+    them, beside the files it can see. At `$.xgafv=1` the 403's entry is ``forbidden`` and the
+    Office 400's ``failedPrecondition``."""
+    hidden = ("spreadsheet", "document", "presentation", "pdf", "xlsx", "docx", "pptx")
     records = [
         {
             "source_type": "google_drive",
@@ -5338,15 +5334,18 @@ def test_editor_apis_distinguish_hidden_type_permission_and_missing(tmp_path):
             "author_email": "mia@acme.com",
             "visibility": "public",
         }
-        for kind in ("spreadsheet", "document")
+        for kind in ("spreadsheet", "document", "presentation")
     ]
     settings = tiny_corpus(tmp_path, records)
     token_data = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
     tokens = {u["email"]: u["token"] for u in token_data["users"]}
     outsider = {"Authorization": f"Bearer {tokens['mia@acme.com']}"}
-    sheet, doc, deck, pdf, xlsx, docx = (served_id("google_drive", f"hidden-{k}") for k in hidden)
+    sheet, doc, deck, pdf, xlsx, docx, pptx = (
+        served_id("google_drive", f"hidden-{k}") for k in hidden
+    )
     own_sheet = served_id("google_drive", "mia-spreadsheet")
     own_doc = served_id("google_drive", "mia-document")
+    own_deck = served_id("google_drive", "mia-presentation")
 
     def refusal(code, message, status):
         return {"error": {"code": code, "message": message, "status": status}}
@@ -5359,8 +5358,10 @@ def test_editor_apis_distinguish_hidden_type_permission_and_missing(tmp_path):
     rows = [
         (f"/sheets/v4/spreadsheets/{own_sheet}", 200, None),
         (f"/docs/v1/documents/{own_doc}", 200, None),
+        (f"/slides/v1/presentations/{own_deck}", 200, None),
         (f"/sheets/v4/spreadsheets/{sheet}", 403, permission),
         (f"/docs/v1/documents/{doc}", 403, permission),
+        (f"/slides/v1/presentations/{deck}", 403, permission),
         (
             f"/docs/v1/documents/{doc}?suggestionsViewMode=NOPE",
             400,
@@ -5369,15 +5370,21 @@ def test_editor_apis_distinguish_hidden_type_permission_and_missing(tmp_path):
         (f"/docs/v1/documents/{own_doc}?suggestionsViewMode=SUGGESTIONS_INLINE", 200, None),
         (f"/sheets/v4/spreadsheets/{xlsx}", 400, office),
         (f"/docs/v1/documents/{docx}", 400, office),
+        (f"/slides/v1/presentations/{pptx}", 400, office),
         (f"/sheets/v4/spreadsheets/{pdf}", 400, invalid),
         (f"/docs/v1/documents/{pdf}", 400, invalid),
+        (f"/slides/v1/presentations/{pdf}", 400, invalid),
         (f"/sheets/v4/spreadsheets/{docx}", 400, invalid),
         (f"/docs/v1/documents/{xlsx}", 400, invalid),
+        (f"/slides/v1/presentations/{xlsx}", 400, invalid),
+        (f"/slides/v1/presentations/{docx}", 400, invalid),
         (f"/sheets/v4/spreadsheets/{doc}", 404, not_found),
         (f"/docs/v1/documents/{sheet}", 404, not_found),
-        (f"/slides/v1/presentations/{deck}", 404, not_found),
+        (f"/slides/v1/presentations/{doc}", 404, not_found),
+        (f"/slides/v1/presentations/{sheet}", 404, not_found),
         ("/sheets/v4/spreadsheets/nosuchfile000", 404, not_found),
         ("/docs/v1/documents/nosuchfile000", 404, not_found),
+        ("/slides/v1/presentations/nosuchfile000", 404, not_found),
     ]
     with client_for(settings, reload=True) as client:
         for path, status, body in rows:
@@ -5387,7 +5394,9 @@ def test_editor_apis_distinguish_hidden_type_permission_and_missing(tmp_path):
                 assert response.json() == body, path
         for path, message, reason in (
             (f"/sheets/v4/spreadsheets/{sheet}", permission["error"]["message"], "forbidden"),
+            (f"/slides/v1/presentations/{deck}", permission["error"]["message"], "forbidden"),
             (f"/docs/v1/documents/{docx}", OFFICE_MSG, "failedPrecondition"),
+            (f"/slides/v1/presentations/{pptx}", OFFICE_MSG, "failedPrecondition"),
         ):
             verbose = client.get(path, headers=outsider, params={"$.xgafv": "1"})
             assert verbose.json()["error"]["errors"] == [
