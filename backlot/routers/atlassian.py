@@ -498,8 +498,15 @@ def _jira_project_order(raw: str) -> None:
     )
 
 
-@router.get("/rest/api/3/project/search")
+@router.get(
+    "/rest/api/3/project/search",
+    openapi_extra={"parameters": [qp("startAt", "integer"), qp("maxResults", "integer")]},
+)
 async def jira_project_search(request: Request):
+    # Jira Cloud, measured 2026-10-16: integer conversion precedes orderBy;
+    # startAt is a long floored at zero, and maxResults is clamped to 1..100.
+    start = max(0, _int_param(request, "startAt", 0, width=JAVA_LONG))
+    limit = min(100, max(1, _int_param(request, "maxResults", 50)))
     # Read for the refusal above. The sort itself is not served, so `orderBy` stays undeclared:
     # `qp` is for a parameter Backlot honours, and advertising this one would offer a client an
     # order the listing never applies. `backlot diff --source jira` keeps the gap.
@@ -525,7 +532,52 @@ async def jira_project_search(request: Request):
                 "self": f"{_site(request)}/rest/api/3/project/{key}",
             }
         )
-    return {"values": values, "maxResults": 50, "startAt": 0, "total": len(values), "isLast": True}
+    total = len(values)
+    page = values[start : start + limit]
+    answer = {"self": _project_search_link(request, start, limit)}
+    if start + len(page) < total:
+        answer["nextPage"] = _project_search_link(request, start + limit, limit)
+    return answer | {
+        "maxResults": limit,
+        "startAt": start,
+        "total": total,
+        "isLast": start + len(page) >= total,
+        "values": page,
+    }
+
+
+def _project_search_link(request: Request, start: int, limit: int) -> str:
+    """`project/search`'s `self` at ``start``, and its `nextPage` at the page after: every parameter
+    the request sent but `startAt` and `maxResults`, each value of a repeated one, by its name and
+    value as sent (`a%2Bb`, `a+b`, `b%6Fgus`; a bare `bogus` as `bogus=`, and `=x` as `x=`), then
+    `maxResults` and `startAt` as read. Real lists them in the order a `java.util.HashMap` holding
+    them in that order iterates: by the bucket each name's `String.hashCode` spreads to, over
+    sixteen buckets doubled while the map is more than three quarters full, and in the order put
+    within a bucket (`maxResults=1&Zeta=1&alpha=2` links `Zeta=1&maxResults=1&alpha=2&startAt=0`).
+    Measured 2026-10-17 on a site of one project and on ecosystem.atlassian.net (100 projects,
+    anonymous), where `nextPage` came with every page but the last."""
+    params: dict[str, list[str]] = {}
+    for piece in request.scope["query_string"].decode("latin-1").split("&"):
+        name, _, value = piece.partition("=")
+        if not name:
+            name, value = value, ""
+        if name and name not in ("startAt", "maxResults"):
+            params.setdefault(name, []).append(value)
+    params["maxResults"], params["startAt"] = [str(limit)], [str(start)]
+    capacity = 16
+    while len(params) > capacity * 3 // 4:
+        capacity *= 2
+
+    def bucket(name: str) -> int:
+        code = 0
+        for char in name:
+            code = (31 * code + ord(char)) & 0xFFFFFFFF
+        return (code ^ (code >> 16)) & (capacity - 1)
+
+    query = "&".join(
+        f"{name}={value}" for name in sorted(params, key=bucket) for value in params[name]
+    )
+    return f"{_site(request)}/rest/api/3/project/search?{query}"
 
 
 def _jira_project_id(container: str) -> str:
