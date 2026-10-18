@@ -636,9 +636,21 @@ async def gmail_label_get(user_id: str, label_id: str, request: Request):
     return _label_obj(label_id, (messages, threads) if label_id == _GMAIL_DEFAULT_LABEL else (0, 0))
 
 
-# The lookbehinds are the four `_GMAIL_ADDRESS_KEYS`; their comment says why.
+# The operators that read the word after whitespace as their value. Measured on a Workspace
+# mailbox: on 2026-10-16, `from: <word>`, `bcc: <word>`, `to:<tab><word>`, `From: <word>` and
+# `TO: <word>` answered the ids the operator answers with no whitespace, and `to: from: bcc:`
+# answered nothing; on 2026-10-17, so did `subject:`, `label:` and `in:` after a space or a tab
+# (`subject:` after two spaces or a no-break space too), and `after:`, `before:`, `newer:` and
+# `older:` after one space or three. A tab after those four leaves the operator empty:
+# `after:<tab>1` answered the messages holding both search terms `after` and `1`. `has:`,
+# `newer_than:`, `older_than:` and `larger:` read nothing after a space: `has: attachment` answered
+# nothing where `has:attachment` answered 160 messages.
+_GMAIL_SPACED = (
+    r"(?<=\bfrom:)|(?<=\bto:)|(?<=\bcc:)|(?<=\bbcc:)|(?<=\bsubject:)|(?<=\blabel:)|(?<=\bin:)"
+)
+_GMAIL_DATED = r"(?<=\bafter:)|(?<=\bbefore:)|(?<=\bnewer:)|(?<=\bolder:)"
 _GMAIL_OP = re.compile(
-    r'(\w+):(?:(?:(?<=\bfrom:)|(?<=\bto:)|(?<=\bcc:)|(?<=\bbcc:))\s*)?("[^"]*"|\S*)', re.IGNORECASE
+    rf'(\w+):(?:(?:{_GMAIL_SPACED})\s*|(?:{_GMAIL_DATED}) *)?("[^"]*"|\S*)', re.IGNORECASE
 )
 # operators we honor; anything else stays as free text
 _GMAIL_KEYS = {
@@ -664,13 +676,8 @@ _GMAIL_KEYS = {
 # `newer`, as an empty `after:` is `after`, and `_GMAIL_OP` leaves both in the free text.
 _GMAIL_KEY_ALIASES = {"newer": "after", "older": "before"}
 # The address operators. A Gmail search ignores one with no value rather than searching it as free
-# text, and reads the word after whitespace as its value. Measured on a Workspace mailbox: `to:`,
-# `from:` and `bcc:` with no value answered every message, as no `q` does (2026-10-14), and so did
-# `cc:`, `from:""` and `to:""` (2026-10-16). On 2026-10-16, `from: <word>`, `bcc: <word>`,
-# `to:<tab><word>`, `From: <word>` and `TO: <word>` answered the ids the operator answers with no
-# whitespace, and `to: from: bcc:` answered nothing. `has: attachment` and `newer_than: 7d` answered
-# nothing where `has:attachment` and `newer_than:7d` answered 160 and 36 messages, so `_GMAIL_OP`
-# reads across whitespace for these four alone.
+# text. Measured on a Workspace mailbox: `to:`, `from:` and `bcc:` with no value answered every
+# message, as no `q` does (2026-10-14), and so did `cc:`, `from:""` and `to:""` (2026-10-16).
 _GMAIL_ADDRESS_KEYS = {"from", "to", "cc", "bcc"}
 # The operators whose value a `+` ends. Measured on a Workspace mailbox on 2026-10-15:
 # `cc:<local>+<word>`, `from:<local>+update` and `to:<local>+update` answered the ids of the
