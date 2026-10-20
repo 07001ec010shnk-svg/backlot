@@ -17,6 +17,7 @@ import sqlite3
 import pytest
 
 from backlot.graphql import body as request_body
+from backlot.graphql import v8_json
 from tests._helpers import build_corpus, client_for, crawl_confluence, db_count, padded_query
 
 
@@ -386,12 +387,22 @@ def test_cloudflare_refuses_a_repeated_authorization(
         assert r.content == page
 
 
-@pytest.mark.parametrize("vendor", ["linear", "fireflies"])
-def test_a_graphql_vendor_reads_the_body_in_a_worker_thread(client, monkeypatch, vendor):
+@pytest.mark.parametrize(
+    "vendor, reader, body",
+    [
+        pytest.param("linear", (request_body, "decode"), _TYPENAME, id="linear"),
+        pytest.param("fireflies", (request_body, "decode"), _TYPENAME, id="fireflies"),
+        pytest.param("linear", (v8_json, "error"), b"{", id="linear, V8's message"),
+    ],
+)
+def test_a_graphql_vendor_reads_the_body_in_a_worker_thread(
+    client, monkeypatch, vendor, reader, body
+):
     """The router hands the body to its reader through ``run_in_threadpool``, so the reader runs
     where no event loop does and the loop serves other requests while it reads."""
+    module, name = reader
     where = []
-    original = request_body.decode
+    original = getattr(module, name)
 
     def recording(*args):
         try:
@@ -401,8 +412,8 @@ def test_a_graphql_vendor_reads_the_body_in_a_worker_thread(client, monkeypatch,
             where.append("a worker thread")
         return original(*args)
 
-    monkeypatch.setattr(request_body, "decode", recording)
-    client.post(f"/{vendor}/graphql", json={"query": "{ __typename }"})
+    monkeypatch.setattr(module, name, recording)
+    client.post(f"/{vendor}/graphql", content=body, headers={"Content-Type": "application/json"})
     assert where == ["a worker thread"]
 
 
