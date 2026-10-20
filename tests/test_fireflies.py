@@ -16,10 +16,12 @@ from graphql import build_client_schema, parse, validate
 from backlot import store
 from backlot.graphql import mcp_tools
 from tests._helpers import (
+    SWEPT_BYTES,
     client_for,
     corpus_client,
     gql,
     padded_query,
+    sent_as,
     served_id,
     tiny_corpus,
 )
@@ -36,18 +38,80 @@ def ff_gql(client, query, headers, **variables):
     return client.post("/fireflies/graphql", json=body, headers=headers)
 
 
-def test_fireflies_requires_a_bearer_key(client):
-    r = client.post("/fireflies/graphql", json={"query": "{ transcripts { id } }"})
-    assert r.status_code == 401
-    # a GraphQL error envelope, not a framework 403 — clients parse errors[0].message
-    assert r.json()["errors"][0]["message"]
-    assert "data" not in r.json()
-    bad = client.post(
-        "/fireflies/graphql",
-        json={"query": "{ transcripts { id } }"},
-        headers={"Authorization": "Bearer not-a-real-key"},
+# The two 500s `backlot.routers.fireflies._auth_failed` answers, as real sends them but for the
+# newline real ends each with, which `_auth_failed` leaves off.
+_NO_PREFIX = (
+    b'{"errors":[{"friendly":true,"code":"auth_failed","message":"Authorization header is missing'
+    b" the 'Bearer' prefix. Please use the format: 'Authorization: Bearer <api_key>'. If this"
+    b' persists, please contact Fireflies support.","extensions":{"code":"auth_failed"}}]}'
+)
+_BAD_KEY = (
+    b'{"errors":[{"friendly":true,"code":"auth_failed","message":"An error occurred while'
+    b" authenticating your request. Please recheck your API key and try again. If this persists,"
+    b' please contact Fireflies support.","extensions":{"code":"auth_failed"}}]}'
+)
+# Values of the header, None for none and `{t}` for a key that resolves, with the 500 Fireflies
+# refused each with or None where it served the query.
+_FIREFLIES_SPELLINGS = [
+    pytest.param("Bearer {t}", None, id="Bearer"),
+    pytest.param("bEaReR {t}", None, id="bEaReR"),
+    pytest.param("Bearer  {t}", None, id="two spaces"),
+    pytest.param(" Bearer {t}", None, id="a space before"),
+    pytest.param("Bearer \xa0{t}\xa0", None, id="U+00A0 around the key"),
+    pytest.param(None, _BAD_KEY, id="no header"),
+    pytest.param("", _BAD_KEY, id="an empty header"),
+    pytest.param("Bearer nope", _BAD_KEY, id="Bearer nope"),
+    pytest.param("Bearer {t} extra", _BAD_KEY, id="a word after"),
+    pytest.param("Bearer {t}x", _BAD_KEY, id="a key that does not resolve"),
+    pytest.param("Bearer {t}\x85", _BAD_KEY, id="U+0085 after"),
+    pytest.param("Bearer \xa0", _BAD_KEY, id="U+00A0 alone"),
+    pytest.param("Bearer \xa0\xa0", _BAD_KEY, id="U+00A0 twice"),
+    pytest.param("Bearer\t{t}", _NO_PREFIX, id="a tab"),
+    pytest.param("Bearer", _NO_PREFIX, id="Bearer alone"),
+    pytest.param("Bearer{t}", _NO_PREFIX, id="no space"),
+    pytest.param("Bearer,{t}", _NO_PREFIX, id="a comma"),
+    pytest.param("\xa0Bearer {t}", _NO_PREFIX, id="U+00A0 before"),
+    pytest.param("{t}", _NO_PREFIX, id="bare"),
+    pytest.param("Token {t}", _NO_PREFIX, id="Token"),
+]
+
+
+# `SWEPT_BYTES` in three places of the header: the bytes that served the query, and the 500 every
+# other byte drew.
+_FIREFLIES_BYTES = {
+    "Bearer{x}{t}": ({0x20}, _NO_PREFIX),
+    "Bearer {x}{t}": ({0x09, 0x20, 0xA0}, _BAD_KEY),
+    "Bearer {t}{x}": ({0x09, 0x20, 0xA0}, _BAD_KEY),
+}
+
+
+def _fireflies_credentials() -> list:
+    """`_FIREFLIES_SPELLINGS`, then each of `SWEPT_BYTES` in each place `_FIREFLIES_BYTES` names,
+    less the values the table already holds."""
+    rows = list(_FIREFLIES_SPELLINGS)
+    seen = {row.values[0] for row in rows}
+    for shape, (served, refusal) in _FIREFLIES_BYTES.items():
+        for byte in SWEPT_BYTES:
+            value = shape.replace("{x}", chr(byte))
+            if value not in seen:
+                seen.add(value)
+                answer = None if byte in served else refusal
+                rows.append(pytest.param(value, answer, id=f"{shape} {byte:#04x}"))
+    return rows
+
+
+@pytest.mark.parametrize("value, refusal", _fireflies_credentials())
+def test_fireflies_reads_a_credential_as_fireflies_does(client, tokens_yaml, value, refusal):
+    headers = {"Content-Type": "application/json"}
+    if value is not None:
+        headers["Authorization"] = value.replace("{t}", tokens_yaml["admin_token"])
+    r = sent_as(
+        client, "POST", "/fireflies/graphql", headers, content=b'{"query":"{ __typename }"}'
     )
-    assert bad.status_code == 401
+    if refusal is None:
+        assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
+    else:
+        assert (r.status_code, r.content) == (500, refusal)
 
 
 # --- a body Fireflies reads ahead of the credential ----------------------------------------------
@@ -55,8 +119,8 @@ def test_fireflies_requires_a_bearer_key(client):
 # answer to it with the key: `_EMPTY`, `_NOT_JSON` or `_TOO_LARGE`, its HTTP layer's refusals
 # `backlot.routers.fireflies._body_refusal` sends at the status their `statusCode` names, or None
 # where it served the query. `_REQUEST_ERROR` is a row of JSON that is not an object: past that
-# layer it reaches the credential, and with the key it is a 400, in Apollo Server's words on real
-# and graphql-js's here.
+# layer it reaches the credential, one of `_auth_failed`'s 500s without the key, and with the key
+# it is a 400, in Apollo Server's words on real and graphql-js's here.
 _REQUEST_ERROR = object()
 _EMPTY = (
     b'{"statusCode":400,"status":false,"code":"http","message":"Body cannot be empty when'
@@ -244,7 +308,11 @@ _FIREFLIES_BODIES = [
 ]
 
 
-@pytest.mark.parametrize("credential", ["key", "none", "nope"])
+# Each credential the body table is sent with, and the 500 a body Fireflies reads draws under it.
+_BODY_CREDENTIALS = {"key": None, "none": _BAD_KEY, "Bearer nope": _BAD_KEY, "nope": _NO_PREFIX}
+
+
+@pytest.mark.parametrize("credential", _BODY_CREDENTIALS)
 @pytest.mark.parametrize(
     "headers,body,answer",
     [pytest.param((), *row.values, id=row.id) for row in _FIREFLIES_BODIES] + _FIREFLIES_READS,
@@ -257,19 +325,18 @@ def test_fireflies_reads_the_body_before_the_credential(
     if not any(name == "Content-Type" for name, _ in headers):
         headers = (("Content-Type", "application/json"), *headers)
     if credential != "none":
-        key = admin_h["Authorization"] if credential == "key" else "Bearer nope"
+        key = admin_h["Authorization"] if credential == "key" else credential
         headers = (*headers, ("Authorization", key))
     r = client.post("/fireflies/graphql", content=body, headers=list(headers))
-    if answer is _REQUEST_ERROR:
-        if credential == "key":
-            assert r.json() == {"errors": [{"message": "POST body sent invalid JSON."}]}
-        assert r.status_code == (400 if credential == "key" else 401)
-    elif answer is not None:
+    if answer is not None and answer is not _REQUEST_ERROR:
         assert (r.status_code, r.content) == (json.loads(answer)["statusCode"], answer)
-    elif credential == "key":
-        assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
+    elif credential != "key":
+        assert (r.status_code, r.content) == (500, _BODY_CREDENTIALS[credential])
+    elif answer is _REQUEST_ERROR:
+        assert r.json() == {"errors": [{"message": "POST body sent invalid JSON."}]}
+        assert r.status_code == 400
     else:
-        assert r.status_code == 401
+        assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
 
 
 def test_fireflies_admin_crawl_sees_every_stored_transcript(client, admin_h, ro_conn):

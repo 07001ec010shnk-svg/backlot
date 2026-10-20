@@ -271,6 +271,12 @@ def gql(client, path: str, query: str, token: str | None = None, **variables):
     return client.post(path, json=body, headers=headers)
 
 
+# The bytes the credential sweeps put into `Authorization`: each latin-1 byte but the control
+# characters other than the tab, whose answers, where they were sent, are in
+# `backlot.auth.api_key_token`.
+SWEPT_BYTES = (0x09, *range(0x20, 0x7F), *range(0x80, 0x100))
+
+
 def sent_as(client, method: str, path: str, headers, content=None):
     """``method`` on ``path`` with each header's latin-1 bytes as sent, ``headers`` a mapping or a
     sequence of pairs, which can name a header twice. The TestClient re-encodes a header's bytes

@@ -10,6 +10,7 @@ not merely that it filters something.
 from __future__ import annotations
 
 import gzip
+import itertools
 import json
 import zlib
 from datetime import datetime, timezone
@@ -22,6 +23,7 @@ from backlot import synth
 from backlot.fidelity.graphql_diff import backlot_schema
 from backlot.graphql import linear_filters, mcp_tools
 from tests._helpers import (
+    SWEPT_BYTES,
     build_corpus,
     client_for,
     complete,
@@ -46,6 +48,13 @@ def gql(client, query, headers, **variables):
     if variables:
         body["variables"] = variables
     return client.post("/linear/graphql", json=body, headers=headers)
+
+
+@pytest.fixture(scope="module")
+def admin_h(tokens_yaml) -> dict[str, str]:
+    """The admin token with no scheme, as ``backlot.auth.api_key_token`` reads it; the shared
+    fixture's ``Bearer <token>`` is ``_API_KEY_AS_BEARER``."""
+    return {"Authorization": tokens_yaml["admin_token"]}
 
 
 def linear_user_token(tokens_yaml, email):
@@ -414,13 +423,14 @@ def test_linear_unauthenticated_is_401(client):
     assert r.json()["errors"][0]["message"] == "Authentication required"
 
 
-# --- the body, read before the credential -------------------------------------------------------
+# --- the body, and where the credential is read against it ---------------------------------------
 # The headers a body was sent with beyond `Content-Type: application/json`, the body, and the bytes
 # Linear refused it with, at the status their `code` names (400 where there is none), or None where
 # Linear served the query, as `backlot.graphql.body` reads them. `_GRAPHQL_JS_NOT_JSON` marks the
-# rows `backlot.routers.linear._read` answers in graphql-js's words whatever the credential: `{`
-# and `-NaN` however they arrive, and a body with no text. `_REQUEST_ERROR` marks a JSON array, the
-# 400 with the key; Linear answers it with `Operation batching disabled.` with or without one.
+# rows `backlot.routers.linear._read` answers in graphql-js's words for the key, no credential and
+# `nope` alike: `{` and `-NaN` however they arrive, and a body with no text. `_REQUEST_ERROR` marks
+# a JSON array, the 400 with the key; Linear answers it with `Operation batching disabled.` with or
+# without one.
 _GRAPHQL_JS_NOT_JSON = b'{"errors":[{"message":"POST body sent invalid JSON."}]}'
 _REQUEST_ERROR = object()
 _LINEAR_BODIES = [
@@ -1146,23 +1156,33 @@ _LINEAR_READS = [
 ]
 
 
-@pytest.mark.parametrize("credential", ["key", "none", "nope"])
+# `Bearer` and a value in a Linear API key's shape that no account holds.
+_KEY_SHAPED = "Bearer lin_api_" + "0" * 40
+
+
+@pytest.mark.parametrize("credential", ["key", "none", "nope", "Bearer key", "Bearer, key-shaped"])
 @pytest.mark.parametrize(
     "headers,body,answer",
     [pytest.param((), *row.values, id=row.id) for row in _LINEAR_BODIES] + _LINEAR_READS,
 )
-def test_linear_reads_the_body_before_the_credential(
+def test_linear_orders_the_body_and_the_credential(
     client, tokens_yaml, credential, headers, body, answer
 ):
     """Each row answers as the comment over `_LINEAR_BODIES` says, and every refusal but a
-    `_REQUEST_ERROR` row's is the same whatever the credential."""
+    `_REQUEST_ERROR` row's is the same for the key, no credential and `nope`; an API key under
+    `Bearer`, and `_KEY_SHAPED`, are `_API_KEY_AS_BEARER` ahead of every body."""
+    admin = tokens_yaml["admin_token"]
     if not any(name == "Content-Type" for name, _ in headers):
         headers = (("Content-Type", "application/json"), *headers)
     if credential != "none":
-        key = tokens_yaml["admin_token"] if credential == "key" else "nope"
+        key = {"key": admin, "nope": "nope", "Bearer key": f"Bearer {admin}"}.get(
+            credential, _KEY_SHAPED
+        )
         headers = (*headers, ("Authorization", key))
     r = sent_as(client, "POST", "/linear/graphql", headers, content=body)
-    if answer is _REQUEST_ERROR:
+    if credential.startswith("Bearer"):
+        assert (r.status_code, r.content) == (400, _API_KEY_AS_BEARER)
+    elif answer is _REQUEST_ERROR:
         if credential == "key":
             assert r.content == _GRAPHQL_JS_NOT_JSON
         assert r.status_code == (400 if credential == "key" else 401)
@@ -3710,10 +3730,6 @@ def test_attachment_string_fields_follow_linears_null_rules(fclient):
 
 
 # --- Linear -----------------------------------------------------------------------
-# Linear's auth is the one shape no other source in this repo uses: the personal API key is the
-# BARE `Authorization` value with no scheme, while an OAuth access token is `Bearer <token>`, and
-# the real API accepts both on the same header. Getting this wrong is silent — a stripped-scheme
-# parse would accept `Bearer <key>` and reject the bare key that every real Linear client sends.
 
 LINEAR_CORPUS = [
     {
@@ -3731,12 +3747,6 @@ LINEAR_CORPUS = [
         "priority": 2,
     },
 ]
-
-
-def _linear_identifiers(client, authorization):
-    """``authorization`` verbatim, not a Bearer-wrapped token — these tests assert on the scheme."""
-    r = gql(client, "{ issues { nodes { identifier } } }", {"Authorization": authorization})
-    return r.status_code, r.json()
 
 
 @pytest.mark.parametrize(
@@ -3920,30 +3930,6 @@ def test_an_unset_priority_filters_and_sorts_as_the_zero_it_is_served_as(tmp_pat
         assert [n["identifier"] for n in asc] == ["ENG-1", "ENG-2"]
 
 
-def test_linear_accepts_a_bare_api_key_with_no_scheme(tmp_path):
-    """What `LinearReader` and `@linear/sdk` both send: `Authorization: <key>`, no prefix."""
-    with _linear_client(tmp_path) as (client, settings):
-        status, body = _linear_identifiers(client, settings.admin_token)
-        assert status == 200
-        assert [n["identifier"] for n in body["data"]["issues"]["nodes"]] == ["ENG-9"]
-
-
-def test_linear_accepts_a_bearer_oauth_token(tmp_path):
-    """The OAuth shape, on the same header."""
-    with _linear_client(tmp_path) as (client, settings):
-        status, body = _linear_identifiers(client, f"Bearer {settings.admin_token}")
-        assert status == 200
-        assert [n["identifier"] for n in body["data"]["issues"]["nodes"]] == ["ENG-9"]
-
-
-def test_linear_rejects_a_stray_scheme_rather_than_stripping_it(tmp_path):
-    """To the real API the WHOLE header value is the key, so `Token <key>` is simply a wrong key —
-    not a key with a scheme to discard. Stripping the first word would authenticate a credential
-    the real API refuses."""
-    with _linear_client(tmp_path) as (client, settings):
-        assert _linear_identifiers(client, f"Token {settings.admin_token}")[0] == 401
-
-
 def test_linear_field_error_is_a_200_and_a_syntax_error_is_a_400(tmp_path):
     """Real Linear splits these: a bad document never executed is a 400 with no `data` key, while
     an error raised mid-execution is a 200 carrying `data` alongside `errors`."""
@@ -3957,6 +3943,102 @@ def test_linear_field_error_is_a_200_and_a_syntax_error_is_a_400(tmp_path):
         )
         assert missing.status_code == 200
         assert "data" in missing.json() and missing.json()["errors"]
+
+
+_API_KEY_AS_BEARER = (
+    b'{"errors":[{"message":"It looks like you\'re trying to use an API key as a Bearer token.'
+    b' Remove the Bearer prefix from the Authorization header.","extensions":{"type":"invalid'
+    b' input","code":"INPUT_ERROR","statusCode":400,"userError":true}}]}'
+)
+# `Authorization` values, `{t}` for an API key that resolves, and the status Linear gave each: 200
+# serving the query and 400 being `_API_KEY_AS_BEARER`. Backlot's 401 keeps its own body.
+_LINEAR_SPELLINGS = [
+    pytest.param("{t}", 200, id="bare"),
+    pytest.param(" {t}", 200, id="a space before"),
+    pytest.param("{t} ", 200, id="a space after"),
+    pytest.param("\xa0{t}", 401, id="U+00A0 before"),
+    pytest.param("{t}\xa0", 401, id="U+00A0 after"),
+    pytest.param("{t} extra", 401, id="a word after"),
+    pytest.param("Bearer {t}", 400, id="Bearer"),
+    pytest.param("bearer {t}", 400, id="bearer"),
+    pytest.param("Bearer {t} ", 400, id="Bearer, a space after"),
+    pytest.param(" Bearer {t}", 400, id="Bearer, a space before"),
+    pytest.param("Bearer  {t}", 401, id="Bearer, two spaces"),
+    pytest.param("Bearer\t{t}", 401, id="Bearer, a tab"),
+    pytest.param("Bearer \t{t}", 401, id="Bearer, a space and a tab"),
+    pytest.param("Bearer \xa0{t}", 401, id="Bearer, a space and U+00A0"),
+    pytest.param("Bearer{t}", 401, id="Bearer, no space"),
+    pytest.param("Bearer,{t}", 401, id="Bearer, a comma"),
+    pytest.param("Bearer {t} extra", 401, id="Bearer, a word after"),
+    pytest.param("Bearer {t}x", 401, id="Bearer, a key that does not resolve"),
+    pytest.param("Bearer lin_api_nope", 401, id="Bearer lin_api_nope"),
+    pytest.param(_KEY_SHAPED, 400, id="Bearer, a key's shape Linear never issued"),
+    pytest.param("bearer lin_api_" + "0" * 40, 400, id="bearer, a key's shape"),
+    pytest.param(
+        "Bearer lin_api_" + "aB3" * 13 + "a", 400, id="Bearer, a key's shape in both cases"
+    ),
+    pytest.param(
+        "Bearer lin_api_" + "0" * 39, 401, id="Bearer, a character short of a key's shape"
+    ),
+    pytest.param("Bearer lin_api_" + "0" * 41, 401, id="Bearer, a character past a key's shape"),
+    pytest.param("Bearer lin_api_" + "0" * 39 + "-", 401, id="Bearer, a key's shape ending in -"),
+    pytest.param(_KEY_SHAPED + " x", 401, id="Bearer, a key's shape and a word after"),
+    pytest.param("Bearer LIN_API_" + "0" * 40, 401, id="Bearer, LIN_API_"),
+    pytest.param("Bearer lin_oauth_" + "0" * 40, 401, id="Bearer, lin_oauth_"),
+    pytest.param("BEARER lin_api_" + "0" * 40, 401, id="BEARER, a key's shape"),
+    pytest.param("lin_api_" + "0" * 40, 401, id="a key's shape alone"),
+    pytest.param("Bearer nope", 401, id="Bearer nope"),
+    pytest.param("bearer nope", 401, id="bearer nope"),
+    pytest.param("Token {t}", 401, id="Token"),
+]
+
+
+# `SWEPT_BYTES` in five places of `Authorization`: the statuses other than the 401 every other byte
+# drew.
+_LINEAR_BYTES = {
+    "Bearer{x}{t}": {0x20: 400},
+    "Bearer {x}{t}": {},
+    "Bearer {t}{x}": {0x09: 400, 0x20: 400},
+    "{x}{t}": {0x09: 200, 0x20: 200},
+    "{t}{x}": {0x09: 200, 0x20: 200},
+}
+
+
+def _linear_credentials() -> list:
+    """`_LINEAR_SPELLINGS`, then each of `SWEPT_BYTES` in each place `_LINEAR_BYTES` names and
+    each of the 64 casings of the scheme, less the values the table already holds."""
+    rows = list(_LINEAR_SPELLINGS)
+    seen = {row.values[0] for row in rows}
+
+    def add(value: str, status: int, id: str) -> None:
+        if value not in seen:
+            seen.add(value)
+            rows.append(pytest.param(value, status, id=id))
+
+    for shape, answers in _LINEAR_BYTES.items():
+        for byte in SWEPT_BYTES:
+            add(shape.replace("{x}", chr(byte)), answers.get(byte, 401), f"{shape} {byte:#04x}")
+    for letters in itertools.product(*[(c, c.upper()) for c in "bearer"]):
+        scheme = "".join(letters)
+        add(f"{scheme} {{t}}", 400 if scheme in ("Bearer", "bearer") else 401, scheme)
+    return rows
+
+
+@pytest.mark.parametrize("value, status", _linear_credentials())
+def test_linear_reads_a_credential_as_linear_does(client, tokens_yaml, value, status):
+    header = value.replace("{t}", tokens_yaml["admin_token"])
+    r = sent_as(
+        client,
+        "POST",
+        "/linear/graphql",
+        {"Authorization": header, "Content-Type": "application/json"},
+        content=b'{"query":"{ viewer { id } }"}',
+    )
+    assert r.status_code == status
+    if status == 200:
+        assert r.json()["data"]["viewer"]["id"]
+    elif status == 400:
+        assert r.content == _API_KEY_AS_BEARER
 
 
 def test_linear_issue_asserts_rather_than_re_derive_a_missing_identifier():
