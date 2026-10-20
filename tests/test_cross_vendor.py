@@ -11,10 +11,12 @@ these share are in ``tests/_helpers.py``.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 
 import pytest
 
+from backlot.graphql import body as request_body
 from tests._helpers import build_corpus, client_for, crawl_confluence, db_count
 
 
@@ -283,3 +285,142 @@ def test_health_source_documents_is_null_without_the_meta_key(tmp_path):
         body = client.get("/health").json()
     assert body["source_documents"] is None
     assert body["documents"] == 1
+
+
+# A variable declared `Int` holding a number as the body spells it, and that number as both vendors
+# quoted it back, which the docstrings of `backlot.graphql.body._int` and `Double` record.
+_NUMBERS = [
+    pytest.param("1" * 4301, "Infinity", id="4301 ones"),
+    pytest.param("1" * 311, "Infinity", id="311 ones"),
+    pytest.param("9" * 309, "Infinity", id="309 nines"),
+    pytest.param("1e400", "Infinity", id="1e400"),
+    pytest.param("-1e400", "-Infinity", id="-1e400"),
+    pytest.param("9" * 308, "1e+308", id="308 nines"),
+    pytest.param("9007199254740993", "9007199254740992", id="2**53 + 1"),
+    pytest.param("734946803407896717", "734946803407896700", id="past 2**53"),
+    pytest.param("123456789012345678901234", "1.2345678901234569e+23", id="24 digits"),
+    pytest.param("1e21", "1e+21", id="1e21"),
+    pytest.param("1e20", "100000000000000000000", id="1e20"),
+    pytest.param("3000000000.0", "3000000000", id="3000000000.0"),
+    pytest.param("0.00001", "0.00001", id="0.00001"),
+    pytest.param("1e-7", "1e-7", id="1e-7"),
+]
+
+
+@pytest.mark.parametrize(
+    "vendor, document",
+    [
+        ("linear", "query($x: Int) { issues(first: $x) { nodes { id } } }"),
+        ("fireflies", "query($x: Int) { transcripts(limit: $x) { id } }"),
+    ],
+)
+@pytest.mark.parametrize("number, quoted", _NUMBERS)
+def test_a_graphql_vendor_quotes_a_number_as_javascript_prints_it(
+    client, tokens_yaml, vendor, document, number, quoted
+):
+    """The variable's value is read as the double ``JSON.parse`` reads and quoted as JavaScript
+    prints it, at both places graphql-js quotes it."""
+    admin = tokens_yaml["admin_token"]
+    credential = admin if vendor == "linear" else f"Bearer {admin}"
+    body = '{"query":"%s","variables":{"x":%s}}' % (document, number)
+    r = client.post(
+        f"/{vendor}/graphql", content=body.encode(), headers={"Authorization": credential}
+    )
+    assert r.status_code == 400
+    message = r.json()["errors"][0]["message"]
+    assert f" got invalid value {quoted}; Int cannot represent " in message
+    assert message.endswith(f" value: {quoted}")
+
+
+@pytest.mark.parametrize("vendor", ["linear", "fireflies"])
+def test_a_graphql_vendor_reads_the_body_in_a_worker_thread(client, monkeypatch, vendor):
+    """The router hands the body to its reader through ``run_in_threadpool``, so the reader runs
+    where no event loop does and the loop serves other requests while it reads."""
+    where = []
+    original = request_body.decode
+
+    def recording(*args):
+        try:
+            asyncio.get_running_loop()
+            where.append("the event loop")
+        except RuntimeError:
+            where.append("a worker thread")
+        return original(*args)
+
+    monkeypatch.setattr(request_body, "decode", recording)
+    client.post(f"/{vendor}/graphql", json={"query": "{ __typename }"})
+    assert where == ["a worker thread"]
+
+
+# Half a surrogate pair where graphql-core quotes the client's text without escaping it: the `\u`
+# escape sent, the text the message names, and the bytes that text is on the wire. A pair is the
+# control, the one character it makes.
+_ISSUE_FILTER = "query($f: IssueFilter) { issues(filter: $f) { nodes { id } } }"
+_TWO_OPERATIONS = "query A { __typename } query B { __typename }"
+_HIGH, _LOW = chr(0xD83D), chr(0xDC00)
+_LONE_SURROGATES = [
+    pytest.param("linear", "key", "\\ud83d", _HIGH, b"\\ud83d", id="Linear, a key, the high half"),
+    pytest.param(
+        "linear",
+        "key",
+        "\\uD83D",
+        _HIGH,
+        b"\\ud83d",
+        id="Linear, a key, the high half in upper case",
+    ),
+    pytest.param("linear", "key", "\\udc00", _LOW, b"\\udc00", id="Linear, a key, the low half"),
+    pytest.param(
+        "linear",
+        "key",
+        "\\udc00\\ud83d",
+        _LOW + _HIGH,
+        b"\\udc00\\ud83d",
+        id="Linear, a key, low then high",
+    ),
+    pytest.param(
+        "linear", "operationName", "\\ud83d", _HIGH, b"\\ud83d", id="Linear, an operationName"
+    ),
+    pytest.param(
+        "fireflies", "operationName", "\\ud83d", _HIGH, b"\\ud83d", id="Fireflies, an operationName"
+    ),
+    pytest.param(
+        "fireflies",
+        "operationName",
+        "\\uDC00",
+        _LOW,
+        b"\\udc00",
+        id="Fireflies, the low half in upper case",
+    ),
+    pytest.param(
+        "linear",
+        "key",
+        "\\ud83d" + "\\ude00",
+        chr(0x1F600),
+        chr(0x1F600).encode(),
+        id="Linear, a key, a pair",
+    ),
+]
+
+
+@pytest.mark.parametrize("vendor, where, sent, named, wire", _LONE_SURROGATES)
+def test_a_graphql_vendor_writes_a_lone_surrogate_as_an_escape(
+    client, tokens_yaml, vendor, where, sent, named, wire
+):
+    """The answer is the request error, its message naming the text and its bytes carrying it as
+    `backlot.graphql.body.node_json` writes it."""
+    admin = tokens_yaml["admin_token"]
+    if where == "key":
+        body = '{"query":"%s","variables":{"f":{"%s":1}}}' % (_ISSUE_FILTER, sent)
+        quoted = f"'{named}' is not defined by type"
+    else:
+        body = '{"query":"%s","operationName":"%s"}' % (_TWO_OPERATIONS, sent)
+        quoted = f"operation named '{named}'"
+    credential = admin if vendor == "linear" else f"Bearer {admin}"
+    r = client.post(
+        f"/{vendor}/graphql",
+        content=body.encode(),
+        headers={"Authorization": credential, "Content-Type": "application/json"},
+    )
+    assert r.status_code == 400
+    assert quoted in r.json()["errors"][0]["message"]
+    assert wire in r.content

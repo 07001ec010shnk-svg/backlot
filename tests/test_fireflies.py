@@ -6,6 +6,8 @@ or call the response builder directly.
 
 from __future__ import annotations
 
+import gzip
+import json
 import sqlite3
 
 import pytest
@@ -13,7 +15,14 @@ from graphql import build_client_schema, parse, validate
 
 from backlot import store
 from backlot.graphql import mcp_tools
-from tests._helpers import client_for, corpus_client, gql, served_id, tiny_corpus
+from tests._helpers import (
+    client_for,
+    corpus_client,
+    gql,
+    padded_query,
+    served_id,
+    tiny_corpus,
+)
 
 # --- fireflies: POST /fireflies/graphql -----------------------------------------
 # Fireflies has no SDK and no LlamaIndex reader; the vendor's own quickstart is a raw HTTP POST,
@@ -39,6 +48,228 @@ def test_fireflies_requires_a_bearer_key(client):
         headers={"Authorization": "Bearer not-a-real-key"},
     )
     assert bad.status_code == 401
+
+
+# --- a body Fireflies reads ahead of the credential ----------------------------------------------
+# The headers a body was sent with beyond `Content-Type: application/json`, the body, and Fireflies'
+# answer to it with the key: `_EMPTY`, `_NOT_JSON` or `_TOO_LARGE`, its HTTP layer's refusals
+# `backlot.routers.fireflies._body_refusal` sends at the status their `statusCode` names, or None
+# where it served the query. `_REQUEST_ERROR` is a row of JSON that is not an object: past that
+# layer it reaches the credential, and with the key it is a 400, in Apollo Server's words on real
+# and graphql-js's here.
+_REQUEST_ERROR = object()
+_EMPTY = (
+    b'{"statusCode":400,"status":false,"code":"http","message":"Body cannot be empty when'
+    b' content-type is set to \'application/json\'","errorMessage":"Body cannot be empty when'
+    b" content-type is set to 'application/json'\"}"
+)
+_NOT_JSON = (
+    b'{"statusCode":400,"status":false,"code":"http","message":"Body is not valid JSON but'
+    b' content-type is set to \'application/json\'","errorMessage":"Body is not valid JSON but'
+    b" content-type is set to 'application/json'\"}"
+)
+_TOO_LARGE = (
+    b'{"statusCode":413,"status":false,"code":"http","message":"Request body is too large",'
+    b'"errorMessage":"Request body is too large"}'
+)
+_TYPENAME = b'{"query":"{ __typename }"}'
+
+
+_FIREFLIES_READS = [
+    pytest.param((), padded_query(2**20), None, id="the limit"),
+    pytest.param((), padded_query(2**20 + 1), _TOO_LARGE, id="past the limit"),
+    pytest.param((), b"{" * (2**20 + 1), _TOO_LARGE, id="past the limit, not JSON"),
+    pytest.param((("Content-Encoding", "gzip"),), gzip.compress(_TYPENAME), _NOT_JSON, id="gzip"),
+    pytest.param((("Content-Encoding", "gzip"),), _TYPENAME, None, id="gzip over a plain body"),
+    pytest.param((("Content-Encoding", "bogus"),), _TYPENAME, None, id="bogus"),
+    pytest.param(
+        (("Content-Type", "application/json; charset=latin1"),), _TYPENAME, None, id="latin1"
+    ),
+    pytest.param(
+        (("Content-Type", "application/json; charset=utf-nope"),), _TYPENAME, None, id="utf-nope"
+    ),
+    pytest.param(
+        (("Content-Type", "application/json; charset=utf-16"),),
+        _TYPENAME.decode().encode("utf-16"),
+        _NOT_JSON,
+        id="utf-16",
+    ),
+]
+_FIREFLIES_BODIES = [
+    pytest.param(b'{"query":"{ __typename }"}', None, id="a query"),
+    pytest.param(b"{", _NOT_JSON, id="{"),
+    pytest.param(b"", _EMPTY, id="empty"),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"x":NaN}}', _NOT_JSON, id="NaN at the end"
+    ),
+    pytest.param(b"   ", _NOT_JSON, id="whitespace only"),
+    pytest.param(b"\n", _NOT_JSON, id="newline only"),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"__proto__":{"a":1}}}',
+        _NOT_JSON,
+        id="__proto__ key",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"constructor":{"prototype":{"a":1}}}}',
+        _NOT_JSON,
+        id="constructor.prototype",
+    ),
+    pytest.param(
+        b'\xff\xfe{\x00"\x00q\x00u\x00e\x00r\x00y\x00"\x00:\x00"\x00{\x00 \x00_\x00_\x00t\x00y\x00p\x00e\x00n\x00a\x00m\x00e\x00 \x00}\x00"\x00}\x00',
+        _NOT_JSON,
+        id="utf-16 body",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"x":"\xff"}}', None, id="invalid utf-8 in a string"
+    ),
+    pytest.param(b'\xef\xbb\xbf{"query":"{ __typename }"}', None, id="utf-8 BOM"),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"constructor":null}}', None, id="constructor null"
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"constructor":"x"}}', None, id="constructor string"
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"constructor":[1]}}', None, id="constructor array"
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"constructor":{"a":1}}}',
+        None,
+        id="constructor object without prototype",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"constructor":{"prototype":null}}}',
+        _NOT_JSON,
+        id="constructor.prototype null",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"\\u005f_proto__":1}}',
+        _NOT_JSON,
+        id="__proto__ escaped",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"x":[{"__proto__":1}]}}',
+        _NOT_JSON,
+        id="__proto__ in an array",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"x":"\\"__proto__\\":1"}}',
+        None,
+        id="__proto__ in a string value",
+    ),
+    pytest.param(b'{"__proto__":1,"query":"{ __typename }"}', _NOT_JSON, id="__proto__ top-level"),
+    pytest.param(
+        b'{"constructor":{"prototype":1},"query":"{ __typename }"}',
+        _NOT_JSON,
+        id="constructor top-level with prototype",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"prototype":1}}',
+        None,
+        id="prototype without constructor",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"constructor":{"prototype":1},"constructor":1}}',
+        None,
+        id="constructor twice, last without prototype",
+    ),
+    pytest.param(b'\xef\xbb\xbf\xef\xbb\xbf{"query":"{ __typename }"}', _NOT_JSON, id="BOM twice"),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"a":"\xff","x":NaN}}',
+        _NOT_JSON,
+        id="utf-8 replacement then NaN",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"1" * 4300 + b"}}",
+        None,
+        id="4300 digits",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"1" * 4301 + b"}}",
+        None,
+        id="4301 digits",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"1" * 5000 + b"}}",
+        None,
+        id="5000 digits",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": -' + b"1" * 4301 + b"}}",
+        None,
+        id="-4301 digits",
+    ),
+    pytest.param(b'{"query": "{ __typename }", "variables": {"x": 1e400}}', None, id="1e400"),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"[" * 1001 + b"]" * 1001 + b"}}",
+        None,
+        id="nested 1001",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"[" * 100000 + b"]" * 100000 + b"}}",
+        None,
+        id="nested 100000",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"[" * 300000 + b"]" * 300000 + b"}}",
+        None,
+        id="nested 300000",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": '
+        + b'{"a":' * 100000
+        + b"1"
+        + b"}" * 100000
+        + b"}}",
+        None,
+        id="objects nested 100000",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": '
+        + b"[" * 100000
+        + b"NaN"
+        + b"]" * 100000
+        + b"}}",
+        _NOT_JSON,
+        id="nested 100000 then NaN",
+    ),
+    pytest.param(b"\xef\xbb\xbf", _NOT_JSON, id="BOM only"),
+    pytest.param(b'{"x":Infinity,"query":"{ __typename }"}', _NOT_JSON, id="Infinity"),
+    pytest.param(b'{"x":-Infinity,"query":"{ __typename }"}', _NOT_JSON, id="-Infinity"),
+    pytest.param(b"[]", _REQUEST_ERROR, id="an array"),
+    pytest.param(b"null", _REQUEST_ERROR, id="null"),
+    pytest.param(b'"x"', _REQUEST_ERROR, id="a string"),
+    pytest.param(b"5", _REQUEST_ERROR, id="a number"),
+    pytest.param(b'[{"query":"{ __typename }"}]', _REQUEST_ERROR, id="a batch of one query"),
+]
+
+
+@pytest.mark.parametrize("credential", ["key", "none", "nope"])
+@pytest.mark.parametrize(
+    "headers,body,answer",
+    [pytest.param((), *row.values, id=row.id) for row in _FIREFLIES_BODIES] + _FIREFLIES_READS,
+)
+def test_fireflies_reads_the_body_before_the_credential(
+    client, admin_h, credential, headers, body, answer
+):
+    """Each row is answered as the comment over `_FIREFLIES_BODIES` says, and no credential
+    changes a `_body_refusal`."""
+    if not any(name == "Content-Type" for name, _ in headers):
+        headers = (("Content-Type", "application/json"), *headers)
+    if credential != "none":
+        key = admin_h["Authorization"] if credential == "key" else "Bearer nope"
+        headers = (*headers, ("Authorization", key))
+    r = client.post("/fireflies/graphql", content=body, headers=list(headers))
+    if answer is _REQUEST_ERROR:
+        if credential == "key":
+            assert r.json() == {"errors": [{"message": "POST body sent invalid JSON."}]}
+        assert r.status_code == (400 if credential == "key" else 401)
+    elif answer is not None:
+        assert (r.status_code, r.content) == (json.loads(answer)["statusCode"], answer)
+    elif credential == "key":
+        assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
+    else:
+        assert r.status_code == 401
 
 
 def test_fireflies_admin_crawl_sees_every_stored_transcript(client, admin_h, ro_conn):

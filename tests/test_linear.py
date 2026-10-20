@@ -9,7 +9,9 @@ not merely that it filters something.
 
 from __future__ import annotations
 
+import gzip
 import json
+import zlib
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -25,8 +27,10 @@ from tests._helpers import (
     complete,
     corpus_client,
     db_count,
+    padded_query,
     selected_field_count,
     selected_fields,
+    sent_as,
     served_id,
 )
 
@@ -408,6 +412,766 @@ def test_linear_unauthenticated_is_401(client):
     r = client.post("/linear/graphql", json={"query": "{ viewer { email } }"})
     assert r.status_code == 401
     assert r.json()["errors"][0]["message"] == "Authentication required"
+
+
+# --- the body, read before the credential -------------------------------------------------------
+# The headers a body was sent with beyond `Content-Type: application/json`, the body, and the bytes
+# Linear refused it with, at the status their `code` names (400 where there is none), or None where
+# Linear served the query, as `backlot.graphql.body` reads them. `_GRAPHQL_JS_NOT_JSON` marks the
+# rows `backlot.routers.linear._read` answers in graphql-js's words whatever the credential: `{`
+# and `-NaN` however they arrive, and a body with no text. `_REQUEST_ERROR` marks a JSON array, the
+# 400 with the key; Linear answers it with `Operation batching disabled.` with or without one.
+_GRAPHQL_JS_NOT_JSON = b'{"errors":[{"message":"POST body sent invalid JSON."}]}'
+_REQUEST_ERROR = object()
+_LINEAR_BODIES = [
+    pytest.param(b"{", _GRAPHQL_JS_NOT_JSON, id="{"),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"x":NaN}}',
+        b'{"error":"Unexpected token \'N\', ...\\"les\\":{\\"x\\":NaN}}\\" is not valid JSON","details":{},"code":400}',
+        id="NaN at the end",
+    ),
+    pytest.param(
+        b"5",
+        b'{"error":"Unexpected token \'5\', \\"5\\" is not valid JSON","details":{},"code":400}',
+        id="top-level 5",
+    ),
+    pytest.param(
+        b'{"x":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"x\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="short object",
+    ),
+    pytest.param(
+        b'{"variables":{"x":NaN},"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'N\', ...\\"les\\":{\\"x\\":NaN},\\"quer\\"... is not valid JSON","details":{},"code":400}',
+        id="surround",
+    ),
+    pytest.param(
+        b'{"x":NaN,"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"x\\":NaN,\\"query\\"... is not valid JSON","details":{},"code":400}',
+        id="start",
+    ),
+    pytest.param(
+        b"[NaN]",
+        b'{"error":"Unexpected token \'N\', \\"[NaN]\\" is not valid JSON","details":{},"code":400}',
+        id="short array",
+    ),
+    pytest.param(
+        b"NaN",
+        b'{"error":"Unexpected token \'N\', \\"NaN\\" is not valid JSON","details":{},"code":400}',
+        id="top-level NaN",
+    ),
+    pytest.param(
+        b'{"x":Infinity,"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'I\', \\"{\\"x\\":Infinity,\\"\\"... is not valid JSON","details":{},"code":400}',
+        id="Infinity",
+    ),
+    pytest.param(
+        b'{"x":-Infinity,"query":"{ __typename }"}',
+        b'{"error":"No number after minus sign in JSON at position 6 (line 1 column 7)","details":{},"code":400}',
+        id="-Infinity",
+    ),
+    pytest.param(
+        b'{\n  "query":"{ __typename }",\n  "variables": {"x": -Infinity}\n}',
+        b'{"error":"No number after minus sign in JSON at position 52 (line 3 column 23)","details":{},"code":400}',
+        id="-Infinity multi-line",
+    ),
+    pytest.param(
+        b'{\n  "query":"{ __typename }",\n  "variables": {"x": NaN}\n}',
+        b'{"error":"Unexpected token \'N\', ...\\"s\\": {\\"x\\": NaN}\\n}\\" is not valid JSON","details":{},"code":400}',
+        id="NaN multi-line",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"e":"\xf0\x9f\x98\x80\xf0\x9f\x98\x80","x":-Infinity}}',
+        b'{"error":"No number after minus sign in JSON at position 55 (line 1 column 56)","details":{},"code":400}',
+        id="-Infinity after astral",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"e":"a\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80","x":NaN}}',
+        b'{"error":"Unexpected token \'N\', ...\\"\xf0\x9f\x98\x80\xf0\x9f\x98\x80\\",\\"x\\":NaN}}\\" is not valid JSON","details":{},"code":400}',
+        id="NaN window splits a pair",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"x":[1,NaN]}}',
+        b'{"error":"Unexpected token \'N\', ...\\"\\":{\\"x\\":[1,NaN]}}\\" is not valid JSON","details":{},"code":400}',
+        id="NaN in a list",
+    ),
+    pytest.param(
+        b'{\r\n"query":"{ __typename }",\r\n"variables":{"x":-Infinity}}',
+        b'{"error":"No number after minus sign in JSON at position 48 (line 3 column 19)","details":{},"code":400}',
+        id="-Infinity after CRLF",
+    ),
+    pytest.param(
+        b'{\r"query":"{ __typename }",\r"variables":{"x":-Infinity}}',
+        b'{"error":"No number after minus sign in JSON at position 46 (line 3 column 19)","details":{},"code":400}',
+        id="-Infinity after CR",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"e":"a\xe2\x80\xa8b","x":-Infinity}}',
+        b'{"error":"No number after minus sign in JSON at position 54 (line 1 column 55)","details":{},"code":400}',
+        id="-Infinity after U+2028 in a string",
+    ),
+    pytest.param(
+        b'{"abcdefghijk":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"abcdefghijk\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="len 19",
+    ),
+    pytest.param(
+        b'{"abcdefghijkl":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"abcdefghijkl\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="len 20",
+    ),
+    pytest.param(
+        b'{"abc":[[NaN],1,2,3,4,5,6,7]}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"abc\\":[[NaN],1,2,3\\"... is not valid JSON","details":{},"code":400}',
+        id="pos 9",
+    ),
+    pytest.param(
+        b'{"abcd":[[NaN],1,2,3,4,5,6,7]}',
+        b'{"error":"Unexpected token \'N\', ...\\"{\\"abcd\\":[[NaN],1,2,3\\"... is not valid JSON","details":{},"code":400}',
+        id="pos 10",
+    ),
+    pytest.param(
+        b'{"abcdefghijklmnopq":[Infinity]}',
+        b'{"error":"Unexpected token \'I\', ...\\"klmnopq\\":[Infinity]}\\" is not valid JSON","details":{},"code":400}',
+        id="Infinity window at the end",
+    ),
+    pytest.param(b'{"x":-NaN,"query":"{ __typename }"}', _GRAPHQL_JS_NOT_JSON, id="-NaN"),
+    pytest.param(
+        b'{"x":Infinityx,"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'I\', \\"{\\"x\\":Infinityx,\\"... is not valid JSON","details":{},"code":400}',
+        id="Infinityx",
+    ),
+    pytest.param(
+        b'{"x":NaN,}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"x\\":NaN,}\\" is not valid JSON","details":{},"code":400}',
+        id="NaN then a later error",
+    ),
+    pytest.param(
+        b'{"abcdefghijklm":NaN}',
+        b'{"error":"Unexpected token \'N\', ...\\"fghijklm\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="L21",
+    ),
+    pytest.param(
+        b'{"abcdefghijklmn":NaN}',
+        b'{"error":"Unexpected token \'N\', ...\\"ghijklmn\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="L22",
+    ),
+    pytest.param(
+        b'{"abcdefgh":NaN,"z":1}',
+        b'{"error":"Unexpected token \'N\', ...\\"abcdefgh\\":NaN,\\"z\\":1}\\" is not valid JSON","details":{},"code":400}',
+        id="L22 pos12",
+    ),
+    pytest.param(
+        b'{"e":"\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80","xy":NaN}',
+        b'{"error":"Unexpected token \'N\', ...\\"\\ude00\xf0\x9f\x98\x80\\",\\"xy\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="end split low surrogate",
+    ),
+    pytest.param(
+        b'{"x":NaN,"e":"\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80"}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"x\\":NaN,\\"e\\":\\"\\ud83d\\"... is not valid JSON","details":{},"code":400}',
+        id="start split",
+    ),
+    pytest.param(
+        b'{"e":"\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80x","x":NaN,"f":"\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80"}',
+        b'{"error":"Unexpected token \'N\', ...\\"\\ude00\xf0\x9f\x98\x80x\\",\\"x\\":NaN,\\"f\\":\\"\\ud83d\\"... is not valid JSON","details":{},"code":400}',
+        id="surround split both",
+    ),
+    pytest.param(
+        b'{\n\r"x":-Infinity}',
+        b'{"error":"No number after minus sign in JSON at position 8 (line 3 column 6)","details":{},"code":400}',
+        id="LF then CR",
+    ),
+    pytest.param(
+        b'{\t"x":\t-Infinity}',
+        b'{"error":"No number after minus sign in JSON at position 8 (line 1 column 9)","details":{},"code":400}',
+        id="tab lines",
+    ),
+    pytest.param(
+        b'"abcdefghijklmnopqrstuvwxyz0123456789"',
+        b'{"error":"Unexpected token \'\\"\', \\"\\"abcdefghi\\"... is not valid JSON","details":{},"code":400}',
+        id="top-level long string",
+    ),
+    pytest.param(
+        b"  \n 5",
+        b'{"error":"Unexpected token \'5\', \\"  \\n 5\\" is not valid JSON","details":{},"code":400}',
+        id="top-level ws then 5",
+    ),
+    pytest.param(
+        b"-Infinity",
+        b'{"error":"Unexpected token \'-\', \\"-Infinity\\" is not valid JSON","details":{},"code":400}',
+        id="top-level -Infinity",
+    ),
+    pytest.param(
+        b"Infinity",
+        b'{"error":"Unexpected token \'I\', \\"Infinity\\" is not valid JSON","details":{},"code":400}',
+        id="top-level Infinity",
+    ),
+    pytest.param(
+        b'{"a":"x\\"y\\\\z","b":NaN}',
+        b'{"error":"Unexpected token \'N\', ...\\"y\\\\\\\\z\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="escaped quote in window",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","a":"p\xe2\x80\xa8q","b":NaN}',
+        b'{"error":"Unexpected token \'N\', ...\\"\\"p\xe2\x80\xa8q\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="U+2028 raw in window",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","a":"\\n","b":NaN}',
+        b'{"error":"Unexpected token \'N\', ...\\":\\"\\\\n\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="control escape in window",
+    ),
+    pytest.param(
+        b"   ",
+        b'{"error":"Unexpected end of JSON input","details":{},"code":400}',
+        id="whitespace only",
+    ),
+    pytest.param(
+        b"\n",
+        b'{"error":"Unexpected end of JSON input","details":{},"code":400}',
+        id="newline only",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"__proto__":{"a":1}}}', None, id="__proto__ key"
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"constructor":{"prototype":{"a":1}}}}',
+        None,
+        id="constructor.prototype",
+    ),
+    pytest.param(
+        b'\xff\xfe{\x00"\x00q\x00u\x00e\x00r\x00y\x00"\x00:\x00"\x00{\x00 \x00_\x00_\x00t\x00y\x00p\x00e\x00n\x00a\x00m\x00e\x00 \x00}\x00"\x00}\x00',
+        b'{"error":"Unexpected token \'\xef\xbf\xbd\', \\"\xef\xbf\xbd\xef\xbf\xbd{\\u0000\\"\\u0000q\\u0000u\\u0000\\"... is not valid JSON","details":{},"code":400}',
+        id="utf-16 body",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"x":"\xff"}}', None, id="invalid utf-8 in a string"
+    ),
+    pytest.param(b'\xef\xbb\xbf{"query":"{ __typename }"}', None, id="utf-8 BOM"),
+    pytest.param(
+        b'{"a":"\xe2\x82","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbd\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 truncated 3-byte",
+    ),
+    pytest.param(
+        b'{"a":"\xed\xa0\x80","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 surrogate",
+    ),
+    pytest.param(
+        b'{"a":"\xf0\x9f\x98","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbd\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 truncated 4-byte",
+    ),
+    pytest.param(
+        b'{"a":"\xc0\x80","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbd\xef\xbf\xbd\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 overlong 2-byte",
+    ),
+    pytest.param(
+        b'{"a":"\xf4\x90\x80\x80","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 above U+10FFFF",
+    ),
+    pytest.param(
+        b'{"a":"\xff","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbd\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 lone FF",
+    ),
+    pytest.param(
+        b'{"a":"\x80","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbd\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 lone continuation",
+    ),
+    pytest.param(
+        b'{"a":"\xe0\x80\x80","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 overlong 3-byte",
+    ),
+    pytest.param(
+        b'{"a":"\xf8\x88\x80\x80\x80","b":NaN}',
+        b'{"error":"Unexpected token \'N\', ...\\"\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 5-byte form",
+    ),
+    pytest.param(
+        b'{"a":"\xe0A","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbdA\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 E0 then ASCII",
+    ),
+    pytest.param(
+        b'{"a":"\xf0\x9fA","b":NaN}',
+        b'{"error":"Unexpected token \'N\', \\"{\\"a\\":\\"\xef\xbf\xbdA\\",\\"b\\":NaN}\\" is not valid JSON","details":{},"code":400}',
+        id="utf8 F0 9F then ASCII",
+    ),
+    pytest.param(
+        b'\xef\xbb\xbf\xef\xbb\xbf{"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'\xef\xbb\xbf\', \\"\xef\xbb\xbf{\\"query\\":\\"... is not valid JSON","details":{},"code":400}',
+        id="BOM twice",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":{"constructor":null}}', None, id="constructor null"
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"1" * 4300 + b"}}",
+        None,
+        id="4300 digits",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"1" * 4301 + b"}}",
+        None,
+        id="4301 digits",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"1" * 5000 + b"}}",
+        None,
+        id="5000 digits",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": -' + b"1" * 4301 + b"}}",
+        None,
+        id="-4301 digits",
+    ),
+    pytest.param(b'{"query": "{ __typename }", "variables": {"x": 1e400}}', None, id="1e400"),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"[" * 1001 + b"]" * 1001 + b"}}",
+        None,
+        id="nested 1001",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"[" * 100000 + b"]" * 100000 + b"}}",
+        None,
+        id="nested 100000",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": ' + b"[" * 300000 + b"]" * 300000 + b"}}",
+        None,
+        id="nested 300000",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": '
+        + b'{"a":' * 100000
+        + b"1"
+        + b"}" * 100000
+        + b"}}",
+        None,
+        id="objects nested 100000",
+    ),
+    pytest.param(
+        b'{"query": "{ __typename }", "variables": {"x": '
+        + b"[" * 100000
+        + b"NaN"
+        + b"]" * 100000
+        + b"}}",
+        b'{"error":"Unexpected token \'N\', ...\\"[[[[[[[[[[NaN]]]]]]]\\"... is not valid JSON","details":{},"code":400}',
+        id="nested 100000 then NaN",
+    ),
+    pytest.param(
+        b"null",
+        b'{"error":"Unexpected token \'n\', \\"null\\" is not valid JSON","details":{},"code":400}',
+        id="top-level null",
+    ),
+    pytest.param(
+        b'\xc2\xa0{"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'\xc2\xa0\', \\"\xc2\xa0{\\"query\\":\\"... is not valid JSON","details":{},"code":400}',
+        id="U+00A0 then {",
+    ),
+    pytest.param(
+        b'\x0b{"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'\\u000b\', \\"\\u000b{\\"query\\":\\"... is not valid JSON","details":{},"code":400}',
+        id="a vertical tab then {",
+    ),
+    pytest.param(
+        b'\x0c{"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'\\f\', \\"\\f{\\"query\\":\\"... is not valid JSON","details":{},"code":400}',
+        id="a form feed then {",
+    ),
+    pytest.param(
+        b'\xe3\x80\x80{"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'\xe3\x80\x80\', \\"\xe3\x80\x80{\\"query\\":\\"... is not valid JSON","details":{},"code":400}',
+        id="U+3000 then {",
+    ),
+    pytest.param(
+        b'\xe2\x80\xa8{"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'\xe2\x80\xa8\', \\"\xe2\x80\xa8{\\"query\\":\\"... is not valid JSON","details":{},"code":400}',
+        id="U+2028 then {",
+    ),
+    pytest.param(
+        b'\x1c{"query":"{ __typename }"}',
+        b'{"error":"Unexpected token \'\\u001c\', \\"\\u001c{\\"query\\":\\"... is not valid JSON","details":{},"code":400}',
+        id="0x1C then {",
+    ),
+    pytest.param(
+        b'{"e":"\xf0\x9f\x98\x80\xf0\x9f\x98\x80",\n"x":-Infinity}',
+        b'{"error":"No number after minus sign in JSON at position 18 (line 2 column 6)","details":{},"code":400}',
+        id="-Infinity after two surrogate pairs on the line before",
+    ),
+    pytest.param(
+        b'{"e":"\xf0\x9f\x98\x80",\r\n"f":"\xf0\x9f\x98\x80\xf0\x9f\x98\x80","x":-Infinity}',
+        b'{"error":"No number after minus sign in JSON at position 28 (line 2 column 17)","details":{},"code":400}',
+        id="-Infinity after surrogate pairs on both lines",
+    ),
+    pytest.param(b"", _GRAPHQL_JS_NOT_JSON, id="empty"),
+    pytest.param(b"\xef\xbb\xbf", _GRAPHQL_JS_NOT_JSON, id="a byte-order mark alone"),
+    pytest.param(b"[]", _REQUEST_ERROR, id="an array"),
+    pytest.param(b'[{"query":"{ __typename }"}]', _REQUEST_ERROR, id="a batch of one query"),
+]
+
+
+_TYPENAME = b'{"query":"{ __typename }"}'
+_LIMIT = 10 * 2**20
+
+
+def _express(status: int, message: bytes) -> bytes:
+    """Express's envelope as Linear writes it around ``message``, already JSON-escaped."""
+    return b'{"error":"%s","details":{},"code":%d}' % (message, status)
+
+
+def _charset(name: str) -> tuple:
+    return (("Content-Type", f"application/json; charset={name}"),)
+
+
+_GZIP = (("Content-Encoding", "gzip"),)
+_LATIN1 = _express(415, b'unsupported charset \\"LATIN1\\"')
+_HEADER_CHECK = _express(400, b"incorrect header check")
+_CUT_SHORT = _express(400, b"unexpected end of file")
+_BOGUS = _express(415, b'unsupported content encoding \\"bogus\\"')
+_TOO_LARGE = _express(413, b"request entity too large")
+_TOO_LARGE_DECLARED = (
+    b'{"error":"request entity too large","details":{},"extensions":{"code":"PAYLOAD_TOO_LARGE",'
+    b'"type":"payload too large","statusCode":413,"userError":true,"limit":10485760,'
+    b'"length":10485761},"code":413}'
+)
+# Forty ideographs outnumber the ASCII around them, so without a byte-order mark iconv-lite reads
+# the body in the order that is wrong for it, and Linear quotes the characters that make.
+_IDEOGRAPHS = '{"query":"{ __typename }","x":"' + "\u4e00" * 40 + '"}'
+_IDEOGRAPHS_MISREAD = _express(
+    400,
+    "Unexpected token '\u7b00', \\\"\u7b00\u2200\u7100\u7500\u6500\u7200\u7900\u2200\u3a00"
+    '\u2200\\"... is not valid JSON'.encode(),
+)
+_LINEAR_READS = [
+    pytest.param(_GZIP, gzip.compress(_TYPENAME), None, id="gzip"),
+    pytest.param((("Content-Encoding", "GZIP"),), gzip.compress(_TYPENAME), None, id="GZIP"),
+    pytest.param((("Content-Encoding", "deflate"),), zlib.compress(_TYPENAME), None, id="deflate"),
+    pytest.param((("Content-Encoding", ""),), _TYPENAME, None, id="an empty encoding"),
+    pytest.param(
+        (("Content-Encoding", " gzip "),), gzip.compress(_TYPENAME), None, id="spaces around gzip"
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip\t"),), gzip.compress(_TYPENAME), None, id="a tab after gzip"
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip\xa0"),),
+        gzip.compress(_TYPENAME),
+        _express(415, 'unsupported content encoding \\"gzip\xa0\\"'.encode()),
+        id="U+00A0 after gzip",
+    ),
+    pytest.param(
+        (("Content-Encoding", "\xa0gzip"),),
+        gzip.compress(_TYPENAME),
+        _express(415, 'unsupported content encoding \\"\xa0gzip\\"'.encode()),
+        id="U+00A0 before gzip",
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip\x85"),),
+        gzip.compress(_TYPENAME),
+        _express(415, 'unsupported content encoding \\"gzip\x85\\"'.encode()),
+        id="U+0085 after gzip",
+    ),
+    pytest.param(
+        (("Content-Encoding", "g zip"),),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"g zip\\"'),
+        id="a space inside",
+    ),
+    pytest.param(
+        (("Content-Encoding", "x-gzip"),),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"x-gzip\\"'),
+        id="x-gzip",
+    ),
+    pytest.param((("Content-Encoding", "bogus"),), _TYPENAME, _BOGUS, id="bogus"),
+    pytest.param((("Content-Encoding", "BOGUS"),), _TYPENAME, _BOGUS, id="BOGUS"),
+    pytest.param(
+        (("Content-Encoding", "gzip"), ("Content-Encoding", "gzip")),
+        gzip.compress(gzip.compress(_TYPENAME)),
+        _express(415, b'unsupported content encoding \\"gzip, gzip\\"'),
+        id="gzip twice",
+    ),
+    pytest.param(
+        (("Content-Encoding", ""), ("Content-Encoding", "gzip")),
+        gzip.compress(_TYPENAME),
+        None,
+        id="an empty encoding, then gzip",
+    ),
+    pytest.param(
+        (("Content-Encoding", " "), ("Content-Encoding", "gzip")),
+        gzip.compress(_TYPENAME),
+        None,
+        id="a space, then gzip",
+    ),
+    pytest.param(
+        (("Content-Encoding", ""), ("Content-Encoding", ""), ("Content-Encoding", "gzip")),
+        gzip.compress(_TYPENAME),
+        None,
+        id="two empty encodings, then gzip",
+    ),
+    pytest.param(
+        (("Content-Encoding", ""), ("Content-Encoding", "")),
+        _TYPENAME,
+        None,
+        id="two empty encodings",
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip"), ("Content-Encoding", "")),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"gzip,\\"'),
+        id="gzip, then an empty encoding",
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip"), ("Content-Encoding", " ")),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"gzip,\\"'),
+        id="gzip, then a space",
+    ),
+    pytest.param(
+        (("Content-Encoding", ""), ("Content-Encoding", "gzip"), ("Content-Encoding", "")),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"gzip,\\"'),
+        id="gzip between empty encodings",
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip"), ("Content-Encoding", " "), ("Content-Encoding", "gzip")),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"gzip, , gzip\\"'),
+        id="gzip, a space, gzip",
+    ),
+    pytest.param(
+        (("Content-Encoding", "bogus"), ("Content-Encoding", "")),
+        _TYPENAME,
+        _express(415, b'unsupported content encoding \\"bogus,\\"'),
+        id="bogus, then an empty encoding",
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip, "),),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"gzip,\\"'),
+        id="gzip and a comma and a space",
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip ,"),),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"gzip ,\\"'),
+        id="a space before a comma",
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip,"), ("Content-Encoding", "gzip")),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"gzip,, gzip\\"'),
+        id="a comma ending an encoding, then gzip",
+    ),
+    pytest.param(
+        (("Content-Encoding", "gzip, identity"),),
+        gzip.compress(_TYPENAME),
+        _express(415, b'unsupported content encoding \\"gzip, identity\\"'),
+        id="gzip, identity",
+    ),
+    pytest.param(_GZIP, _TYPENAME, _HEADER_CHECK, id="gzip over a plain body"),
+    pytest.param(_GZIP, gzip.compress(_TYPENAME) + b"xx", _HEADER_CHECK, id="gzip then xx"),
+    pytest.param(_GZIP, gzip.compress(_TYPENAME)[:-5], _CUT_SHORT, id="gzip cut short"),
+    pytest.param(_GZIP, b"", _CUT_SHORT, id="gzip over no bytes"),
+    pytest.param(_GZIP, gzip.compress(b""), _GRAPHQL_JS_NOT_JSON, id="gzip of no bytes"),
+    pytest.param(_GZIP, gzip.compress(b"{"), _GRAPHQL_JS_NOT_JSON, id="gzip of {"),
+    pytest.param(
+        (("Content-Encoding", "deflate"),),
+        zlib.compress(_TYPENAME)[2:-4],
+        _HEADER_CHECK,
+        id="raw deflate",
+    ),
+    pytest.param(_charset("utf-16le"), _TYPENAME.decode().encode("utf-16-le"), None, id="utf-16le"),
+    pytest.param(
+        _charset("utf-16-le"), _TYPENAME.decode().encode("utf-16-le"), None, id="utf-16-le"
+    ),
+    pytest.param(_charset("utf-16be"), _TYPENAME.decode().encode("utf-16-be"), None, id="utf-16be"),
+    pytest.param(
+        _charset("utf-16"), _TYPENAME.decode().encode("utf-16"), None, id="utf-16, marked"
+    ),
+    pytest.param(
+        _charset("utf-16"), _TYPENAME.decode().encode("utf-16-be"), None, id="utf-16, big-endian"
+    ),
+    pytest.param(
+        _charset("utf-16"), _TYPENAME.decode().encode("utf-16-le"), None, id="utf-16, little-endian"
+    ),
+    pytest.param(
+        _charset("utf-16le"),
+        '\ufeff{"query":"{ __typename }"}'.encode("utf-16-le"),
+        None,
+        id="utf-16le, marked",
+    ),
+    pytest.param(
+        _charset("utf-16le"), _TYPENAME.decode().encode("utf-16-le") + b"x", None, id="odd bytes"
+    ),
+    pytest.param(
+        _charset("utf-16le"),
+        b'{"query":"{ __typename }","x":"'.decode().encode("utf-16-le")
+        + b"\x00\xd8"
+        + b'"}'.decode().encode("utf-16-le"),
+        None,
+        id="a lone surrogate",
+    ),
+    pytest.param(
+        _charset("utf-32"), _TYPENAME.decode().encode("utf-32"), None, id="utf-32, marked"
+    ),
+    pytest.param(
+        _charset("utf-32"), _TYPENAME.decode().encode("utf-32-be"), None, id="utf-32, big-endian"
+    ),
+    pytest.param(_charset("utf-32le"), _TYPENAME.decode().encode("utf-32-le"), None, id="utf-32le"),
+    pytest.param(_charset("UTF-8"), _TYPENAME, None, id="UTF-8"),
+    pytest.param(_charset('"utf-8"'), _TYPENAME, None, id="utf-8 quoted"),
+    pytest.param(_charset("utf-7"), _TYPENAME, None, id="utf-7"),
+    pytest.param(_charset("utf-7-imap"), _TYPENAME, None, id="utf-7-imap"),
+    pytest.param(
+        _charset("utf-16le"),
+        "5".encode("utf-16-le"),
+        _express(400, b"Unexpected token '5', \\\"5\\\" is not valid JSON"),
+        id="utf-16le 5",
+    ),
+    pytest.param(
+        _charset("utf-16le"), "{".encode("utf-16-le"), _GRAPHQL_JS_NOT_JSON, id="utf-16le {"
+    ),
+    pytest.param(_charset("utf-16le"), b"", _GRAPHQL_JS_NOT_JSON, id="utf-16le, no bytes"),
+    pytest.param(_charset("utf-8; foo=bar"), _TYPENAME, None, id="another parameter"),
+    pytest.param(_charset('"utf\\-8"'), _TYPENAME, None, id="a quoted pair"),
+    pytest.param(_charset('"lat\\in1"'), _TYPENAME, _LATIN1, id="a quoted pair, latin1"),
+    pytest.param(
+        (("Content-Type", "application/json; charset = latin1"),),
+        _TYPENAME,
+        _LATIN1,
+        id="spaces around =",
+    ),
+    pytest.param(_charset('"utf-8:1234"'), _TYPENAME, None, id="a trailing :1234"),
+    pytest.param(_charset("utf-32be"), _TYPENAME.decode().encode("utf-32-be"), None, id="utf-32be"),
+    pytest.param(
+        _charset("utf-32be"),
+        b'{"query":"{ __typename }","x":"'.decode().encode("utf-32-be")
+        + b"\x00\x11\x00\x00"
+        + b'"}'.decode().encode("utf-32-be"),
+        None,
+        id="past U+10FFFF",
+    ),
+    pytest.param(
+        _charset("utf-16le"), _IDEOGRAPHS.encode("utf-16-le"), None, id="utf-16le, ideographs"
+    ),
+    pytest.param(
+        _charset("utf-16"), _IDEOGRAPHS.encode("utf-16"), None, id="utf-16, marked, ideographs"
+    ),
+    pytest.param(
+        _charset("utf-16"),
+        b"\xfe\xff" + _IDEOGRAPHS.encode("utf-16-be"),
+        None,
+        id="utf-16, marked big-endian, ideographs",
+    ),
+    pytest.param(
+        _charset("utf-16"),
+        _IDEOGRAPHS.encode("utf-16-le"),
+        _IDEOGRAPHS_MISREAD,
+        id="utf-16, little-endian ideographs",
+    ),
+    pytest.param(
+        _charset("utf-16"),
+        _IDEOGRAPHS.encode("utf-16-be"),
+        _IDEOGRAPHS_MISREAD,
+        id="utf-16, big-endian ideographs",
+    ),
+    pytest.param(_charset("latin1"), _TYPENAME, _LATIN1, id="latin1"),
+    pytest.param(
+        _charset("iso-8859-1"),
+        _TYPENAME,
+        _express(415, b'unsupported charset \\"ISO-8859-1\\"'),
+        id="iso-8859-1",
+    ),
+    pytest.param(
+        _charset("utf8"), _TYPENAME, _express(415, b'unsupported charset \\"UTF8\\"'), id="utf8"
+    ),
+    pytest.param(
+        _charset("utf-nope"),
+        _TYPENAME,
+        _express(415, b'unsupported charset \\"UTF-NOPE\\"'),
+        id="utf-nope",
+    ),
+    pytest.param(
+        _charset("utf_16le"),
+        _TYPENAME.decode().encode("utf-16-le"),
+        _express(415, b'unsupported charset \\"UTF_16LE\\"'),
+        id="utf_16le",
+    ),
+    pytest.param(
+        (("Content-Type", "Application/JSON; Charset=Latin1"),), _TYPENAME, _LATIN1, id="Charset"
+    ),
+    pytest.param(_charset("utf-8; charset=latin1"), _TYPENAME, _LATIN1, id="two charsets"),
+    pytest.param(
+        _charset("latin1") + (("Content-Encoding", "bogus"),),
+        _TYPENAME,
+        _LATIN1,
+        id="latin1, bogus",
+    ),
+    pytest.param(
+        _charset("utf-nope") + (("Content-Encoding", "bogus"),),
+        _TYPENAME,
+        _BOGUS,
+        id="utf-nope, bogus",
+    ),
+    pytest.param((), padded_query(_LIMIT), None, id="the limit"),
+    pytest.param((), padded_query(_LIMIT + 1), _TOO_LARGE_DECLARED, id="past the limit"),
+    pytest.param(_GZIP, gzip.compress(padded_query(_LIMIT)), None, id="the limit, gzipped"),
+    pytest.param(_GZIP, gzip.compress(padded_query(_LIMIT + 1)), _TOO_LARGE, id="past it, gzipped"),
+    pytest.param(
+        _GZIP, gzip.compress(padded_query(_LIMIT + 2)), _TOO_LARGE, id="past it by two, gzipped"
+    ),
+    pytest.param(
+        (("Content-Encoding", "deflate"),),
+        zlib.compress(padded_query(_LIMIT + 1)),
+        _TOO_LARGE,
+        id="past it, deflated",
+    ),
+    pytest.param(_GZIP, b"x" * (_LIMIT + 1), _HEADER_CHECK, id="past it, not gzip"),
+    pytest.param((), b"{" * (_LIMIT + 1), _TOO_LARGE_DECLARED, id="past it, not JSON"),
+    pytest.param(
+        (("Content-Encoding", "bogus"),), padded_query(_LIMIT + 1), _BOGUS, id="past it, bogus"
+    ),
+    pytest.param(_charset("latin1"), padded_query(_LIMIT + 1), _LATIN1, id="past it, latin1"),
+    pytest.param(
+        _charset("utf-nope"), padded_query(_LIMIT + 1), _TOO_LARGE_DECLARED, id="past it, utf-nope"
+    ),
+]
+
+
+@pytest.mark.parametrize("credential", ["key", "none", "nope"])
+@pytest.mark.parametrize(
+    "headers,body,answer",
+    [pytest.param((), *row.values, id=row.id) for row in _LINEAR_BODIES] + _LINEAR_READS,
+)
+def test_linear_reads_the_body_before_the_credential(
+    client, tokens_yaml, credential, headers, body, answer
+):
+    """Each row answers as the comment over `_LINEAR_BODIES` says, and every refusal but a
+    `_REQUEST_ERROR` row's is the same whatever the credential."""
+    if not any(name == "Content-Type" for name, _ in headers):
+        headers = (("Content-Type", "application/json"), *headers)
+    if credential != "none":
+        key = tokens_yaml["admin_token"] if credential == "key" else "nope"
+        headers = (*headers, ("Authorization", key))
+    r = sent_as(client, "POST", "/linear/graphql", headers, content=body)
+    if answer is _REQUEST_ERROR:
+        if credential == "key":
+            assert r.content == _GRAPHQL_JS_NOT_JSON
+        assert r.status_code == (400 if credential == "key" else 401)
+    elif answer is not None:
+        assert (r.status_code, r.content) == (json.loads(answer).get("code", 400), answer)
+    elif credential == "key":
+        assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
+    else:
+        assert r.status_code == 401
 
 
 def test_linear_parent_resolves_and_is_acl_scoped(client, admin_h, tokens_yaml):
