@@ -4789,3 +4789,143 @@ def test_a_stated_identifier_outranks_another_teams_derived_one(tmp_path):
         h = {"Authorization": settings.admin_token}
         got = gql(c, f'{{ issue(id: "{stated}") {{ identifier title }} }}', h).json()["data"]
         assert got["issue"]["title"] == "states it"
+
+
+_BACKWARD_ROOTS = {
+    "issues": ("{ issues(%s, orderBy: updatedAt) { %s } }", ["issues"]),
+    "team": (
+        '{ team(id: "engineering") { issues(%s, orderBy: updatedAt) { %s } } }',
+        ["team", "issues"],
+    ),
+    "users": ("{ users(%s) { %s } }", ["users"]),
+    "children": (
+        '{ issue(id: "ENG-1") { children(%s, orderBy: updatedAt) { %s } } }',
+        ["issue", "children"],
+    ),
+    "teams": ("{ teams(%s) { %s } }", ["teams"]),
+    "comments": ("{ comments(%s) { %s } }", ["comments"]),
+    "issue comments": ('{ issue(id: "ENG-1") { comments(%s) { %s } } }', ["issue", "comments"]),
+    "labels": ('{ issue(id: "ENG-1") { labels(%s) { %s } } }', ["issue", "labels"]),
+    "attachments": ('{ issue(id: "ENG-1") { attachments(%s) { %s } } }', ["issue", "attachments"]),
+    "relations": ('{ issue(id: "ENG-1") { relations(%s) { %s } } }', ["issue", "relations"]),
+    "inverse relations": (
+        '{ issue(id: "ENG-2") { inverseRelations(%s) { %s } } }',
+        ["issue", "inverseRelations"],
+    ),
+}
+
+
+@pytest.mark.parametrize("root", list(_BACKWARD_ROOTS))
+@pytest.mark.parametrize("operation", ["order", "end", "start", "walk", "edges", "forward"])
+def test_linear_backward_pages_name_the_served_nodes(tmp_path, root, operation):
+    """The measurement on ``linear_resolvers._connection`` covers these connections.
+
+    Its before endCursor continues backward; before startCursor overlaps the preceding page.
+    Distinct timestamps make position independent of database tie ordering. ENG-1 holds eight
+    comments, labels and attachments and a relation to each other issue, every other issue a
+    relation to ENG-2, and each team past the first one issue.
+    """
+    records = [
+        {
+            "source_type": "linear",
+            "doc_id": f"page-{i}",
+            "team": "engineering",
+            "group": "engineering",
+            "identifier": f"ENG-{i}",
+            "title": f"Issue {i}",
+            "content": "page",
+            "author_email": f"user{i}@acme.com",
+            "visibility": "public",
+            "created": f"2026-01-{i:02}T00:00:00Z",
+            "updated": f"2026-02-{i:02}T00:00:00Z",
+            **({"parent": "ENG-1"} if i > 1 else {}),
+            **(
+                {
+                    "comments": [
+                        {"content": f"note {n}", "created_ts": 1767225600 + n} for n in range(8)
+                    ],
+                    "labels": [f"label-{n}" for n in range(8)],
+                    "attachments": [f"https://acme.test/run/{n}" for n in range(8)],
+                    "relations": [{"to": f"page-{n}", "type": "related"} for n in range(2, 9)],
+                }
+                if i == 1
+                else {"relations": [{"to": "page-2", "type": "related"}]}
+                if i > 2
+                else {}
+            ),
+        }
+        for i in range(1, 9)
+    ] + [
+        {
+            "source_type": "linear",
+            "doc_id": f"squad-{i}",
+            "team": f"squad{i}",
+            "group": f"squad{i}",
+            "title": f"Squad issue {i}",
+            "content": "page",
+            "author_email": "user1@acme.com",
+            "visibility": "public",
+            "created": f"2026-03-{i:02}T00:00:00Z",
+            "updated": f"2026-04-{i:02}T00:00:00Z",
+        }
+        for i in range(1, 8)
+    ]
+    settings = build_corpus(tmp_path, records)
+    with client_for(settings) as client:
+
+        def page(args):
+            selection = "nodes { id } pageInfo { startCursor endCursor hasPreviousPage }"
+            query, path = _BACKWARD_ROOTS[root]
+            response = gql(
+                client, query % (args, selection), {"Authorization": settings.admin_token}
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert "errors" not in body, body
+            result = body["data"]
+            for key in path:
+                result = result[key]
+            return result
+
+        forward = [node["id"] for node in page("first: 50")["nodes"]]
+        backward = page("last: 3")
+
+        def got(result):
+            return [node["id"] for node in result["nodes"]]
+
+        if operation == "order":
+            assert got(backward) == forward[-3:][::-1]
+        elif operation == "end":
+            following = page("last: 3, before: " + lit(backward["pageInfo"]["endCursor"]))
+            assert got(following) == forward[-6:-3][::-1]
+        elif operation == "start":
+            overlapping = page("last: 3, before: " + lit(backward["pageInfo"]["startCursor"]))
+            assert got(overlapping) == forward[-4:-1][::-1]
+        elif operation == "edges":
+            first = page("first: 1")
+            assert first["pageInfo"]["startCursor"] == first["pageInfo"]["endCursor"]
+            empty = page("last: 3, before: " + lit(first["pageInfo"]["startCursor"]))
+            assert empty["nodes"] == []
+            assert empty["pageInfo"]["startCursor"] is None
+            assert empty["pageInfo"]["endCursor"] is None
+            assert got(page("last: 50")) == forward[::-1]
+        elif operation == "forward":
+            current = page("first: 3")
+            after_first = page("first: 2, after: " + lit(current["pageInfo"]["startCursor"]))
+            assert got(after_first) == forward[1:3]
+            seen = []
+            for _ in range(len(forward) + 1):
+                seen.extend(got(current))
+                if not current["nodes"]:
+                    break
+                current = page("first: 3, after: " + lit(current["pageInfo"]["endCursor"]))
+            assert seen == forward
+        else:
+            seen = []
+            for _ in range(len(forward) + 1):
+                seen.extend(got(backward))
+                if not backward["nodes"]:
+                    break
+                backward = page("last: 3, before: " + lit(backward["pageInfo"]["endCursor"]))
+            assert seen == forward[::-1]
+            assert len(seen) == len(set(seen))
