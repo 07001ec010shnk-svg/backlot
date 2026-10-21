@@ -964,18 +964,33 @@ def _user_obj(conn, email: str, caller: Caller) -> dict:
 
 @router.api_route("/api.test", methods=["GET", "POST"], response_model=SlackApiTest)
 async def api_test(request: Request):
-    """Real Slack's connectivity check — no auth required, echoes back any params other than
-    `error` (which flips the response to an error envelope carrying that value). Several real
-    clients call this at construction/connect time (e.g. llama-index's `SlackReader.__init__`),
-    so Backlot must answer it rather than 404 — a 404 there breaks reader construction entirely,
-    before the caller ever gets a chance to point it at Backlot."""
-    error = _param(request, "error")
-    if error:
-        return _err(error)
+    """Real Slack's connectivity check: served with no credential at all, and an echo of the
+    arguments it was sent, as `args`. Several real clients call it at construction/connect time
+    (e.g. llama-index's `SlackReader.__init__`), so Backlot must answer it rather than 404.
+
+    A credential sent is read as on every other method (``_caller_or_error``) and refused ahead of
+    an `error` argument when it does not resolve, and so is a `token` query parameter
+    ``auth.slack_query_token_refused`` refuses, one that resolves included; with none, the request
+    is served. The query's arguments come first in `args`, then the body's, and the token read is
+    `token`: in the place of the body's `token` field, an empty one included, and last when it came
+    in the bearer header alone. A non-empty `error` answers `ok: false` with that error, `null` for
+    a body's that is not UTF-8, and `args` beside it. Measured against slack.com/api on 2026-10-13
+    and 2026-10-20."""
+    if auth.slack_query_token_refused(request) or auth.slack_token(request) is not None:
+        _, refusal = _caller_or_error(request)
+        if refusal is not None:
+            return refusal
     args: dict[str, str | None] = dict(request.query_params)
     form = getattr(request.state, "_form", None)
     if form:
         args.update({k: None if isinstance(v, Undecodable) else v for k, v in form.items()})
+    token = auth.slack_token(request)
+    if token is not None:
+        args["token"] = token
+    error = _param(request, "error")
+    if error:
+        error = None if isinstance(error, Undecodable) else error
+        return JSONResponse({"ok": False, "error": error, "args": args})
     return {"ok": True, "args": args}
 
 
