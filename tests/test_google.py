@@ -9927,14 +9927,38 @@ def test_gmail_from_to_searches_address_headers(tmp_path, surface, caller, query
         ('subject:" " lunch', ["lunch"]),
         ('label:"" lunch', []),
         ("after:", ["after"]),
+        ('label:"', ["plan", "lunch", "after"]),
+        ('in:"', ["plan", "lunch", "after"]),
+        ('subject:"', ["plan", "lunch", "after"]),
+        ('lunch label:"', ["lunch"]),
+        ('label:" lunch', []),
+        ('label: " inbox', ["plan", "lunch", "after"]),
+        ('label:" -inbox', ["plan", "lunch", "after"]),
+        ('label:" inbox lunch', []),
+        ('subject:" lunch', ["lunch"]),
+        ('subject:" after', []),
+        ('subject:" rollout plan', ["plan"]),
+        ('subject:" plan rollout', []),
+        ('subject:" label:inbox', []),
+        ('subject:" after:2026/01/01', []),
+        ('LABEL:" inbox', ["plan", "lunch", "after"]),
+        ('subject:" from:me', ["plan", "lunch", "after"]),
+        ('subject:" FROM:me', ["plan", "lunch", "after"]),
+        ('subject:" from: me', ["plan", "lunch", "after"]),
+        ('subject:" -from:me', ["plan", "lunch", "after"]),
+        ('subject:" from:-me', ["plan", "lunch", "after"]),
+        ('subject:"from:me', []),
+        ('subject:" from:me+lunch', []),
+        ('-subject:" from:me', []),
+        ('-subject:" from:bob', ["plan", "lunch", "after"]),
+        ('in:" subject:lunch', ["lunch"]),
     ],
 )
-def test_gmail_an_empty_operator_is_dropped_or_the_term_it_spells(
-    tmp_path, surface, query, expected
-):
-    """Each row is how the comments on `_GMAIL_DROPPED_WHEN_EMPTY` and `_GMAIL_SPACED` read its
-    query, over both listings; the corpus holds the word `after` so that a bare `after:` can be told
-    from a dropped one."""
+def test_gmail_an_empty_or_lone_quoted_operator(tmp_path, surface, query, expected):
+    """Each row is how the comments on `_GMAIL_DROPPED_WHEN_EMPTY`, `_GMAIL_SPACED` and
+    `_GMAIL_LONE_QUOTE` read its query, over both listings; the corpus holds the word `after` so
+    that a bare `after:` can be told from a dropped one, and `subject:" after` from a search
+    term."""
     settings = tiny_corpus(
         tmp_path,
         [
