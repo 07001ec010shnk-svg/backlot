@@ -2156,7 +2156,8 @@ def _drive_created(row) -> int:
 
 
 def _drive_modified(row) -> int:
-    """A file's last-modified second, an hour after creation when the corpus states none."""
+    """A file's last-modified second, an hour after creation when the corpus states none
+    (``store.DRIVE_MODIFIED`` is the same in SQL)."""
     return row["updated_ts"] if row["updated_ts"] is not None else _drive_created(row) + 3600
 
 
@@ -2461,6 +2462,28 @@ def _drive_sort(files: list[dict], specs: list[tuple]) -> list[dict]:
     for keyfn, reverse in reversed(specs):
         files.sort(key=keyfn, reverse=reverse)
     return files
+
+
+def _drive_newest_first(objects, folders: list[dict], offset: int, limit: int) -> list[dict]:
+    """The page at ``offset`` of a listing whose request names no `orderBy` and whose `q` has no
+    `fullText` term: newest `modifiedTime` first, ties by id, each synthesized folder among the
+    stored files where its own time puts it. Measured on Drive v3: a Workspace member's 170 files
+    and a consumer account's 21,702 with no `q` (2026-10-20), and on 2026-10-21 the member's 228
+    with `orderBy=` or `q=` empty, under `trashed = false` and under a `modifiedTime` bound, and
+    both accounts' under `createdTime` and `viewedByMeTime` bounds, `starred = false`,
+    `sharedWithMe = true`, `'me' in owners` and `trashed = true`, in the order
+    `orderBy=modifiedTime desc` gives, id for id, and in descending `modifiedTime` under `mimeType`
+    and `name contains` terms on both accounts and `'root' in parents` on the member's. Five
+    `fullText contains` queries on the two accounts came back with 16 to 144 of their adjacent pairs
+    out of time order.
+
+    ``objects(o, n)`` reads stored rows ``o`` to ``o + n`` already in that order. A row on the page
+    has at most ``len(folders)`` folders ahead of it, so the page holds no row before row
+    ``offset - len(folders)``, and a folder ahead of every row from there sorts before the page."""
+    start = max(0, offset - len(folders))
+    window = objects(start, offset + limit - start, with_shared=False)
+    newest = [(_DRIVE_ORDER_KEYS["modifiedTime"], True)]
+    return _drive_sort(window + folders, newest)[offset - start : offset - start + limit]
 
 
 def _drive_starred_after_another_key(order_by: str | None) -> bool:
@@ -2802,7 +2825,8 @@ async def drive_files_list(request: Request):
         raise gerr.supports_all_drives_required()
     q = gerr.first_repeat(params, "q") or ""
     query = _drive_q_parse(q)  # 400 on a clause Backlot cannot evaluate; None when there is no q
-    if order and query is not None and any(t.field == "fullText" for t in _drive_q_terms(query)):
+    fulltext = any(t.field == "fullText" for t in _drive_q_terms(query))
+    if order and fulltext:
         raise gerr.sorting_not_supported_fulltext()
     order = _drive_order_keyfns(order)
     # Measured 2026-09-23: a token the API did not issue is 400 `Invalid Value`, where an empty one
@@ -2843,6 +2867,9 @@ async def drive_files_list(request: Request):
         fetch = lambda o, n: store.list_drive_folder(conn, container, ids, limit=n, offset=o)  # noqa: E731
     elif query is not None:  # filter the visible set by the query, then paginate
         matched = _drive_q_rows(conn, query, container, ids, me, hits)
+        if not fulltext:  # in the order `_drive_newest_first` reads rows in
+            matched.sort(key=lambda r: r["id"])
+            matched.sort(key=_drive_modified, reverse=True)
         total_rows, fetch = len(matched), lambda o, n: matched[o : o + n]  # noqa: E731
     else:
         # exclude_trashed: with no `q` at all there is no query to carry `trashed = false`, and
@@ -2854,7 +2881,13 @@ async def drive_files_list(request: Request):
             conn, "google_drive", visible_ids=ids, exclude_trashed=True
         )
         fetch = lambda o, n: store.list_documents(  # noqa: E731
-            conn, "google_drive", visible_ids=ids, limit=n, offset=o, exclude_trashed=True
+            conn,
+            "google_drive",
+            visible_ids=ids,
+            limit=n,
+            offset=o,
+            exclude_trashed=True,
+            newest_first=True,
         )
 
     # The file ids that came from the row stream, as opposed to a synthesized folder -- see
@@ -2881,14 +2914,16 @@ async def drive_files_list(request: Request):
             offset : offset + limit
         ]
         _drive_fill_shared(conn, files, stored)
-    else:
-        # No sort: the stored rows first (SQL-paginated), the folder objects as the tail. Real
-        # Drive leaves the default order unspecified, and keeping folders last means a client that
-        # reads files[0] out of an unfiltered listing still gets a file.
+    elif fulltext:
+        # The index's rank order (`_drive_q_rows`), the folder objects as the tail: real lists a
+        # `fullText` match in an order of its own, not by time (`_drive_newest_first`).
         files = objects(offset, min(limit, max(0, total_rows - offset)))
         if len(files) < limit:
             start = max(0, offset - total_rows)
             files += folders[start : start + limit - len(files)]
+    else:
+        files = _drive_newest_first(objects, folders, offset, limit)
+        _drive_fill_shared(conn, files, stored)
     body = {
         "kind": "drive#fileList",
         "incompleteSearch": False,
