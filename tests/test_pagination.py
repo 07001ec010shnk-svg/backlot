@@ -354,18 +354,26 @@ def test_linear_both_directions_at_once_is_rejected():
 
 
 def test_linear_page_info_flags_the_middle_of_a_result_set():
+    """A page in the middle flags the direction it was asked in, and answers `false` for the
+    other one, as the docstring of `_connection` measures."""
     page = _connection([{"id": 1}, {"id": 2}], offset=2, has_next=True)
     assert page["pageInfo"]["hasNextPage"] is True
-    assert page["pageInfo"]["hasPreviousPage"] is True
+    assert page["pageInfo"]["hasPreviousPage"] is False
     assert pg.decode_cursor(page["pageInfo"]["startCursor"]) == 3
     # The last node is position four; after that node starts at offset four.
     assert pg.decode_cursor(page["pageInfo"]["endCursor"]) == 4
+    back = _connection([{"id": 1}, {"id": 2}], offset=2, has_next=True, backward=True)
+    assert back["pageInfo"]["hasNextPage"] is False
+    assert back["pageInfo"]["hasPreviousPage"] is True
 
 
 def test_linear_page_info_terminates_on_the_last_page():
     page = _connection([{"id": 9}], offset=9, has_next=False)
     assert page["pageInfo"]["hasNextPage"] is False
-    assert page["pageInfo"]["hasPreviousPage"] is True
+    assert page["pageInfo"]["hasPreviousPage"] is False
+    back = _connection([{"id": 9}], offset=9, has_next=False, backward=True)
+    assert back["pageInfo"]["hasNextPage"] is False
+    assert back["pageInfo"]["hasPreviousPage"] is True
 
 
 def test_linear_limit_plus_one_probe_decides_has_next():

@@ -105,13 +105,19 @@ def _slice(first, after, last, before) -> tuple[int | None, int, int]:
     if first is not None and last is not None:
         raise GraphQLError("passing both `first` and `last` is not supported")
     start = pagination.decode_cursor(after) if after else 0
-    if last is not None or (before is not None and first is None):
+    if _backward(first, last, before):
         limit = pagination.clamp_limit(last, PAGE_DEFAULT, PAGE_MAX)
         if before is None:
             return None, limit, start  # resolved against the total by _from_end
         end = max(0, pagination.decode_cursor(before) - 1)
         return max(start, end - limit), min(limit, max(0, end - start)), start
     return start, pagination.clamp_limit(first, PAGE_DEFAULT, PAGE_MAX), start
+
+
+def _backward(first, last, before) -> bool:
+    """Whether a page is asked for from its end (``last:``, or ``before:`` without ``first:``), the
+    test :func:`_slice` makes."""
+    return last is not None or (before is not None and first is None)
 
 
 def _from_end(offset: int | None, limit: int, floor: int, total: int) -> int:
@@ -126,11 +132,20 @@ def _connection(nodes: list, offset: int, has_next: bool, *, backward: bool = Fa
     api.linear.app on 2026-10-05 and 2026-10-21: `after:` a `first: 3` page's `startCursor` serves
     from its second node on, and `before:` a `last: 3` page's `endCursor` the three nodes before it.
 
-    ``backward`` serves a ``last:`` page last node first, and every resolver passes it for one, as
-    real does on each connection measured: `issues`, `Team.issues`, `users` and `Issue.children` on
-    2026-10-05, and on 2026-10-21 `comments`, `Issue.comments`, `Issue.labels`, `Issue.attachments`,
-    `Issue.relations` and `Issue.inverseRelations`, over issues made to hold three of each.
-    `teams` takes it unmeasured, since the measuring workspace held one team, and `Issue.releases`
+    ``backward`` is :func:`_backward`, which every resolver passes. A backward page is served last
+    node first, as real does on each connection measured: `issues`, `Team.issues`, `users` and
+    `Issue.children` on 2026-10-05, and on 2026-10-21 `comments`, `Issue.comments`, `Issue.labels`,
+    `Issue.attachments`, `Issue.relations` and `Issue.inverseRelations`, over issues made to hold
+    three of each.
+
+    The flag for the direction a page was not asked in is `false`, whatever lies that way: on
+    2026-10-21 `first: 1` after a cursor answered `hasPreviousPage: false` and `last: 1` before one
+    `hasNextPage: false`, with nodes on both sides of the page, on `issues`, `Team.issues`, `users`,
+    `issueLabels`, `workflowStates`, `projectStatuses`, `Issue.children`, `comments`,
+    `Issue.comments`, `Issue.labels`, `Issue.attachments`, `Issue.relations` and
+    `Issue.inverseRelations`.
+
+    `teams` takes both unmeasured, since the measuring workspace held one team, and `Issue.releases`
     holds one node at most.
 
     ``has_next`` comes from a limit+1 probe, NOT from a COUNT of the whole result set. The
@@ -146,8 +161,8 @@ def _connection(nodes: list, offset: int, has_next: bool, *, backward: bool = Fa
     return {
         "nodes": nodes,
         "pageInfo": {
-            "hasNextPage": has_next,
-            "hasPreviousPage": offset > 0,
+            "hasNextPage": has_next and not backward,
+            "hasPreviousPage": backward and offset > 0,
             "startCursor": pagination.encode_cursor(start_cursor) if nodes else None,
             "endCursor": pagination.encode_cursor(end_cursor) if nodes else None,
         },
@@ -1019,7 +1034,9 @@ def _issue_page(
         archived=includeArchived,
     )
     rows, has_next = _page(rows, limit)
-    return _connection([_issue(r, info) for r in rows], offset, has_next, backward=last is not None)
+    return _connection(
+        [_issue(r, info) for r in rows], offset, has_next, backward=_backward(first, last, before)
+    )
 
 
 def resolve_issues(_root, info, **kwargs) -> dict:
@@ -1111,7 +1128,7 @@ def resolve_teams(
         [_team(n, info) for n in page],
         offset,
         offset + limit < len(names),
-        backward=last is not None,
+        backward=_backward(first, last, before),
     )
 
 
@@ -1134,7 +1151,7 @@ def resolve_comments(
     )
     rows, has_next = _page(rows, limit)
     return _connection(
-        [_comment(r, info) for r in rows], offset, has_next, backward=last is not None
+        [_comment(r, info) for r in rows], offset, has_next, backward=_backward(first, last, before)
     )
 
 
@@ -1189,7 +1206,7 @@ def resolve_users(
         users[offset : offset + limit],
         offset,
         offset + limit < len(users),
-        backward=last is not None,
+        backward=_backward(first, last, before),
     )
 
 
@@ -1388,7 +1405,7 @@ def resolve_issue_comments(
     )
     rows, has_next = _page(rows, limit)
     return _connection(
-        [_comment(r, info) for r in rows], offset, has_next, backward=last is not None
+        [_comment(r, info) for r in rows], offset, has_next, backward=_backward(first, last, before)
     )
 
 
@@ -1456,7 +1473,9 @@ def resolve_issue_children(
         order_by=orderBy,
     )
     rows, has_next = _page(rows, limit)
-    return _connection([_issue(r, info) for r in rows], offset, has_next, backward=last is not None)
+    return _connection(
+        [_issue(r, info) for r in rows], offset, has_next, backward=_backward(first, last, before)
+    )
 
 
 def _relations_page(issue, info, *, inverse, first, after, last, before) -> dict:
@@ -1480,7 +1499,10 @@ def _relations_page(issue, info, *, inverse, first, after, last, before) -> dict
     )
     rows, has_next = _page(rows, limit)
     return _connection(
-        [_relation(r, info) for r in rows], offset, has_next, backward=last is not None
+        [_relation(r, info) for r in rows],
+        offset,
+        has_next,
+        backward=_backward(first, last, before),
     )
 
 
@@ -1538,7 +1560,7 @@ def resolve_issue_attachments(
         nodes[offset : offset + limit],
         offset,
         offset + limit < len(nodes),
-        backward=last is not None,
+        backward=_backward(first, last, before),
     )
 
 
@@ -1558,7 +1580,7 @@ def resolve_issue_releases(
         nodes[offset : offset + limit],
         offset,
         offset + limit < len(nodes),
-        backward=last is not None,
+        backward=_backward(first, last, before),
     )
 
 
@@ -1574,7 +1596,7 @@ def resolve_issue_labels(
         nodes[offset : offset + limit],
         offset,
         offset + limit < len(nodes),
-        backward=last is not None,
+        backward=_backward(first, last, before),
     )
 
 

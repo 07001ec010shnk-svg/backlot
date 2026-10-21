@@ -4812,18 +4812,21 @@ _BACKWARD_ROOTS = {
         '{ issue(id: "ENG-2") { inverseRelations(%s) { %s } } }',
         ["issue", "inverseRelations"],
     ),
+    "releases": ('{ issue(id: "ENG-1") { releases(%s) { %s } } }', ["issue", "releases"]),
 }
 
 
 @pytest.mark.parametrize("root", list(_BACKWARD_ROOTS))
-@pytest.mark.parametrize("operation", ["order", "end", "start", "walk", "edges", "forward"])
+@pytest.mark.parametrize(
+    "operation", ["order", "end", "start", "walk", "edges", "forward", "flags"]
+)
 def test_linear_backward_pages_name_the_served_nodes(tmp_path, root, operation):
     """The measurement on ``linear_resolvers._connection`` covers these connections.
 
     Its before endCursor continues backward; before startCursor overlaps the preceding page.
     Distinct timestamps make position independent of database tie ordering. ENG-1 holds eight
-    comments, labels and attachments and a relation to each other issue, every other issue a
-    relation to ENG-2, and each team past the first one issue.
+    comments, labels and attachments, a relation to each other issue and one release, every other
+    issue a relation to ENG-2, and each team past the first one issue.
     """
     records = [
         {
@@ -4847,6 +4850,7 @@ def test_linear_backward_pages_name_the_served_nodes(tmp_path, root, operation):
                     "labels": [f"label-{n}" for n in range(8)],
                     "attachments": [f"https://acme.test/run/{n}" for n in range(8)],
                     "relations": [{"to": f"page-{n}", "type": "related"} for n in range(2, 9)],
+                    "release": "r1",
                 }
                 if i == 1
                 else {"relations": [{"to": "page-2", "type": "related"}]}
@@ -4874,7 +4878,9 @@ def test_linear_backward_pages_name_the_served_nodes(tmp_path, root, operation):
     with client_for(settings) as client:
 
         def page(args):
-            selection = "nodes { id } pageInfo { startCursor endCursor hasPreviousPage }"
+            selection = (
+                "nodes { id } pageInfo { startCursor endCursor hasPreviousPage hasNextPage }"
+            )
             query, path = _BACKWARD_ROOTS[root]
             response = gql(
                 client, query % (args, selection), {"Authorization": settings.admin_token}
@@ -4909,6 +4915,13 @@ def test_linear_backward_pages_name_the_served_nodes(tmp_path, root, operation):
             assert empty["pageInfo"]["startCursor"] is None
             assert empty["pageInfo"]["endCursor"] is None
             assert got(page("last: 50")) == forward[::-1]
+        elif operation == "flags":
+            after = page("first: 1, after: " + lit(page("first: 1")["pageInfo"]["endCursor"]))
+            assert after["pageInfo"]["hasPreviousPage"] is False
+            assert after["pageInfo"]["hasNextPage"] is (len(forward) > 2)
+            before = page("last: 1, before: " + lit(backward["pageInfo"]["endCursor"]))
+            assert before["pageInfo"]["hasNextPage"] is False
+            assert before["pageInfo"]["hasPreviousPage"] is (len(forward) > 4)
         elif operation == "forward":
             current = page("first: 3")
             after_first = page("first: 2, after: " + lit(current["pageInfo"]["startCursor"]))
