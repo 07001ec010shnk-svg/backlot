@@ -11794,6 +11794,125 @@ def test_gmail_an_empty_or_lone_quoted_operator(tmp_path, surface, query, expect
 
 @pytest.mark.parametrize("surface", ["messages", "threads"])
 @pytest.mark.parametrize(
+    "query, expected",
+    [
+        ('from:" me', ["lunch"]),
+        ('to:" me', ["plan"]),
+        ('from:" probe', []),
+        ('from:"me probe', []),
+        ('to:" probe', []),
+        ('from:" label:inbox', []),
+        ('subject:" from:me"', ["lunch"]),
+        ('subject:" from:"me"', ["lunch"]),
+        ('label:" inbox "', ["plan"]),
+        ('subject:" probe "', ["lunch"]),
+        ('subject:" probe\u00a0"', ["lunch"]),
+        ('subject:" from:" probe', []),
+        ('label:" inbox subject:"probe"', ["plan"]),
+        ('" label:inbox', ["plan"]),
+        ('" from:me', ["lunch"]),
+        ('newer_than:"', []),
+        ('label:"" "', ["plan", "lunch"]),
+        ('label:"""', ["plan", "lunch"]),
+        ("probe-label:inbox", []),
+        ('probe-subject:" from:me', []),
+        ("probe-(from:me)", []),
+        ('from:" from:me', ["lunch"]),
+        ('to:" from:me', ["lunch"]),
+        ('cc:" from:me', ["lunch"]),
+        ('to:" -from:me', ["lunch"]),
+        ('from:" to:me', ["plan"]),
+        ('from:" -to:me', ["plan"]),
+        ('-from:" to:me', ["lunch"]),
+        ('from:" subject:probe', ["lunch"]),
+        ('label:"" " inbox', ["plan"]),
+        ('subject:"" " from:me', ["lunch"]),
+        ('subject:"" " -from:me', ["lunch"]),
+        ('in:"" " to:me', ["plan"]),
+        ('subject:"" " label:inbox', []),
+        ('label:" inbox -subject:"probe"', ["plan"]),
+        ('-newer_than:"', ["plan", "lunch"]),
+        ('NOT older_than:"', ["plan", "lunch"]),
+        ('newer_than:""', []),
+        ('older_than:""', []),
+        ('newer_than:"" "', []),
+        ('older_than:30d"', ["plan", "lunch"]),
+        ('older_than:30d"" "', ["plan", "lunch"]),
+        ('newer_than:30"d', []),
+        ("2026-label:inbox", ["plan"]),
+        ("2026-from:me", []),
+        ("probe-(label:inbox)", ["plan"]),
+        ("probe-(label:inbox", ["plan"]),
+        ("probe-(label:inbox from:me)", []),
+        ("probe-(-from:me)", []),
+        ("probe-(label:inbox -subject:probe)", []),
+        ("-probe-label:inbox", ["plan", "lunch"]),
+        ("NOT probe-label:inbox", ["plan", "lunch"]),
+        ("NOT NOT probe-label:inbox", []),
+        ("-probe-(from:me)", ["plan", "lunch"]),
+        ("-probe-label:inbox from:me", ["lunch"]),
+        ('" -label:inbox', ["plan"]),
+        ('" -from:me', ["lunch"]),
+        ('label:inbox "', ["plan"]),
+        ('"label:inbox', ["plan"]),
+        ('" label:inbox -from:me', []),
+        ('label:inbox -from:me "', ["plan"]),
+        ('" label:', []),
+        ('" from:', []),
+        ("label:inbox me", []),
+        ('from:"', ["plan", "lunch"]),
+        ('probe from:"', ["plan", "lunch"]),
+        ('from:"me', ["lunch"]),
+        ('subject:"', ["plan", "lunch"]),
+        ('-subject:"', ["plan", "lunch"]),
+        ('probe-label:" inbox', []),
+        ('" probe', ["plan", "lunch"]),
+        ('probe "', ["plan", "lunch"]),
+        ('"probe', ["plan", "lunch"]),
+        ('"', []),
+    ],
+)
+def test_gmail_a_stray_quote_beside_an_operator(tmp_path, surface, query, expected):
+    """Each row is how the comments on `_GMAIL_LONE_QUOTE`, `_GMAIL_CLOSED_QUOTE`,
+    `_GMAIL_HYPHENED` and `_GMAIL_BARE_LONE_QUOTE`, and those in `_parse_gmail_q`, read its query,
+    over both listings. `plan` is from bob to the caller in the inbox and `lunch` from the caller to
+    bob in sent; both hold the word `probe` and the number 2026."""
+    settings = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "gmail",
+                "doc_id": doc_id,
+                "mailbox": "ava",
+                "title": title,
+                "content": content,
+                "author_email": author,
+                "to": to,
+                "label_ids": [label],
+                "readers": ["ava@acme.com"],
+                "created": "2026-03-01T09:00:00Z",
+            }
+            for doc_id, title, content, author, to, label in [
+                ("plan", "Rollout plan", "probe 2026", "bob@acme.com", "ava@acme.com", "INBOX"),
+                ("lunch", "Lunch probe", "Friday? 2026", "ava@acme.com", "bob@acme.com", "SENT"),
+            ]
+        ],
+    )
+    tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
+    with client_for(settings, reload=True) as c:
+        r = c.get(
+            f"/gmail/v1/users/me/{surface}",
+            headers={"Authorization": f"Bearer {tok(tokens, 'ava@acme.com')}"},
+            params={"q": query},
+        )
+    assert r.status_code == 200
+    assert {item["id"] for item in r.json().get(surface, [])} == {
+        served_id("gmail", doc_id) for doc_id in expected
+    }
+
+
+@pytest.mark.parametrize("surface", ["messages", "threads"])
+@pytest.mark.parametrize(
     "query, expected", [('subject:"from: foo"', ["literal"]), ('subject:""', ["literal", "other"])]
 )
 def test_gmail_empty_address_tokens_preserve_quoted_subjects(tmp_path, surface, query, expected):
