@@ -187,6 +187,24 @@ def _parse_batch_subrequest(payload: str):
     return method, target, headers, body
 
 
+def _drive_batch_cut_path(target: str) -> str:
+    """A Drive batch part's target with its path cut at the first ``;`` in it, its query kept.
+
+    Measured 2026-10-05 against ``www.googleapis.com/batch/drive/v3``, and on 2026-10-22 with each
+    part alone in its batch and all ten of ``_BATCH_CUT_ROWS`` in one: real ends a part's path
+    there, so ``files/{id};x`` is that file, ``files/{id};x/export`` is ``files.get`` on that file
+    with its ``/export`` dropped, and ``files;x``, ``about;x``, ``drives;x`` and
+    ``files/{id}/permissions;x`` are those routes' answers. The cut is read off the target as
+    sent, so an escaped ``%3B`` stays in the path and names the file whose id carries a ``;``.
+    A request sent on its own is not cut: each of those paths was a 404 there on 2026-10-22, that
+    same ``files/{id};x`` naming a file that does not exist."""
+    path, sep, query = target.partition("?")
+    cut = path.find(";")
+    if cut != -1:
+        path = path[:cut]
+    return f"{path}?{query}" if sep else path
+
+
 def _batch_sub_response(r, base: str) -> str:
     """One part's answer as the `application/http` payload a batch carries, `base` being the batch
     request's base URL. The download redirect (:func:`gerr.download_redirect`), the 302 whose
@@ -237,6 +255,13 @@ async def batch(request: Request, api: str = "", version: str = "") -> Response:
         (part.get("Content-ID", ""), *_parse_batch_subrequest(part.get_payload(decode=False)))
         for part in parsed.get_payload()
     ]
+    if api == "drive":
+        # A Drive batch ends each part's path at a `;` it carries (`_drive_batch_cut_path`), ahead
+        # of the download a part is read as, so the cut decides that too.
+        parts = [
+            (cid, method, _drive_batch_cut_path(target) if target else target, headers, body)
+            for cid, method, target, headers, body in parts
+        ]
     others = sum(
         1
         for _, method, target, _, _ in parts
