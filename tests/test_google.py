@@ -13,14 +13,14 @@ import io
 import json
 import re
 import unicodedata
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode
 
 import httpx
 import jwt
 import pytest
 import yaml
 
-from backlot import oauth, sheets_grid, store
+from backlot import oauth, sheets_grid, store, synth
 from backlot.config import Settings
 from backlot.errors import google as gerr
 from tests._helpers import (
@@ -1768,11 +1768,18 @@ def test_drive_permissions_list_pages_a_file_with_three_permissions(tmp_path, si
     assert [x for p in pages for x in p["permissions"]] == whole
 
 
-def test_drive_permissions_list_declares_the_parameters_it_pages_by(client):
-    """`pageSize` and `pageToken` shape the page, so a client reading the OpenAPI document can
-    find them, and `backlot diff --source google_drive` reports neither as missing."""
-    op = client.app.openapi()["paths"]["/drive/v3/files/{file_id}/permissions"]["get"]
-    assert {"pageSize", "pageToken"} <= {p["name"] for p in op["parameters"]}
+@pytest.mark.parametrize(
+    "route, names",
+    [
+        ("/drive/v3/files/{file_id}/permissions", {"pageSize", "pageToken", "fields"}),
+        ("/drive/v3/drives", {"q", "fields"}),
+    ],
+)
+def test_drive_listing_declares_the_parameters_it_reads(client, route, names):
+    """A parameter that shapes the answer is declared, so a client reading the OpenAPI document can
+    find it, and `backlot diff --source google_drive` reports none of them as missing."""
+    op = client.app.openapi()["paths"][route]["get"]
+    assert names <= {p["name"] for p in op["parameters"]}
 
 
 @pytest.mark.parametrize(
@@ -1942,6 +1949,222 @@ _ADMIN_ONLY = (
 _SERVED = (200, None, None, None)
 _TYPED = (400, "invalid", None, None)
 _RANGE = (400, "invalidParameter", "page_size", None)
+_Q_REFUSED = (400, "invalid", "q", "Invalid Value")
+
+
+def _mask_refused(subject: str) -> tuple:
+    return (400, "invalidParameter", "fields", f"Invalid field selection {subject}")
+
+
+_DOC = "/drive/v3/files/{doc}"
+_PERMS_OF_DOC = "/drive/v3/files/{doc}/permissions"
+# Masks real refused on a Google Workspace member's `files.get`, `files.list`, `permissions.list`,
+# `drives.list` and `about`: a mask that is not one is named whole, an unknown name alone, the first
+# in the mask's order.
+_MASKS_REFUSED = (
+    [
+        (_DOC, mask, mask)
+        for mask in [",", "id,", ",id", "id,,name", " ,id", "id, ", "id ,", "id, ,name", "id,name,"]
+        + ["owners(emailAddress,)", "capabilities(canEdit,)", "capabilities/canEdit,", "owners("]
+        + ["id(", "(id)", "id,\t", "id,\nname", "id," + chr(0xA0) + "name", "b x", "bogus,,id"]
+        + ["id,,bogus", "bogus,id(", "owners(*id)", "id)", "id),name", "owners(kind)),id"]
+        + ["owners(kind", "owners(kind,zzz", "id name", "id)name", "\n", chr(0x3000)]
+        + ["owners(" * 1000 + "kind" + ")" * 1000 + ",", "owners(" * 1000 + "kind"]
+        + ["id,b" + chr(cp) + "x" for cp in (0xAA, 0xB2, 0xB5, 0x9FA6, 0x21030)]
+        + ["id,x-", "id,-", "id,:x", "id,x:", "id,x::y", "id,x:y:z", "id,:", "owners(:x)"]
+    ]
+    + [
+        (_DOC, mask, name)
+        for mask, name in [("id, bogus", "bogus"), (" bogus", "bogus"), ("bogus ", "bogus")]
+        + [
+            ("id,b" + chr(cp) + "x", "b" + chr(cp) + "x")
+            for cp in (0xE9, 0xB7, 0x308, 0x640, 0x4E00)
+        ]
+        + [(f"id,{name}", name) for name in ("-x", "x--y", "x:y", "1:x", "x.", "x$y$z", "+x")]
+        + [
+            ("zzz,bogus", "zzz"),
+            ("bogus,zzz", "bogus"),
+            ("zzz,id,aaa", "zzz"),
+            ("aaa,owners(zzz)", "aaa"),
+        ]
+    ]
+    + [
+        ("/drive/v3/files", mask, mask)
+        for mask in ["files(id),", "files(id,)", "files(,id)", ",files(id)", "files/id,"]
+        + ["files(id),,nextPageToken", "nextPageToken,", "files(*id)", "files(id", "files(id))"]
+        + ["\n", chr(0x1C), chr(0x3000), "files(" + "owners(" * 1000 + "kind" + ")" * 1001 + ","]
+    ]
+    + [
+        (path, mask.format(list=listed), subject.format(list=listed))
+        for path, listed in ((_PERMS_OF_DOC, "permissions"), ("/drive/v3/drives", "drives"))
+        for mask, subject in [("bogus", "bogus"), ("{list}(bogus)", "bogus"), ("files", "files")]
+        + [("{list}(id),bogus", "bogus"), ("zzz,bogus", "zzz"), ("{list}(zzz),aaa", "zzz")]
+        + [("aaa,{list}(zzz)", "aaa"), ("{list}(zzz,aaa)", "zzz"), ("{list}(id,)", "{list}(id,)")]
+        + [("kind,", "kind,"), (",", ","), ("{list}(id),", "{list}(id),")]
+        + [("bogus,{list}(id,)", "bogus,{list}(id,)"), ("{list}(id", "{list}(id"), ("\n", "\n")]
+    ]
+    + [
+        ("/drive/v3/about", mask, subject)
+        for mask, subject in [("user,", "user,"), (",", ","), ("zzz,bogus", "zzz")]
+        + [("bogus,user", "bogus")]
+    ]
+)
+_FIELDS_REQUIRED = (
+    400,
+    "required",
+    "fields",
+    "The 'fields' parameter is required for this method.",
+)
+_NOT_FOUND = (404, "notFound", "fileId", None)
+
+
+def _unserved(name: str) -> tuple:
+    message = (
+        f"'{name}' is not served by Backlot: real Drive answers it, and nothing here carries it."
+    )
+    return (400, "invalidParameter", "fields", message)
+
+
+# Masks naming a field real answered and nothing here carries, refused as the comment above
+# `_DRIVE_FILE_UNSERVED` says.
+_MASKS_UNSERVED = [
+    (_DOC, "downloadRestrictions", "downloadRestrictions"),
+    (_DOC, "id,clientEncryptionDetails", "clientEncryptionDetails"),
+    (_DOC, "copyRequiresWriterPermission,viewersCanCopyContent", "copyRequiresWriterPermission"),
+    ("/drive/v3/files", "files(id,writersCanShare)", "writersCanShare"),
+    ("/drive/v3/files", "files/linkShareMetadata", "linkShareMetadata"),
+    (_PERMS_OF_DOC, "permissions(deleted)", "deleted"),
+    (_PERMS_OF_DOC, "permissions(id,photoLink)", "photoLink"),
+    (_PERMS_OF_DOC, "permissions/permissionDetails", "permissionDetails"),
+    (_PERMS_OF_DOC, "permissions(pendingOwner)", "pendingOwner"),
+]
+_FULLTEXT = "q=" + quote("fullText contains 'a'")
+# Where real answered a mask ending in a comma among a route's other refusals, each sent beside it,
+# and, as controls, where it answered a mask that is not one in another way or one naming a field
+# the resource lacks, and which of two `fields` it read.
+_MASK_ORDER = (
+    [("/drive/v3/files", "files(id),", "pageSize=NOPE", _TYPED)]
+    + [("/drive/v3/files", "files(id),", "pageSize=0", _RANGE)]
+    + [
+        ("/drive/v3/files", mask, extra, _mask_refused(mask))
+        for mask in ["files(id),", "files(id),\t"]
+        for extra in ["pageToken=bad", "q=bogus", "orderBy=bogus", "orderBy=name,name"]
+        + ["orderBy=name,starred", f"{_FULLTEXT}&orderBy=name", "includeItemsFromAllDrives=true"]
+        + ["pageSize=1&pageSize=2"]
+    ]
+    + [
+        ("/drive/v3/files", mask, "q=bogus", _Q_REFUSED)
+        for mask in ["files(id,,name)", "files(id,)", "files(", "\n", "bogus"]
+    ]
+    + [("/drive/v3/files", "bogus", "orderBy=bogus", (400, "invalid", "orderBy", "Invalid Value"))]
+    + [
+        (
+            "/drive/v3/files",
+            "bogus",
+            "pageToken=bad",
+            (400, "invalid", "pageToken", "Invalid Value"),
+        )
+    ]
+    + [
+        ("/drive/v3/files/{nope}", mask, "", _mask_refused(mask))
+        for mask in ["id,", "id, ", "id,\t", "id,\n", "id," + chr(0x0B), ",", "id,,", "bogus,"]
+        + ["owners(kind,"]
+    ]
+    + [
+        ("/drive/v3/files/{nope}", mask, "", _NOT_FOUND)
+        for mask in ["id,,name", "owners(", "id)", "\n", "id name", ",id", "bogus", "files(id,)"]
+        + ["id," + chr(0x1C), "id," + chr(0xA0)]
+    ]
+    + [(_DOC, "id,", "acknowledgeAbuse=true", _mask_refused("id,"))]
+    + [(_DOC, "id,", "supportsAllDrives=NOPE", _TYPED)]
+    + [("/drive/v3/files/{nope}/permissions", "kind,", "", _mask_refused("kind,"))]
+    + [
+        ("/drive/v3/files/{nope}/permissions", mask, "", _NOT_FOUND)
+        for mask in ["kind,,permissions", "permissions(", "\n"]
+    ]
+    + [
+        (path, "kind,", extra, expected)
+        for path in (_PERMS_OF_DOC, "/drive/v3/drives")
+        for extra, expected in [("pageSize=NOPE", _TYPED), ("useDomainAdminAccess=NOPE", _TYPED)]
+        + [("pageSize=0", _RANGE), ("pageSize=1&pageSize=2", _mask_refused("kind,"))]
+        + [("useDomainAdminAccess=true", _mask_refused("kind,"))]
+    ]
+    + [(_PERMS_OF_DOC, "kind,", "supportsAllDrives=NOPE", _TYPED)]
+    + [(_PERMS_OF_DOC, "kind,", "pageToken=bad", _mask_refused("kind,"))]
+    + [
+        ("/drive/v3/drives", "kind,", extra, _mask_refused("kind,"))
+        for extra in ["pageToken=x", "q=bogus"]
+    ]
+    + [("/drive/v3/drives", mask, "q=bogus", _Q_REFUSED) for mask in ["kind,,drives", "\n"]]
+    + [(_PERMS_OF_DOC, "kind,", "fields=kind", _mask_refused("kind,"))]
+    + [(_PERMS_OF_DOC, "kind", "fields=" + quote("kind,"), _SERVED)]
+    + [(_DOC, "id", "fields=" + quote("id,"), _SERVED)]
+)
+# Masks `about` answered with the missing-mask 400 `_drive_about_field_keys` describes.
+_ABOUT_MASKS_REQUIRED = ["\n", chr(0x1C), chr(0x3000), "user()", "user( )", "kind()"]
+# What a member's `drives.list` answered each `q` with, as `_DRIVES_Q` records.
+_DRIVES_Q_TAKEN = [
+    "",
+    "name contains 'a'",
+    "name = 'a'",
+    "name != 'a'",
+    "name = 'a\\'b'",
+    "hidden = true",
+    "hidden = TRUE",
+    "hidden != true",
+    "hidden",
+    "not hidden",
+    "not hidden = true",
+    "(name = 'a')",
+    "name = 'a' or name = 'b'",
+    "name = 'a' or hidden = true",
+    "name contains 'a' and not hidden = true",
+    "name < 'a'",
+    "name <= 'a'",
+    "name > 'a'",
+    "name >= 'a'",
+    "not name < 'a'",
+    "name < 'a' and hidden = false",
+    "not (not hidden)",
+    "not (hidden)",
+    "()",
+    "not ()",
+    "name contains 'a' and ()",
+    "hidden = true or",
+    "(name contains 'a' or) and hidden = false",
+    'name = "x"',
+    'name contains "a"',
+]
+_DRIVES_Q_REFUSED = [
+    " ",
+    "\t",
+    "bogus",
+    "name",
+    "name contains",
+    "name = a",
+    "name ~ 'a'",
+    "NAME = 'a'",
+    "hidden = 'yes'",
+    "memberCount > 1",
+    "memberCount > 'a'",
+    "organizerCount = 1",
+    "orgUnitId = 'x'",
+    "createdTime > '2020-01-01T00:00:00'",
+    "name contains 'a' or memberCount > 1",
+    "mimeType = 'a'",
+    "trashed = false",
+    "'root' in parents",
+    "fullText contains 'a'",
+    "starred = true",
+    "not not hidden",
+    "not not name contains 'a'",
+    "not(hidden)",
+    "hidden" + chr(0xA0) + "= true",
+    "( )",
+    "()()",
+    "not()",
+    "hidden = true and",
+]
 _PAGE_EXPIRED = (403, "pageTokenExpired", None, None)
 _UNKNOWN = (500, None, None, None)
 
@@ -2035,6 +2258,37 @@ _DRIVE_CHECK_ROWS = [
     ("/drive/v3/drives", "useDomainAdminAccess=false&useDomainAdminAccess=true", "admin", _SERVED),
     ("/drive/v3/drives", "useDomainAdminAccess=true&pageSize=0", "admin", _RANGE),
     ("/drive/v3/drives", "useDomainAdminAccess=true&q=name%3D%27x%27", "admin", _ADMIN_ONLY),
+    # the `q` a member's `drives.list` takes, and where its refusal falls among the others
+    *[("/drive/v3/drives", f"q={quote(q)}", "admin", _SERVED) for q in _DRIVES_Q_TAKEN],
+    *[("/drive/v3/drives", f"q={quote(q)}", "admin", _Q_REFUSED) for q in _DRIVES_Q_REFUSED],
+    ("/drive/v3/drives", "q=bogus&q=name%3D%27a%27", "admin", _Q_REFUSED),
+    ("/drive/v3/drives", "q=name%3D%27a%27&q=bogus", "admin", _SERVED),
+    ("/drive/v3/drives", "q=bogus&pageSize=NOPE", "admin", _TYPED),
+    ("/drive/v3/drives", "pageSize=NOPE&q=bogus", "admin", _TYPED),
+    ("/drive/v3/drives", "q=bogus&useDomainAdminAccess=NOPE", "admin", _TYPED),
+    ("/drive/v3/drives", "q=bogus&pageSize=0", "admin", _RANGE),
+    ("/drive/v3/drives", "q=bogus&pageToken=x", "admin", _Q_REFUSED),
+    ("/drive/v3/drives", "pageToken=x&q=bogus", "admin", _Q_REFUSED),
+    ("/drive/v3/drives", "q=bogus&useDomainAdminAccess=true", "admin", _Q_REFUSED),
+    ("/drive/v3/drives", "useDomainAdminAccess=true&q=bogus", "admin", _Q_REFUSED),
+    # a mask, and where its refusal falls among the others
+    *[(path, f"fields={quote(mask)}", "admin", _mask_refused(subject)) for path, mask, subject in _MASKS_REFUSED],
+    *[("/drive/v3/about", f"fields={quote(mask)}", "admin", _FIELDS_REQUIRED) for mask in _ABOUT_MASKS_REQUIRED],
+    *[(path, f"fields={quote(mask)}" + (extra and f"&{extra}"), "admin", expected) for path, mask, extra, expected in _MASK_ORDER],
+    *[(path, f"fields={quote(mask)}", "admin", _unserved(name)) for path, mask, name in _MASKS_UNSERVED],
+    ("/drive/v3/files/{pdf}/permissions", "fields=bogus&pageToken={issued}", "admin", _PAGE_EXPIRED),
+    ("/drive/v3/files/{pdf}/permissions", "fields=kind%2C&pageToken={issued}", "admin", _mask_refused("kind,")),
+    *[(path, "fields=bogus&fields=kind", "admin", _mask_refused("bogus")) for path in (_PERMS_OF_DOC, "/drive/v3/drives")],
+    *[(path, "fields=kind&fields=bogus", "admin", _SERVED) for path in (_PERMS_OF_DOC, "/drive/v3/drives")],
+    *[(path, f"fields=bogus&{query}", "admin", _TYPED) for path in (_PERMS_OF_DOC, "/drive/v3/drives") for query in ("pageSize=NOPE", "useDomainAdminAccess=NOPE")],
+    *[(path, "fields=bogus&pageSize=0", "admin", _RANGE) for path in (_PERMS_OF_DOC, "/drive/v3/drives")],
+    (_PERMS_OF_DOC, "fields=bogus&pageToken=bad", "admin", (400, "invalid", "pageToken", "Invalid Value")),
+    (_PERMS_OF_DOC, "pageToken=bad&fields=bogus", "admin", (400, "invalid", "pageToken", "Invalid Value")),
+    (_PERMS_OF_DOC, "fields=bogus&useDomainAdminAccess=true", "admin", (404, "notFound", "fileId", None)),
+    ("/drive/v3/files/{nope}/permissions", "fields=bogus", "admin", (404, "notFound", "fileId", None)),
+    ("/drive/v3/drives", "fields=bogus&pageToken=x", "admin", (400, "invalid", "pageToken", "Invalid Value")),
+    ("/drive/v3/drives", "fields=bogus&useDomainAdminAccess=true", "admin", _ADMIN_ONLY),
+    ("/drive/v3/drives", "fields=bogus&q=bogus", "admin", _Q_REFUSED),
 ]
 # fmt: on
 
@@ -2227,7 +2481,7 @@ def test_a_typed_refusal_comes_after_the_credential_and_before_the_lookup(
         assert send(missing, headers, bad=True).content == send(missing, headers).content
 
 
-@pytest.mark.parametrize("mask", ["", " "])
+@pytest.mark.parametrize("mask", ["", " ", "\t"])
 def test_drive_a_blank_fields_mask_selects_nothing(client, admin_h, mask):
     """The blank mask `_drive_get_field_keys` describes, on a listing, a file and a folder, and
     `about`'s missing-mask 400 for the same mask. An absent mask is the default object."""
@@ -2242,6 +2496,125 @@ def test_drive_a_blank_fields_mask_selects_nothing(client, admin_h, mask):
         assert client.get(path, headers=admin_h).json(), path
     about = _gerr(client.get(ABOUT, headers=admin_h, params={"fields": mask}))
     assert about["message"] == "The 'fields' parameter is required for this method."
+
+
+# What real answered each mask with. The third column is the top-level keys, `None` where the
+# answer was the unmasked one. The fourth is each entry's keys on a listing: `"default"` where each
+# entry was the unmasked one, an empty set where the list came back empty because every entry was
+# left with no key, and `None` where the entries are not compared. A documented field the file has
+# no value for leaves it out of the answer here, where real answers it.
+_MASKS_SERVED = [
+    (_DOC, "id , name", {"id", "name"}, None),
+    (_DOC, "id,\tname", {"id", "name"}, None),
+    (_DOC, "id\t,name", {"id", "name"}, None),
+    (_DOC, "  id  ", {"id"}, None),
+    (_DOC, "owners()", set(), None),
+    (_DOC, "owners( )", set(), None),
+    (_DOC, "owners (kind),id", {"owners", "id"}, None),
+    (_DOC, "owners/ kind,id", {"owners", "id"}, None),
+    (_DOC, "owners /kind,id", {"owners", "id"}, None),
+    (_DOC, "owners(emailAddress , displayName),id", {"owners", "id"}, None),
+    (_DOC, "owners(),id", {"id"}, None),
+    (_DOC, "*,id", None, None),
+    (_DOC, "id,*", None, None),
+    (_DOC, "id()", {"id"}, None),
+    (_DOC, "id( )", {"id"}, None),
+    (_DOC, "name()", {"name"}, None),
+    (_DOC, "kind()", {"kind"}, None),
+    (_DOC, "mimeType()", {"mimeType"}, None),
+    (_DOC, "kind(),id", {"kind", "id"}, None),
+    (_DOC, "createdTime()", set(), None),
+    (_DOC, "trashed()", set(), None),
+    ("/drive/v3/files", "*", {"files"}, "default"),
+    ("/drive/v3/files", "*,files(id)", {"files"}, "default"),
+    ("/drive/v3/files", "files(id,*)", {"files"}, "default"),
+    ("/drive/v3/files", "files()", {"files"}, set()),
+    ("/drive/v3/files", "files( )", {"files"}, set()),
+    ("/drive/v3/files", "files(trashingUser)", {"files"}, set()),
+    ("/drive/v3/files", "files/trashingUser", {"files"}, set()),
+    ("/drive/v3/files", "files(id,trashingUser)", {"files"}, {"id"}),
+    ("/drive/v3/files", "files(id())", {"files"}, {"id"}),
+    ("/drive/v3/files", "files(name())", {"files"}, {"name"}),
+    ("/drive/v3/files", "files(createdTime())", {"files"}, set()),
+    (_PERMS_OF_DOC, "", set(), None),
+    (_PERMS_OF_DOC, " ", set(), None),
+    (_PERMS_OF_DOC, "nextPageToken", set(), None),
+    (_PERMS_OF_DOC, "kind", {"kind"}, None),
+    (_PERMS_OF_DOC, " kind", {"kind"}, None),
+    (_PERMS_OF_DOC, "kind,nextPageToken", {"kind"}, None),
+    (_PERMS_OF_DOC, "permissions(id)", {"permissions"}, {"id"}),
+    (_PERMS_OF_DOC, "permissions( id )", {"permissions"}, {"id"}),
+    (_PERMS_OF_DOC, "permissions/id", {"permissions"}, {"id"}),
+    (_PERMS_OF_DOC, "permissions/kind", {"permissions"}, {"kind"}),
+    (_PERMS_OF_DOC, "permissions(id,role)", {"permissions"}, {"id", "role"}),
+    (_PERMS_OF_DOC, "permissions(id,\trole)", {"permissions"}, {"id", "role"}),
+    (_PERMS_OF_DOC, "kind ,permissions(id)", {"kind", "permissions"}, {"id"}),
+    (_PERMS_OF_DOC, "permissions()", {"permissions"}, set()),
+    (_PERMS_OF_DOC, "kind()", {"kind"}, None),
+    (_PERMS_OF_DOC, "permissions(id())", {"permissions"}, {"id"}),
+    (_PERMS_OF_DOC, "permissions(role())", {"permissions"}, {"role"}),
+    (_PERMS_OF_DOC, "permissions(type())", {"permissions"}, {"type"}),
+    (_PERMS_OF_DOC, "permissions(kind())", {"permissions"}, {"kind"}),
+    (_PERMS_OF_DOC + "?pageSize=1", "nextPageToken()", {"nextPageToken"}, None),
+    (_PERMS_OF_DOC, "permissions(emailAddress())", {"permissions"}, set()),
+    (_PERMS_OF_DOC, "permissions( )", {"permissions"}, set()),
+    (_PERMS_OF_DOC, "permissions(teamDrivePermissionDetails)", {"permissions"}, set()),
+    (_PERMS_OF_DOC, "permissions", {"permissions"}, "default"),
+    (_PERMS_OF_DOC, "permissions(*)", {"permissions"}, "default"),
+    (_PERMS_OF_DOC, "*", {"kind", "permissions"}, "default"),
+    (_PERMS_OF_DOC, "*,permissions(id)", {"kind", "permissions"}, "default"),
+    (_PERMS_OF_DOC, "permissions(id,*)", {"permissions"}, "default"),
+    ("/drive/v3/drives", "", set(), None),
+    ("/drive/v3/drives", " ", set(), None),
+    ("/drive/v3/drives", "nextPageToken", set(), None),
+    ("/drive/v3/drives", "kind", {"kind"}, None),
+    ("/drive/v3/drives", "kind,nextPageToken", {"kind"}, None),
+    ("/drive/v3/drives", "drives(id)", {"drives"}, None),
+    ("/drive/v3/drives", "drives/id", {"drives"}, None),
+    ("/drive/v3/drives", "drives()", {"drives"}, None),
+    ("/drive/v3/drives", "drives(id,name)", {"drives"}, None),
+    ("/drive/v3/drives", "*", {"kind", "drives"}, None),
+    ("/drive/v3/drives", "kind()", {"kind"}, None),
+    ("/drive/v3/about", "user, storageQuota", {"user", "storageQuota"}, None),
+    ("/drive/v3/about", "user ,kind", {"user", "kind"}, None),
+    ("/drive/v3/about", "user", {"user"}, None),
+    ("/drive/v3/about", "user,storageQuota", {"user", "storageQuota"}, None),
+    ("/drive/v3/about", "user(kind)", {"user"}, None),
+    ("/drive/v3/about", "user(*)", {"user"}, None),
+]
+
+
+@pytest.mark.parametrize("path, mask, top, entries", _MASKS_SERVED)
+def test_drive_answers_a_fields_mask_with_what_it_selects(
+    client, admin_h, path, mask, top, entries
+):
+    """The rows `_MASKS_SERVED` records. `files.list`'s own top-level keys are left whole, as
+    `_drive_file_field_keys` says, so only its `files` is compared; `"default"` is each entry as an
+    unmasked request gets it. A `drives.list` row compares the top-level keys alone: Backlot serves
+    no shared drive, where real listed the member's two."""
+    doc = _drive_find(client, admin_h, "Brand")["id"]
+    url, _, query = path.format(doc=doc).partition("?")
+
+    def get(**params):
+        r = client.get(
+            url, headers=admin_h, params={"pageSize": 2, **dict(parse_qsl(query)), **params}
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        return {"files": body["files"]} if path == "/drive/v3/files" else body
+
+    body = get(fields=mask)
+    if top is None:
+        assert body == get()
+        return
+    assert set(body) == top
+    listed = next((k for k in body if isinstance(body[k], list)), None)
+    if entries == "default":
+        assert body[listed] == get()[listed]
+    elif entries:
+        assert body[listed] and all(set(e) == entries for e in body[listed])
+    elif entries is not None:
+        assert body[listed] == []
 
 
 BAD_TOKEN = {"Authorization": "Bearer not-a-real-token"}
@@ -4253,13 +4626,13 @@ def _drive_ids(client, headers, **params):
 
 
 def test_drive_shared_with_me_partitions_by_owner(client, tokens_yaml):
-    """`q=sharedWithMe=true` must return only items shared with the caller by someone else, and
-    `false` must exclude them — real Drive's "Shared with me" is the only way to enumerate those.
-    Ignoring the clause makes both return the caller's whole visible corpus."""
+    """`q=sharedWithMe=true` returns only the items someone else shared with the caller, and
+    `'me' in owners` the caller's own, so the two partition what the caller sees. Real refuses
+    `sharedWithMe = false`, as `_FILES_Q` records, so the caller's own are asked for by owner."""
     mia = {"Authorization": f"Bearer {tok(tokens_yaml, 'mia@acme.com')}"}
     all_ids = set(_drive_ids(client, mia, q="trashed=false", pageSize=100))
     shared = set(_drive_ids(client, mia, q="sharedWithMe=true and trashed=false", pageSize=100))
-    own = set(_drive_ids(client, mia, q="sharedWithMe=false and trashed=false", pageSize=100))
+    own = set(_drive_ids(client, mia, q="'me' in owners and trashed=false", pageSize=100))
     assert shared and own  # SAMPLE gives mia both her own and others' files
     assert shared != own and not (shared & own)
     assert shared | own == all_ids  # together they partition the visible corpus
@@ -4282,7 +4655,7 @@ def test_drive_shared_items_carry_shared_with_me_time(client, tokens_yaml):
     own = client.get(
         "/drive/v3/files",
         headers=mia,
-        params={"q": "sharedWithMe=false and trashed=false", "pageSize": 100},
+        params={"q": "'me' in owners and trashed=false", "pageSize": 100},
     ).json()["files"]
     assert shared and own
     assert all(f["sharedWithMeTime"] for f in shared), "every shared item needs the timestamp"
@@ -5505,13 +5878,6 @@ def test_drive_about_rejects_an_unknown_field(client, admin_h):
     assert _about(client, admin_h, "storageQuota").status_code == 200
 
 
-def test_drive_about_rejects_a_mask_that_selects_nothing(client, admin_h):
-    """`fields=,` clears the required-mask check but names no field. Falling through to "no
-    projection" would answer a request for nothing with the entire resource."""
-    r = client.get(ABOUT, headers=admin_h, params={"fields": ","})
-    assert r.status_code == 400
-
-
 def test_drive_about_needs_auth(client):
     # no header at all -> 401 (`about` takes no API key, `_NO_CREDENTIAL_ROWS`); a bad token -> 401
     assert client.get(ABOUT, params={"fields": "user"}).status_code == 401
@@ -5521,17 +5887,9 @@ def test_drive_about_needs_auth(client):
     assert client.get(ABOUT, headers=bad).status_code == 401
 
 
-def test_drive_about_serves_only_the_requested_fields(client, admin_h):
-    """Unlike `files.list` — whose typed response model always carries `kind` — `about` projects
-    strictly, which is what real Drive does: ask for `user` and `user` is all you get."""
-    j = _about(client, admin_h, "user").json()
-    assert set(j) == {"user"}
-    assert set(_about(client, admin_h, "user,storageQuota").json()) == {"user", "storageQuota"}
-
-
 def test_drive_about_nested_mask_selects_its_parent(client, admin_h):
-    """`storageQuota/limit` selects `storageQuota`, the same rule every other mask in Backlot
-    follows — one projection depth, applied consistently."""
+    """`storageQuota/limit` selects `storageQuota` whole, as `owners/kind` selects `owners` on
+    `files.get`."""
     j = _about(client, admin_h, "storageQuota/limit").json()
     assert set(j) == {"storageQuota"}
     assert "usage" in j["storageQuota"]
@@ -7457,62 +7815,189 @@ def test_drive_permissions_and_trashed(tmp_path):
     # group-restricted doc surfaces a group-type permission
     gperms = _drive_permissions(conn, served_id("google_drive", "d2"))
     assert any(p["type"] == "group" for p in gperms)
-    # trashed excluded from a default `q`, included when asked
+    # `trashed = false` leaves a trashed file out and `trashed = true` matches it
     d2 = store.get_document(conn, "google_drive", served_id("google_drive", "d2"))
     facts = _drive_facts(d2)
     assert _drive_q_eval(_drive_q_parse("trashed = false"), facts, None, {}) is False
     assert _drive_q_eval(_drive_q_parse("trashed = true"), facts, None, {}) is True
 
 
-def test_drive_files_list_excludes_trashed_with_no_query_at_all(tmp_path):
-    """Real Drive leaves trashed files out of `files.list` unless `trashed = true` asks for them.
-
-    Every `q`-bearing path honored that (the matcher's default branch, and list_drive_folder's own
-    WHERE), so the ONE call that returned trash was the plainest possible one: `files.list` with no
-    `q`, which went straight to the generic listing helper and had no trashed notion. Asserted over
-    HTTP rather than on the matcher, since the matcher was never reached on this path — and on the
-    reported total too, because a count that includes rows the listing drops makes nextPageToken
-    promise a page that does not exist."""
+# A file and a trashed file its owner lists, as the no-`q` branch of `drive_files_list` records.
+@pytest.mark.parametrize(
+    "q, listed",
+    [
+        (None, {"live", "gone"}),
+        ("name contains 'Deck'", {"live", "gone"}),
+        ("'{folder}' in parents", {"live", "gone"}),
+        ("'{folder}' in parents and trashed = false", {"live"}),
+        ("'{folder}' in parents and trashed = true", {"gone"}),
+        ("name contains 'Deck' and not starred", {"live", "gone"}),
+        ("name contains 'Deck' and trashed = false", {"live"}),
+        ("name contains 'Deck' and not trashed", {"live"}),
+        ("name contains 'Deck' and trashed", {"gone"}),
+    ],
+)
+def test_drive_files_list_lists_the_trash_unless_q_leaves_it_out(tmp_path, q, listed):
+    """The total is the listing's, so `nextPageToken` promises no page there is not."""
     from backlot import synth
     from tests._helpers import corpus_client
 
     records = [
         {
             "source_type": "google_drive",
-            "doc_id": "live",
+            "doc_id": doc_id,
             "folder": "mk",
-            "title": "Current Deck",
+            "title": title,
             "content": "x",
             "author_email": "a@x.com",
             "visibility": "public",
-        },
-        {
-            "source_type": "google_drive",
-            "doc_id": "gone",
-            "folder": "mk",
-            "title": "Old Deck",
-            "content": "y",
-            "author_email": "a@x.com",
-            "visibility": "public",
-            "trashed": True,
-        },
+            **extra,
+        }
+        for doc_id, title, extra in (
+            ("live", "Current Deck", {}),
+            ("gone", "Old Deck", {"trashed": True}),
+        )
     ]
-    # The served ids, not the corpus ids: a bare "live"/"gone" never appears in `ids` regardless
-    # of whether trashing is honored, so the assertions below would pass for the wrong reason.
-    live_id, gone_id = synth.gdrive_file_id("live"), synth.gdrive_file_id("gone")
+    served = {synth.gdrive_file_id(doc_id): doc_id for doc_id in ("live", "gone")}
     with corpus_client(tmp_path, records) as (client, settings):
-        h = {"Authorization": f"Bearer {settings.admin_token}"}
-        body = client.get("/drive/v3/files", headers=h, params={"pageSize": 100}).json()
-        ids = [f["id"] for f in body["files"]]
-        assert live_id in ids
-        assert gone_id not in ids, "a trashed file must not appear in an unfiltered files.list"
-        assert "nextPageToken" not in body, "the total counted a row the listing dropped"
+        params = {"pageSize": 100, "q": (q or "").format(folder=synth.drive_folder_id("mk"))}
+        r = client.get(
+            "/drive/v3/files",
+            headers={"Authorization": f"Bearer {settings.admin_token}"},
+            params={k: v for k, v in params.items() if v},
+        )
+        assert r.status_code == 200, r.text
+        assert {served[f["id"]] for f in r.json()["files"] if f["id"] in served} == listed
+        assert "nextPageToken" not in r.json()
 
-        # ...and it is still reachable when the caller asks for it, as in real Drive.
-        asked = client.get(
-            "/drive/v3/files", headers=h, params={"q": "trashed = true", "pageSize": 100}
-        ).json()
-        assert [f["id"] for f in asked["files"]] == [gone_id]
+
+@pytest.mark.parametrize(
+    "q, scope",
+    [
+        ("'f' in parents", "all"),
+        ("('f' in parents)", "all"),
+        ("'f' in parents and trashed = false", "live"),
+        ("trashed = false and 'f' in parents", "live"),
+        ("'f' in parents and name = 'a'", None),
+        ("'f' in parents and 'me' in owners", None),
+        ("'f' in parents and (name = 'a' or name = 'b')", None),
+        ("'f' in parents and trashed = true", None),
+        ("'f' in parents or name = 'a'", None),
+        ("not 'f' in parents", None),
+    ],
+)
+def test_drive_q_plain_folder_reads_a_folder_scope(q, scope):
+    from backlot.routers import google
+
+    assert google._drive_q_plain_folder(google._drive_q_parse(q)) == scope
+
+
+@pytest.mark.parametrize(
+    "q, scan, listed",
+    [
+        ("'{folder}' in parents", "backlot.routers.google._drive_q_rows", {"Live", "Gone"}),
+        ("name = 'Gone'", "backlot.store.list_documents", {"Gone"}),
+        ("name contains 'ON'", "backlot.store.list_documents", {"Gone"}),
+        ("name = 'Gone' and trashed = false", "backlot.store.list_documents", set()),
+        ("name contains 'e' and not trashed", "backlot.store.list_documents", {"Live"}),
+    ],
+)
+def test_drive_a_folder_scope_or_a_name_is_listed_from_sql(tmp_path, monkeypatch, q, scan, listed):
+    """`'<id>' in parents`, LlamaIndex's Google Drive reader's `q`, is served by
+    `store.list_drive_folder`, and a `name` term, mirage's lookup, by `store.list_drive_by_name`,
+    each with its owner's trash and whatever `trashed` term sits beside it: with ``scan`` patched
+    to fail, the listing still answers, where the rows a scan builds stop at 100,000 candidates."""
+    from backlot import synth
+
+    def fail(*args, **kwargs):
+        raise AssertionError(f"{q} reached {scan}")
+
+    monkeypatch.setattr(scan, fail)
+    record = {
+        "source_type": "google_drive",
+        "folder": "mk",
+        "content": "x",
+        "visibility": "private",
+    }
+    s = tiny_corpus(
+        tmp_path,
+        [
+            {**record, "doc_id": "live", "title": "Live", "author_email": "mia@acme.com"},
+            {**record, "doc_id": "gone", "title": "Gone", "author_email": "mia@acme.com"}
+            | {"trashed": True},
+        ],
+    )
+    tokens = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))
+    mia = {"Authorization": f"Bearer {tok(tokens, 'mia@acme.com')}"}
+    params = {"q": q.format(folder=synth.drive_folder_id("mk")), "fields": "files(name)"}
+    with client_for(s, reload=True) as c:
+        r = c.get("/drive/v3/files", headers=mia, params=params)
+        assert r.status_code == 200, r.text
+        assert {f["name"] for f in r.json()["files"]} == listed
+
+
+def test_drive_lists_only_the_trash_its_caller_may_see(tmp_path):
+    """Mia lists her own trash, and neither Ava's private file nor the two of Ava's she can read,
+    which `files.get` still answers; the admin token lists every one. Ava's file out of the trash,
+    `Kept`, is listed to each caller under each `q` but `trashed`. To each of the three users
+    `files.get` answers `ownedByMe: true` on exactly the trashed files it lists: `MIA@acme.com`'s is
+    `mia@acme.com`'s, and `Éva@acme.com`'s is not `éva@acme.com`'s."""
+    from backlot import synth
+
+    record = {"source_type": "google_drive", "folder": "mk", "content": "alpha", "trashed": True}
+    ava = {**record, "author_email": "ava@acme.com"}
+    s = tiny_corpus(
+        tmp_path,
+        [
+            {**record, "doc_id": "hers", "title": "Hers", "author_email": "mia@acme.com"},
+            {**ava, "doc_id": "secret", "title": "Secret", "visibility": "private"},
+            {**ava, "doc_id": "public", "title": "Public", "visibility": "public"},
+            {**ava, "doc_id": "lent", "title": "Lent", "visibility": "private"}
+            | {"readers": ["ava@acme.com", "mia@acme.com"]},
+            {**record, "doc_id": "shout", "title": "Shout", "author_email": "MIA@acme.com"}
+            | {"visibility": "private", "readers": ["MIA@acme.com", "mia@acme.com"]},
+            {**record, "doc_id": "accent", "title": "Accent", "author_email": "Éva@acme.com"}
+            | {"visibility": "private", "readers": ["Éva@acme.com", "éva@acme.com"]},
+            {**ava, "doc_id": "kept", "title": "Kept", "visibility": "public", "trashed": False},
+        ],
+    )
+    tokens = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))
+    callers = {"admin": tokens["admin_token"]}
+    callers |= {who: tok(tokens, f"{who}@acme.com") for who in ("mia", "ava", "éva")}
+    folder = synth.drive_folder_id("mk")
+    queries = (None, "trashed", f"'{folder}' in parents", "fullText contains 'alpha'")
+    queries += ("name contains 'e' or name contains 'u'", "name != 'x'")
+    with client_for(s, reload=True) as c:
+        for who, want in (
+            ("admin", {"Hers", "Secret", "Public", "Lent", "Shout", "Accent"}),
+            ("mia", {"Hers", "Shout"}),
+            ("ava", {"Secret", "Public", "Lent"}),
+            ("éva", set()),
+        ):
+            h = {"Authorization": f"Bearer {callers[who]}"}
+            for q in queries:
+                params = {"q": q, "fields": "files(name,mimeType)"} if q else {}
+                r = c.get("/drive/v3/files", headers=h, params=params)
+                names = {f["name"] for f in r.json()["files"] if f["mimeType"] != _FOLDER}
+                assert names == (want if q == "trashed" else want | {"Kept"}), (who, q)
+            for name in ("Hers", "Public", "Lent", "Shout", "Accent", "Kept"):
+                r = c.get("/drive/v3/files", headers=h, params={"q": f"name = '{name}'"})
+                assert {f["name"] for f in r.json()["files"]} == {name} & (want | {"Kept"}), (
+                    who,
+                    name,
+                )
+            if who == "admin":
+                continue
+            for doc_id in ("hers", "secret", "public", "lent", "shout", "accent"):
+                url = f"/drive/v3/files/{synth.gdrive_file_id(doc_id)}"
+                r = c.get(url, headers=h, params={"fields": "name,trashed,ownedByMe"})
+                if r.status_code == 404:
+                    continue
+                body = r.json()
+                assert body["trashed"] and body["ownedByMe"] == (body["name"] in want), (
+                    who,
+                    doc_id,
+                )
 
 
 #: Two folders whose synthesized times (``synth.epoch``) fall between their files', a file whose
@@ -7647,18 +8132,20 @@ _Q_RECORDS = [
         "author_email": "mia@x.com",
         "visibility": "public",
         "trashed": True,
+        "created": "2025-11-01T09:00:00Z",
+        "updated": "2025-11-02T09:00:00Z",
     },
 ]
 _FOLDER = "application/vnd.google-apps.folder"
 
 
 def test_drive_q_evaluates_the_operators_the_reference_lists(tmp_path):
-    """Every operator the reference lists for `name`, `mimeType`, `modifiedTime`, `createdTime` and
-    `trashed`, over a corpus small enough to name the answer; `sharedWithMe`, `fullText` and the
-    two collections are in the client-shapes test that closes this group. Folders are dropped here
-    (their `createdTime` is seeded,
-    so a time clause's answer for them is not this test's to state); the test below is where they
-    go through the same evaluator."""
+    """Every operator the reference lists for `name`, `mimeType`, `modifiedTime`, `createdTime`,
+    `viewedByMeTime`, `trashed` and `starred`, over a corpus small enough to name the answer;
+    `sharedWithMe`, `fullText` and the two collections are in the client-shapes test that closes
+    this group. Folders are dropped here (their `createdTime` is seeded, so a time clause's answer
+    for them is not this test's to state); the test below is where they go through the same
+    evaluator."""
     from tests._helpers import corpus_client
 
     with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
@@ -7676,18 +8163,28 @@ def test_drive_q_evaluates_the_operators_the_reference_lists(tmp_path):
         # name: contains, =, != — `=` reads case-insensitively, as the `contains` before it did
         assert files("name = 'Q1 Deck'") == {"Q1 Deck"}
         assert files("name = 'q1 deck'") == {"Q1 Deck"}
-        assert files("name != 'Q1 Deck'") == {"Brand guidelines", "Q1 Revenue", "Mia's Notes"}
+        assert files("name != 'Q1 Deck'") == {
+            "Brand guidelines",
+            "Q1 Revenue",
+            "Mia's Notes",
+            "Old Deck",
+        }
         # the reference's escape for an apostrophe inside a value
         assert files("name = 'Mia\\'s Notes'") == {"Mia's Notes"}
         # mimeType: contains, =, !=
         assert files("mimeType contains 'spreadsheet'") == {"Q1 Revenue"}
         assert files("mimeType = 'application/vnd.google-apps.presentation'") == {"Q1 Deck"}
         # modifiedTime / createdTime: the full comparison set, a zone-less value read as UTC
-        assert files("modifiedTime < '2026-01-10T00:00:00Z'") == {"Q1 Revenue", "Mia's Notes"}
+        assert files("modifiedTime < '2026-01-10T00:00:00Z'") == {
+            "Q1 Revenue",
+            "Mia's Notes",
+            "Old Deck",
+        }
         assert files("modifiedTime <= '2026-01-21T09:00:00Z'") == {
             "Q1 Revenue",
             "Q1 Deck",
             "Mia's Notes",
+            "Old Deck",
         }
         assert files("modifiedTime >= '2026-01-21T09:00:00'") == {"Brand guidelines", "Q1 Deck"}
         assert files("modifiedTime > '2026-01-21T09:00:00Z'") == {"Brand guidelines"}
@@ -7696,25 +8193,68 @@ def test_drive_q_evaluates_the_operators_the_reference_lists(tmp_path):
             "Brand guidelines",
             "Q1 Deck",
             "Mia's Notes",
+            "Old Deck",
         }
         # or, not, parentheses
         assert files("name contains 'Deck' or name contains 'Brand'") == {
             "Q1 Deck",
             "Brand guidelines",
+            "Old Deck",
         }
-        assert files("not name contains 'Q1'") == {"Brand guidelines", "Mia's Notes"}
+        assert files("not name contains 'Q1'") == {"Brand guidelines", "Mia's Notes", "Old Deck"}
         assert files(
             "(name contains 'Q1' or name contains 'Brand') and mimeType != "
             "'application/vnd.google-apps.presentation'"
         ) == {"Q1 Revenue", "Brand guidelines"}
-        # trashed: left out unless a clause asks, and asked for through `not` as well as `= true`
-        assert files("name contains 'Deck'") == {"Q1 Deck"}
+        # trashed: listed unless a clause leaves it out, and asked for through `not` as well as
+        # `= true`
+        assert files("name contains 'Deck'") == {"Q1 Deck", "Old Deck"}
+        assert files("name contains 'Deck' and trashed = false") == {"Q1 Deck"}
         assert files("name contains 'Deck' and trashed = true") == {"Old Deck"}
         assert files("not trashed = false") == {"Old Deck"}
         assert files("trashed != false") == {"Old Deck"}
         # ...and through `not` beside a `name contains`, whose title-LIKE candidate set answers
         # non-trashed rows only and so must not be used here.
         assert files("name contains 'Deck' and not trashed = false") == {"Old Deck"}
+        assert files("trashed") == {"Old Deck"}
+        # a folder's files, the trash with them unless the scope leaves it out, and a clause
+        # beside the scope applied as well
+        mk = synth.drive_folder_id("mk")
+        assert files(f"'{mk}' in parents") == {
+            "Brand guidelines",
+            "Q1 Deck",
+            "Mia's Notes",
+            "Old Deck",
+        }
+        assert files(f"'{mk}' in parents and trashed = false") == {
+            "Brand guidelines",
+            "Q1 Deck",
+            "Mia's Notes",
+        }
+        assert files(f"'{mk}' in parents and trashed = false and name contains 'Deck'") == {
+            "Q1 Deck"
+        }
+        # starred and viewedByMeTime: nothing is starred or viewed, so `!=` alone matches a time
+        every = {"Brand guidelines", "Q1 Revenue", "Q1 Deck", "Mia's Notes", "Old Deck"}
+        for q, expected in (
+            ("starred = true", set()),
+            ("starred = TRUE", set()),
+            ("starred", set()),
+            ("starred = false", every),
+            ("starred != true", every),
+            ("not starred = true", every),
+            ("not starred", every),
+            ("starred != false", set()),
+            ("viewedByMeTime > '2000-01-01T00:00:00'", set()),
+            ("viewedByMeTime < '2100-01-01T00:00:00Z'", set()),
+            ("viewedByMeTime <= '2100-01-01T00:00:00Z'", set()),
+            ("viewedByMeTime >= '2000-01-01'", set()),
+            ("viewedByMeTime = '2000-01-01T00:00:00'", set()),
+            ("viewedByMeTime != '2000-01-01T00:00:00'", every),
+            ("not viewedByMeTime > '2000-01-01T00:00:00'", every),
+            ("not viewedByMeTime != '2000-01-01T00:00:00'", set()),
+        ):
+            assert files(q) == expected, q
 
 
 def test_drive_q_or_spans_folders_and_files(tmp_path):
@@ -7745,9 +8285,8 @@ def test_drive_q_or_spans_folders_and_files(tmp_path):
 
 
 def test_drive_q_refuses_a_clause_it_cannot_parse(tmp_path):
-    """A term the reference does not list, or a clause that is not the grammar, is a 400 on `q` —
-    where before it silently fell out of the filter. Real Drive's wording for it is unmeasured, so
-    the message is the bare `Invalid Value` of the parameter envelope."""
+    """A term `files.list` does not take, a clause that is not the grammar, or white space alone is
+    the 400 `_drive_q_refused` raises."""
     from tests._helpers import corpus_client
 
     with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
@@ -7759,7 +8298,8 @@ def test_drive_q_refuses_a_clause_it_cannot_parse(tmp_path):
             "name contains 'unterminated",
             "trashed = 'true'",
             "modifiedTime contains 'x'",
-            "modifiedTime < 'yesterday'",  # the reference wants RFC 3339 here
+            "modifiedTime < 'yesterday'",
+            "createdTime < 'yesterday'",
             "'x' in bogus",
             "(name contains 'a'",
             "name contains 'a' name contains 'b'",
@@ -7772,10 +8312,39 @@ def test_drive_q_refuses_a_clause_it_cannot_parse(tmp_path):
             "name contains 'a' or or name contains 'b'",
             "not",
             "name contains 'a' and not",
-            "not not name contains 'a'",
             "not " * 200 + "name contains 'a'",
             "sharedWithMe < true",
             "sharedWithMe >= false",
+            "Starred = true",
+            "starred = 'true'",
+            "starred = yes",
+            "starred contains true",
+            "VIEWEDBYMETIME > '2000-01-01T00:00:00'",
+            "viewedByMeTime > 'garbage'",
+            "viewedByMeTime > ''",
+            "viewedByMeTime > 2020",
+            "viewedByMeTime contains '2020'",
+            "modifiedByMeTime > '2000-01-01T00:00:00'",
+            "sharedWithMeTime > '2000-01-01T00:00:00'",
+            "starred = true and",
+            "not not starred",
+            "not not name contains 'a'",
+            "not sharedWithMe",
+            "sharedWithMe = false",
+            "sharedWithMe != true",
+            "not (name contains 'a' and sharedWithMe)",
+            "not(trashed)",
+            "NOT(trashed)",
+            "(not(trashed))",
+            "name contains 'a' and not(starred)",
+            *("trashed" + chr(cp) + "= false" for cp in (0x0B, 0x1C, 0x85, 0xA0, 0x2003, 0x3000)),
+            chr(0xA0) + "trashed = false",
+            *("trashed = false" + chr(cp) for cp in (0x0B, 0xA0, 0x3000)),
+            " and ",
+            " ",
+            "\t",
+            "\n",
+            chr(0xA0),
         ):
             r = client.get("/drive/v3/files", headers=h, params={"q": q})
             assert r.status_code == 400, f"{q}: {r.text}"
@@ -7799,9 +8368,9 @@ _LIVE = {"Brand guidelines", "Q1 Revenue", "Q1 Deck", "Mia's Notes"}
         ("trashed > false", _LIVE),
         ("trashed >= true", {"Old Deck"}),
         ("trashed >= false", _LIVE),
-        ("()", _LIVE),
+        ("()", _LIVE | {"Old Deck"}),
         ("name = 'Q1 Deck' and ()", {"Q1 Deck"}),
-        ("name = 'Q1 Deck' or", _LIVE),
+        ("name = 'Q1 Deck' or", _LIVE | {"Old Deck"}),
         ("(name = 'Q1 Deck' or) and name contains 'Q1'", {"Q1 Deck", "Q1 Revenue"}),
         ("not (not name = 'Q1 Deck')", {"Q1 Deck"}),
         ("(" * 64 + "name = 'Q1 Deck'" + ")" * 64, {"Q1 Deck"}),
@@ -7824,18 +8393,16 @@ def test_drive_q_reads_what_real_reads_past_the_reference(tmp_path, q, names):
 
 
 def test_drive_q_refuses_a_documented_term_it_holds_no_fact_for(tmp_path):
-    """`starred`, `writers`, `viewedByMeTime` are the reference's, and a corpus record carries
-    nothing to answer them from. Refused with a message that says so, the way an unmodelled
-    `orderBy` key is — honouring `starred = true` as "everything" would be the silent listing the
-    parser exists to stop."""
+    """`writers`, `readers`, `visibility` and the two map-valued terms are the reference's, and a
+    corpus record carries nothing to answer them from, so the refusal says so."""
     from tests._helpers import corpus_client
 
     with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
         h = {"Authorization": f"Bearer {settings.admin_token}"}
         for q in (
-            "starred = true",
             "'mia@x.com' in writers",
-            "viewedByMeTime > '2026-01-01T00:00:00Z'",
+            "'mia@x.com' in readers",
+            "visibility = 'anyoneCanFind'",
             # The reference's own spelling for the two map-valued terms: `{` is a token, so the
             # field is read and named before the brace can be refused.
             "properties has { key='x' and value='y' }",
@@ -7865,8 +8432,14 @@ def test_drive_q_shapes_clients_send_still_parse(tmp_path):
                 "sharedWithMe and trashed = false",
                 {"mk", "fin", "Brand guidelines", "Q1 Revenue", "Q1 Deck", "Mia's Notes"},
             ),
-            ("sharedWithMe = false", set()),
-            ("sharedWithMe != true", set()),
+            (
+                "(sharedWithMe = TRUE) and not (name contains 'zzzq') and trashed = false",
+                {"mk", "fin", "Brand guidelines", "Q1 Revenue", "Q1 Deck", "Mia's Notes"},
+            ),
+            ("not (not starred)", set()),
+            ("not\t(name != 'Q1 Deck')", {"Q1 Deck"}),
+            ("trashed = false\fand\rname = 'Q1 Deck'", {"Q1 Deck"}),
+            ("trashed = false and(name = 'Q1 Deck') \t\n", {"Q1 Deck"}),
             ("'mia@x.com' in owners and name contains 'Q1'", {"Q1 Deck"}),
             # `me` is the caller; the admin token owns nothing, so nothing is `me`'s and
             # everything non-trashed is `not me`'s.
@@ -7902,7 +8475,7 @@ def test_drive_q_me_is_the_caller(tmp_path):
         mia = {"Authorization": f"Bearer {tokens['mia@x.com']}"}
         files = "mimeType != 'application/vnd.google-apps.folder'"
         for q, expected in (
-            ("'me' in owners", {"Brand guidelines", "Q1 Deck", "Mia's Notes"}),
+            ("'me' in owners", {"Brand guidelines", "Q1 Deck", "Mia's Notes", "Old Deck"}),
             (f"not 'me' in owners and {files}", {"Q1 Revenue"}),
         ):
             r = client.get("/drive/v3/files", headers=mia, params={"q": q, "fields": "files(name)"})
