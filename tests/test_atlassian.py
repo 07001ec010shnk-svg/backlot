@@ -1499,6 +1499,54 @@ def test_confluence_single_space_get(client, admin_h):
         }, sent
 
 
+def test_confluence_writes_a_character_past_the_bmp_as_surrogate_escapes(client, admin_h):
+    """Pins the bytes ``errors.atlassian._confluence_json`` writes, on the raw body, since
+    ``.json()`` decodes both writings to one string."""
+    emoji = "%F0%9F%98%80"  # U+1F600
+    for path, status, written in (
+        (
+            f"/atlassian/wiki/rest/api/space/{emoji}",
+            404,
+            rb'No space found with key : \uD83D\uDE00\""',
+        ),
+        (
+            f"/atlassian/wiki/rest/api/content?spaceKey={emoji}",
+            404,
+            rb"No space with key : \uD83D\uDE00",
+        ),
+        (
+            f"/atlassian/wiki/rest/api/content?limit={emoji}",
+            400,
+            rb"For input string: \"\uD83D\uDE00\"",
+        ),
+        (
+            f"/atlassian/wiki/rest/api/content/229469/label?prefix={emoji}",
+            400,
+            rb"label prefixes :[\uD83D\uDE00]",
+        ),
+        (
+            f"/atlassian/wiki/rest/api/content?type={emoji}",
+            501,
+            rb"Cannot find custom content type : \uD83D\uDE00",
+        ),
+        (
+            "/atlassian/wiki/rest/api/content/%F0%9D%9F%93/child/page",
+            400,
+            rb"for value [\uD835\uDFD3]",
+        ),
+    ):
+        refused = client.get(path, headers=admin_h)
+        assert refused.status_code == status, path
+        assert written in refused.content, path
+        # and never the character's own UTF-8 bytes
+        assert "\U0001f600".encode() not in refused.content, path
+        assert "\U0001d7d3".encode() not in refused.content, path
+    # A character inside the plane is written as its UTF-8 bytes, unescaped.
+    inside = client.get("/atlassian/wiki/rest/api/space/%C3%A9", headers=admin_h)
+    assert inside.status_code == 404
+    assert "é".encode() in inside.content
+
+
 # --- OpenAPI enrichment: atlassian (jira + confluence) ------------------------------------
 
 
