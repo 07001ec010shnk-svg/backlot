@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import re
+import unicodedata
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -4310,30 +4311,75 @@ def test_drive_shared_with_me_time_needs_a_caller(client, admin_h):
     )
 
 
-def test_drive_order_by_shared_with_me_time(client, tokens_yaml):
-    """Backlot models the relation this key sorts on (owner vs caller), so it sorts rather than
-    400s — unlike the view/modify-by-me timestamps, which have no counterpart here at all."""
-    mia = {"Authorization": f"Bearer {tok(tokens_yaml, 'mia@acme.com')}"}
-    r = client.get(
-        "/drive/v3/files",
-        headers=mia,
-        params={"q": "sharedWithMe=true", "pageSize": 100, "orderBy": "sharedWithMeTime desc"},
-    )
-    assert r.status_code == 200
-    times = [f["sharedWithMeTime"] for f in r.json()["files"]]
-    assert times == sorted(times, reverse=True)
+@pytest.mark.parametrize(
+    "order_by, listed",
+    [
+        ("sharedWithMeTime", "a2 a1 m1 m2"),
+        ("sharedWithMeTime asc", "a2 a1 m1 m2"),
+        ("sharedWithMeTime desc", "m2 m1 a2 a1"),
+        ("modifiedByMeTime", "m2 m1 a1 a2"),
+        ("modifiedByMeTime asc", "m2 m1 a1 a2"),
+        ("modifiedByMeTime desc", "a2 a1 m2 m1"),
+        ("viewedByMeTime", "a2 a1 m2 m1"),
+        ("viewedByMeTime asc", "a2 a1 m2 m1"),
+        ("viewedByMeTime desc", "m2 m1 a2 a1"),
+        ("recency", "a2 a1 m2 m1"),
+        ("recency asc", "a2 a1 m2 m1"),
+        ("recency desc", "a2 a1 m2 m1"),
+    ],
+)
+def test_drive_order_by_a_per_caller_time(tmp_path, order_by, listed):
+    """Ava owns two of the files and the other two are Mia's, shared with her, modified in turn,
+    so each block's order is its own and not the files' modification order. None is viewed, so
+    under `viewedByMeTime` Mia's files sort after Ava's own, where `_DRIVE_ORDER_KEYS` says real
+    puts them."""
+    records = [
+        {
+            "source_type": "google_drive",
+            "doc_id": doc_id,
+            "folder": "f",
+            "title": doc_id,
+            "content": "p",
+            "author_email": f"{owner}@acme.com",
+            "readers": ["ava@acme.com", "mia@acme.com"],
+            "visibility": "private",
+            "created": f"2026-01-{day:02d}T09:00:00Z",
+            "updated": f"2026-01-{day:02d}T09:00:00Z",
+        }
+        for doc_id, owner, day in (
+            ("a1", "ava", 1),
+            ("m1", "mia", 5),
+            ("a2", "ava", 10),
+            ("m2", "mia", 15),
+        )
+    ]
+    s = tiny_corpus(tmp_path, records)
+    ava = tok(yaml.safe_load(s.tokens_path.read_text(encoding="utf-8")), "ava@acme.com")
+    with client_for(s, reload=True) as c:
+        r = c.get(
+            "/drive/v3/files",
+            headers={"Authorization": f"Bearer {ava}"},
+            params={
+                "orderBy": order_by,
+                "fields": "files(name)",
+                "q": "mimeType != 'application/vnd.google-apps.folder'",
+            },
+        )
+    assert r.status_code == 200, r.text
+    assert [f["name"] for f in r.json()["files"]] == listed.split()
 
 
 @pytest.mark.parametrize(
     "name, owned",
     [("Mine", True), ("Theirs", False), ("Plans", False), ("Figures", True), ("Drafts", False)],
 )
-def test_drive_owned_by_me_and_can_share_follow_the_caller(tmp_path, name, owned):
-    """`ownedByMe` is per caller, and `canShare` with it: what the caller owns it can share, and
-    what it can only read it cannot. Real answered `canShare: true` on 117 of the 118 items a Google
-    Workspace member's `files.list` named as its own on 2026-10-18 and on 2026-10-19, and `false` on
-    each folder and each file shared with it to read. `Plans` is a folder a record's `folder` names,
-    and `Figures` and `Drafts` are `subtype: folder` records."""
+def test_drive_owned_by_me_can_share_and_modified_by_me_follow_the_caller(tmp_path, name, owned):
+    """`ownedByMe` is per caller, and `canShare` and `modifiedByMe` with it: what the caller owns it
+    can share, and what it can only read it cannot; `_modified_by_me` says why the caller modified
+    exactly what it owns. Real answered `canShare: true` on 117 of the 118 items a Google Workspace
+    member's `files.list` named as its own on 2026-10-18 and on 2026-10-19, and `false` on each
+    folder and each file shared with it to read. `Plans` is a folder a record's `folder` names, and
+    `Figures` and `Drafts` are `subtype: folder` records."""
     record = {
         "source_type": "google_drive",
         "folder": "Plans",
@@ -4364,16 +4410,18 @@ def test_drive_owned_by_me_and_can_share_follow_the_caller(tmp_path, name, owned
             for f in c.get(
                 "/drive/v3/files",
                 headers=ava,
-                params={"fields": "files(id,name,ownedByMe,capabilities/canShare)"},
+                params={"fields": f"files(id,name,{_PER_CALLER})"},
             ).json()["files"]
         }[name]
         got = c.get(
-            f"/drive/v3/files/{listed['id']}",
-            headers=ava,
-            params={"fields": "ownedByMe,capabilities/canShare"},
+            f"/drive/v3/files/{listed['id']}", headers=ava, params={"fields": _PER_CALLER}
         ).json()
     for f in (listed, got):
-        assert (f["ownedByMe"], f["capabilities"]["canShare"]) == (owned, owned)
+        assert (f["ownedByMe"], f["capabilities"]["canShare"], f["modifiedByMe"]) == (owned,) * 3
+        assert f.get("modifiedByMeTime") == (f["modifiedTime"] if owned else None)
+
+
+_PER_CALLER = "ownedByMe,capabilities/canShare,modifiedByMe,modifiedByMeTime,modifiedTime"
 
 
 def test_drive_order_by_sorts_the_result(client, admin_h):
@@ -4469,16 +4517,710 @@ def test_drive_order_by_does_not_change_the_rows_themselves(client, admin_h):
     assert any(f["shared"] for f in plain.values())  # ...and `shared` is really resolved
 
 
-def test_drive_order_by_rejects_keys_it_cannot_honor(client, admin_h):
-    """Real Drive 400s an undocumented sort key. Backlot models no per-caller view/share
-    timestamps, so those documented keys are rejected loudly rather than silently ignored."""
-    for bad in ("bogusKey", "name descending", "viewedByMeTime"):
-        r = client.get("/drive/v3/files", headers=admin_h, params={"orderBy": bad})
-        assert r.status_code == 400, f"orderBy={bad!r} should 400, got {r.status_code}"
-    ok = client.get(
-        "/drive/v3/files", headers=admin_h, params={"orderBy": "folder,name desc", "pageSize": 5}
+def _nfd(name: str) -> str:
+    return unicodedata.normalize("NFD", name)
+
+
+# The first folder `backlot.collation` describes: its names in the order they were made, and the
+# orders real listed them in.
+_MADE = [
+    "resume",
+    "résumé",
+    "resumé",
+    "Resume",
+    "RESUME",
+    "cote",
+    "coté",
+    "côte",
+    "côté",
+    "가",
+    "家",
+    "可",
+    "加",
+    "각",
+    "각2",
+    "家2",
+    "a",
+    "A",
+    "b",
+    "x2",
+    "x02",
+    "x002",
+    "x10",
+    "x1٠",
+    "x٢",
+    "x²",
+    "x2①",
+    "x2²",
+    "x20",
+    "x 2",
+    "x-2",
+    "x_2",
+    "x.2",
+    "file99999999999999999999",
+    "file100000000000000000000",
+    "v1",
+    "v01",
+    "_a",
+    "-a",
+    ".a",
+    "(a",
+    "[a",
+    "1a",
+    "$a",
+    "#a",
+    "~a",
+    "€a",
+    "가나",
+    "abc",
+    "家族",
+    "ガ",
+    "α",
+    "Ж",
+    "😀",
+    _nfd("한글"),
+    "한글",
+    _nfd("éclair"),
+    "éclair",
+]
+_BY_NAME_NATURAL = [
+    "_a",
+    "-a",
+    ".a",
+    "(a",
+    "[a",
+    "#a",
+    "~a",
+    "😀",
+    "$a",
+    "€a",
+    "1a",
+    "A",
+    "a",
+    "abc",
+    "b",
+    "cote",
+    "coté",
+    "côte",
+    "côté",
+    "éclair",
+    _nfd("éclair"),
+    "file99999999999999999999",
+    "file100000000000000000000",
+    "RESUME",
+    "Resume",
+    "resume",
+    "resumé",
+    "résumé",
+    "v01",
+    "v1",
+    "x 2",
+    "x_2",
+    "x-2",
+    "x.2",
+    "x٢",
+    "x002",
+    "x02",
+    "x2",
+    "x2①",
+    "x2²",
+    "x1٠",
+    "x10",
+    "x20",
+    "x²",
+    "α",
+    "Ж",
+    "가",
+    "가나",
+    "각",
+    "각2",
+    "한글",
+    _nfd("한글"),
+    "ガ",
+    "加",
+    "可",
+    "家",
+    "家2",
+    "家族",
+]
+_BY_NAME_NATURAL_DESC = [
+    "家族",
+    "家2",
+    "家",
+    "可",
+    "加",
+    "ガ",
+    "한글",
+    _nfd("한글"),
+    "각2",
+    "각",
+    "가나",
+    "가",
+    "Ж",
+    "α",
+    "x²",
+    "x20",
+    "x1٠",
+    "x10",
+    "x2²",
+    "x2①",
+    "x٢",
+    "x002",
+    "x02",
+    "x2",
+    "x.2",
+    "x-2",
+    "x_2",
+    "x 2",
+    "v01",
+    "v1",
+    "résumé",
+    "resumé",
+    "RESUME",
+    "Resume",
+    "resume",
+    "file100000000000000000000",
+    "file99999999999999999999",
+    "éclair",
+    _nfd("éclair"),
+    "côté",
+    "côte",
+    "coté",
+    "cote",
+    "b",
+    "abc",
+    "A",
+    "a",
+    "1a",
+    "€a",
+    "$a",
+    "😀",
+    "~a",
+    "#a",
+    "[a",
+    "(a",
+    ".a",
+    "-a",
+    "_a",
+]
+_BY_NAME = [
+    "#a",
+    "$a",
+    "(a",
+    "-a",
+    ".a",
+    "1a",
+    "[a",
+    "_a",
+    "A",
+    "a",
+    "abc",
+    "b",
+    "cote",
+    "coté",
+    "côte",
+    "côté",
+    _nfd("éclair"),
+    "file100000000000000000000",
+    "file99999999999999999999",
+    "RESUME",
+    "Resume",
+    "resume",
+    "resumé",
+    "résumé",
+    "v01",
+    "v1",
+    "x 2",
+    "x-2",
+    "x.2",
+    "x002",
+    "x02",
+    "x10",
+    "x1٠",
+    "x2",
+    "x20",
+    "x2²",
+    "x2①",
+    "x_2",
+    "x²",
+    "x٢",
+    "~a",
+    "éclair",
+    "α",
+    "Ж",
+    _nfd("한글"),
+    "€a",
+    "ガ",
+    "加",
+    "可",
+    "家",
+    "家2",
+    "家族",
+    "가",
+    "가나",
+    "각",
+    "각2",
+    "한글",
+    "😀",
+]
+# The second: names some code points of which collate as one, runs of more digits than ICU reads
+# as one number, and code points ICU weighs by their value.
+_MADE_2 = [
+    "la",
+    "l\u00b7a",
+    "lb",
+    "l.a",
+    _nfd("й"),
+    "й",
+    "ий",
+    "ик",
+    "и",
+    "เก",
+    "ก",
+    "กา",
+    "ข",
+    "ཀ\u0fb2\u0f71\u0f80",
+    "ཀ\u0fb2\u0f71",
+    "ཀ\u0fb2",
+    "ཀ\u0f71\u0f80",
+    "9" * 254 + "1",
+    "9" * 255,
+    "1" + "0" * 254,
+    "x𝟐",
+    "x2",
+    "x𝟐3",
+    "x23",
+    "x１０",
+    "x11",
+    "一",
+    "𠀀",
+    "a\u0378",
+    "a\ue000",
+    "a\U0010fffd",
+    "a",
+]
+_BY_NAME_NATURAL_2 = [
+    "1" + "0" * 254,
+    "9" * 254 + "1",
+    "9" * 255,
+    "a",
+    "a\u0378",
+    "a\ue000",
+    "a\U0010fffd",
+    "l.a",
+    "la",
+    "l\u00b7a",
+    "lb",
+    "x2",
+    "x𝟐",
+    "x１０",
+    "x11",
+    "x23",
+    "x𝟐3",
+    "и",
+    "ий",
+    "ик",
+    "й",
+    _nfd("й"),
+    "ก",
+    "กา",
+    "เก",
+    "ข",
+    "ཀ\u0fb2",
+    "ཀ\u0fb2\u0f71",
+    "ཀ\u0f71\u0f80",
+    "ཀ\u0fb2\u0f71\u0f80",
+    "一",
+    "𠀀",
+]
+_BY_NAME_NATURAL_DESC_2 = [
+    "𠀀",
+    "一",
+    "ཀ\u0fb2\u0f71\u0f80",
+    "ཀ\u0f71\u0f80",
+    "ཀ\u0fb2\u0f71",
+    "ཀ\u0fb2",
+    "ข",
+    "เก",
+    "กา",
+    "ก",
+    "й",
+    _nfd("й"),
+    "ик",
+    "ий",
+    "и",
+    "x23",
+    "x𝟐3",
+    "x11",
+    "x１０",
+    "x2",
+    "x𝟐",
+    "lb",
+    "l\u00b7a",
+    "la",
+    "l.a",
+    "a\U0010fffd",
+    "a\ue000",
+    "a\u0378",
+    "a",
+    "9" * 255,
+    "9" * 254 + "1",
+    "1" + "0" * 254,
+]
+_BY_NAME_2 = [
+    "1" + "0" * 254,
+    "9" * 254 + "1",
+    "9" * 255,
+    "a",
+    "a\u0378",
+    "a\ue000",
+    "a\U0010fffd",
+    "l.a",
+    "la",
+    "lb",
+    "l\u00b7a",
+    "x11",
+    "x2",
+    "x23",
+    "x１０",
+    "x𝟐",
+    "x𝟐3",
+    "и",
+    _nfd("й"),
+    "ий",
+    "ик",
+    "й",
+    "ก",
+    "กา",
+    "ข",
+    "เก",
+    "ཀ\u0f71\u0f80",
+    "ཀ\u0fb2",
+    "ཀ\u0fb2\u0f71",
+    "ཀ\u0fb2\u0f71\u0f80",
+    "一",
+    "𠀀",
+]
+# The third: U+0E01 U+0E4D U+0E32, whose last two code points collate as one and tie it with U+0E01
+# U+0E33, beside Thai names that hold one of its parts or neither.
+_MADE_3 = [
+    "\u0e01\u0e4d\u0e32",
+    "\u0e01\u0e33",
+    "\u0e01\u0e32",
+    "\u0e01\u0e21",
+    "\u0e01\u0e4d",
+    "\u0e01",
+]
+_BY_NAME_NATURAL_3 = [
+    "\u0e01",
+    "\u0e01\u0e4d",
+    "\u0e01\u0e21",
+    "\u0e01\u0e32",
+    "\u0e01\u0e33",
+    "\u0e01\u0e4d\u0e32",
+]
+_BY_NAME_NATURAL_DESC_3 = [
+    "\u0e01\u0e33",
+    "\u0e01\u0e4d\u0e32",
+    "\u0e01\u0e32",
+    "\u0e01\u0e21",
+    "\u0e01\u0e4d",
+    "\u0e01",
+]
+# The fourth: `ab` with a code point ICU weighs as nothing between its letters, which real tied
+# with `ab`.
+_MADE_4 = ["ab", "a\u00adb", "aa", "a\u200bb", "ac", "a\ufeffb"]
+_BY_NAME_NATURAL_4 = ["aa", "a\ufeffb", "a\u200bb", "a\u00adb", "ab", "ac"]
+_BY_NAME_NATURAL_DESC_4 = ["ac", "a\ufeffb", "a\u200bb", "a\u00adb", "ab", "aa"]
+# The fifth: a number of 255 digits beside one of 254, digits beside characters ICU weighs as digit
+# zero, a Cyrillic `и` whose breve follows its dot below and so collates as `й`, and Tibetan vowel
+# signs a sign further on completes; `name_natural desc` was the exact reverse.
+_MADE_5 = ["1" + "0" * 254, "2" + "0" * 253, "x5", "x\u2070", "x1", "x\u24ea", "x0"]
+_MADE_5 += [
+    "\u0438\u0430",
+    "\u0438\u0432",
+    "\u0439\u0430",
+    "\u0439\u0432",
+    "\u0438\u0323\u0306\u0431",
+]
+_MADE_5 += ["\u0f71\u0f72\u0fb3", "\u0f71\u0f71\u0f72", "\u0f71\u0f74\u0fb3", "\u0f71\u0f71\u0f74"]
+_BY_NAME_NATURAL_5 = [_MADE_5[i] for i in (0, 1, 6, 4, 2, 5, 3, 7, 8, 9, 11, 10, 12, 13, 14, 15)]
+# Replayed without the two names whose vowel sign ICU joins to the first AA sign past the second,
+# which `backlot.collation` does not; real's order of the others is the order it listed them in.
+_KEPT_5 = [n for n in _MADE_5 if n not in ("\u0f71\u0f71\u0f72", "\u0f71\u0f71\u0f74")]
+# The sixth: names that differ in case or in a character's variant, in pairs made in turn; real
+# tied an ASCII letter's capital with it and no other.
+_MADE_6 = [
+    "xa",
+    "xA",
+    "yA",
+    "ya",
+    "q\u24ea",
+    "q\u2070",
+    "z\uff58",
+    "zx",
+    "\ufb01g",
+    "fig",
+    "k\u00aa",
+    "ka",
+    "\u00e4b",
+    "a\u0308b",
+    "\u00c4c",
+    "\u00e4c",
+    "w\u00e9",
+    "w\u00c9",
+    "we",
+]
+_BY_NAME_NATURAL_6 = [
+    _MADE_6[i] for i in (13, 12, 15, 14, 9, 8, 11, 10, 4, 5, 18, 16, 17, 1, 0, 3, 2, 7, 6)
+]
+_BY_NAME_NATURAL_DESC_6 = [
+    _MADE_6[i] for i in (6, 7, 3, 2, 1, 0, 17, 16, 18, 5, 4, 10, 11, 8, 9, 14, 15, 13, 12)
+]
+# The seventh: an `и` whose breve a mark of its own class keeps from the letter, which real sorted
+# among the names with `и`, and Tibetan vowel signs that one sign or two spell alike.
+_MADE_7 = ["\u0438\u0430", "\u0439\u0430", "\u0438\u0323\u0301\u0306\u0431", "\u0438\u0432"]
+_MADE_7 += [
+    "\u0439\u0432",
+    "\u0f40\u0f71\u0f74\u0f72",
+    "\u0f40\u0f71\u0f72",
+    "\u0f40\u0f71\u0f74",
+    "\u0f40\u0f73",
+]
+_BY_NAME_NATURAL_7 = [_MADE_7[i] for i in (0, 2, 3, 1, 4, 8, 6, 7, 5)]
+_BY_NAME_NATURAL_DESC_7 = [_MADE_7[i] for i in (5, 7, 8, 6, 4, 1, 3, 2, 0)]
+# Replayed without the name whose marks are out of their canonical order, which ICU weighs as
+# written and `backlot.collation` after NFC has reordered them.
+_KEPT_7 = [n for n in _MADE_7 if n != "\u0f40\u0f71\u0f74\u0f72"]
+# The eighth: Tibetan vowel signs whose later sign completes the first one past another, which
+# real tied with the same signs written the other way round, listed newest first both ways.
+_MADE_8 = ["\u0f71\u0f71\u0f72", "\u0f71\u0f72\u0f71", "\u0f71\u0f71\u0f74", "\u0f71\u0f74\u0f71"]
+_MADE_8 += ["\u0f71\u0f71\u0f80", "\u0f71\u0f80\u0f71"]
+_BY_NAME_NATURAL_8 = [_MADE_8[i] for i in (1, 0, 5, 4, 3, 2)]
+_BY_NAME_NATURAL_DESC_8 = [_MADE_8[i] for i in (3, 2, 5, 4, 1, 0)]
+# Eleven names real listed under `name_natural` on 2026-10-10, in a folder made for them in a
+# Korean-language account; `name_natural desc` was the exact reverse. None holds Hangul or Han,
+# which a Korean-language account orders otherwise than an English-language one.
+_ELEVEN = ["2²3", "10²", "²", "a", "x2", "x2①", "x2²", "x3", "x10", "x22", "x²"]
+# The ninth folder `backlot.collation` describes: names whose order turns on the entries of its
+# tables, made in code point order.
+# fmt: off
+_MADE_9 = [f"a{c}b" for c in (
+    "\t\n\x0b\x0c\r !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~\x85\xa1\xa2\xa3\xa4\xa5\xa6\xa7"
+    "\xa8\xa9\xab\xac\xae\xaf\xb0\xb1\xb4\xb6\xb7\xb8\xbb\xbf\xd7\xf7\u0e46\u0ec6\u2010"
+    "\u2012\u2013\u2014\u2015\u2016\u2017\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f"
+    "\u2020\u2021\u2022\u2023\u2027\u2028\u2029\u2038\u2044\u20ac\u20ad\u2190\u2191\u2192"
+    "\u2193\u2194\u2195\u2196\u2197\u2198\u2199\u219c\u219d\u219e\u219f\u3001\u3002\u3003"
+    "\u3005\u3008\u3009\u300a\u300b\u300c\u300d\u300e\u300f\u3010\u3011\u3014\u3015\u301c"
+    "\u301d\u301e\u303b\u309d\u30fb\u30fc\u30fd"
+)]
+_MADE_9 += ["a" + mark + "b" for mark in (
+    "\u034f\u0591\u05bd\u05c4\u05c5\u0610\u06d6\u06df\u06e7\u06e8\u06ea\ufe21\ufe23\ufe28"
+    "\ufe2a\ufe2f\U000e0100"
+)]
+_MADE_9 += ["xa"] + ["xa" + mark for mark in (
+    "\u0300\u0301\u0302\u0303\u0304\u0306\u0307\u0308\u030a\u030b\u030c\u0310\u0327\u0328"
+    "\u0335\u0338"
+)]
+_MADE_9 += [f"w{a}{b}" for a, b in zip("acefghijkmoqsuw", "\u0305\u05b0\u05bf\u05bf\u05c1\u05c1\u05c7\u05c7\u064b\u0670\u0e47\u0ec8\u20d0\ufe20\u3099")]
+_MADE_9 += [f"w{a}{b}" for a in "acefghijkmoqsuw" for b in ("", "b")]
+_MADE_9 += [
+    "ab", "la", "lb", "l\xb7a", "l\u0387a", "x a", "x,",
+    "x10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "x1\u20442",
+    "x9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
+    "x\xa0a", "x\xb9\u2044\u2082", "x\xbd", "x\u0628", "x\u1d2c", "x\u1d43", "x\u2002a",
+    "x\u2090", "x\u24b6", "x\u24d0", "x\u3000a", "x\u3002", "x\ufe10", "x\ufe50", "x\ufe8f",
+    "x\ufe90", "x\ufe91", "x\ufe92", "x\uff21", "x\uff41", "x\uff61", "x\U0001d400",
+    "x\U0001d41a", "x\U0001f130", "yae", "yaf", "yd", "ye", "yh", "yi", "yj", "yl", "ym", "yn",
+    "yo", "yoe", "yof", "yp", "yq", "yr", "yss", "yst", "yt", "yu", "yz", "y\xc6", "y\xd0",
+    "y\xd8", "y\xde", "y\xdf", "y\xe6", "y\xf0", "y\xf8", "y\xfe", "y\u0110", "y\u0111",
+    "y\u0126", "y\u0127", "y\u0131", "y\u0138", "y\u0141", "y\u0142", "y\u014a", "y\u014b",
+    "y\u0152", "y\u0153", "y\u0166", "y\u0167", "y\u1e9e", "\u013fa", "\u0140a",
+    "\u0430\u0418\u0306", "\u0430\u0419", "\u0430\u0438\u0306", "\u0430\u0438\u043a",
+    "\u0430\u0439", "\u0622\u0628", "\u0623\u0628", "\u0624\u0628", "\u0625\u0628",
+    "\u0626\u0628", "\u0627\u0628", "\u0627\u062c", "\u0627\u0653\u0628", "\u0627\u0654\u0628",
+    "\u0627\u0655\u0628", "\u0648\u0628", "\u0648\u0654\u0628", "\u064a\u0628",
+    "\u064a\u0654\u0628", "\u0e02", "\u0e40\u0e01", "\u0e81\u0eb2", "\u0e81\u0eb3",
+    "\u0e81\u0ec0", "\u0e81\u0ecd", "\u0e81\u0ecd\u0eb2", "\u0e82", "\u0ec0\u0e01",
+    "\u0ec0\u0e81", "\u0f40\u0e33", "\u0f40\u0e4d\u0e32", "\u0f40\u0eb3", "\u0f40\u0ecd\u0eb2",
+    "\u0f40\u0f68", "\u0f40\u0f71", "\u0f40\u0f71\u0f72", "\u0f40\u0f71\u0f74",
+    "\u0f40\u0f71\u0f80", "\u0f40\u0f72", "\u0f40\u0f73", "\u0f40\u0f74", "\u0f40\u0f75",
+    "\u0f40\u0f76", "\u0f40\u0f77", "\u0f40\u0f78", "\u0f40\u0f79", "\u0f40\u0f7a",
+    "\u0f40\u0f7b", "\u0f40\u0f7c", "\u0f40\u0f7d", "\u0f40\u0f80", "\u0f40\u0f81",
+    "\u0f40\u0f84", "\u0f40\u0f88", "\u0f40\u0f90", "\u0f40\u0fb2\u0f71\u0f80",
+    "\u0f40\u0fb2\u0f80", "\u0f40\u0fb3\u0f71\u0f80", "\u0f40\u0fb3\u0f80", "\u0f40\u0fb8",
+    "\u0f41", "\u1981", "\u19b5\u1980", "\u2764", "\u2764\ufe0e", "\u2764\ufe0f", "\u3041",
+    "\u3041\u3044", "\u3042", "\u304b\u3042", "\u304b\u30fc", "\u30a1", "\u30a2",
+    "\u30ab\u30a2", "\u30ab\u30fc", "\u32d0", "\uff67", "\uff71",
+]
+_MADE_9.sort()
+_BY_NAME_NATURAL_9 = [_MADE_9[int(i)] for i in (
+    "353 352 351 0 1 2 3 4 39 96 97 5 32 82 18 76 77 78 79 80 132 137 17 116 22 21 6 40 26 60 "
+    "19 117 57 12 83 84 85 86 7 87 88 89 90 133 134 49 59 13 14 28 30 35 37 120 121 122 123 "
+    "124 125 126 127 128 129 130 131 81 46 56 27 15 20 29 11 8 10 91 92 93 94 95 118 98 33 55 "
+    "31 52 47 58 53 48 51 102 104 103 105 106 107 108 109 110 111 112 113 114 115 16 54 62 61 "
+    "23 24 25 50 36 45 38 99 74 75 119 135 136 138 139 43 41 9 42 44 100 101 145 144 143 142 "
+    "141 140 73 72 71 70 69 68 67 66 65 64 63 34 146 287 149 148 286 147 150 152 151 153 155 "
+    "154 156 158 157 159 161 160 162 164 163 165 167 166 168 170 169 171 173 172 174 176 175 "
+    "177 179 178 180 182 181 183 185 184 186 188 187 189 191 190 192 194 193 195 227 223 217 "
+    "196 230 229 228 237 198 199 197 218 219 200 236 239 226 235 238 225 222 224 240 221 202 "
+    "201 206 203 211 209 208 210 204 207 216 213 214 205 215 212 220 233 234 232 231 241 267 "
+    "262 242 243 272 271 268 263 244 245 274 273 246 275 247 248 278 277 249 250 280 279 251 "
+    "269 264 252 282 281 253 254 255 276 256 257 266 285 258 259 284 283 260 261 270 265 291 "
+    "292 290 289 288 300 293 301 294 304 295 302 296 306 297 298 299 303 305 308 307 312 309 "
+    "313 310 316 311 314 315 318 317 320 319 342 321 347 341 322 326 327 323 338 339 325 328 "
+    "329 324 344 330 343 331 346 332 345 333 334 335 336 337 340 348 350 349 354 356 359 364 "
+    "360 365 363 355 358 362 357 361"
+).split()]
+_BY_NAME_NATURAL_DESC_9 = [_MADE_9[int(i)] for i in (
+    "361 357 362 358 355 363 365 360 364 359 356 354 349 350 348 340 337 336 335 334 345 333 "
+    "346 332 343 331 344 330 329 324 328 339 325 338 327 323 326 322 341 347 321 342 320 319 "
+    "318 317 315 314 316 311 313 310 309 312 307 308 305 303 299 298 306 297 302 296 304 295 "
+    "301 294 300 293 289 288 292 290 291 265 270 261 260 283 284 259 258 285 266 257 256 276 "
+    "255 254 253 281 282 252 264 269 251 279 280 250 249 277 278 248 247 275 246 273 274 245 "
+    "244 263 268 271 272 243 242 262 267 241 231 232 234 233 220 212 215 205 214 213 216 207 "
+    "204 210 208 209 211 203 206 201 202 240 221 224 222 225 238 235 226 239 236 200 219 218 "
+    "197 199 198 237 228 229 230 196 217 223 227 195 193 194 192 190 191 189 187 188 186 184 "
+    "185 183 181 182 180 178 179 177 175 176 174 172 173 171 169 170 168 166 167 165 163 164 "
+    "162 160 161 159 157 158 156 154 155 153 151 152 150 147 286 287 149 148 146 145 144 143 "
+    "142 141 140 73 72 71 70 69 68 67 66 65 64 63 34 101 100 44 42 9 41 43 139 138 136 135 119 "
+    "75 74 99 38 45 36 50 25 24 23 61 62 54 16 115 114 113 112 111 110 109 108 107 106 105 103 "
+    "104 102 51 48 53 58 47 52 31 55 33 98 118 95 94 93 92 91 10 8 11 29 20 15 27 56 46 81 131 "
+    "130 129 128 127 126 125 124 123 122 121 120 37 35 30 28 14 13 59 49 134 133 90 89 88 87 7 "
+    "86 85 84 83 12 57 117 19 60 26 40 6 21 22 116 17 137 132 80 79 78 77 76 18 82 32 5 97 96 "
+    "39 4 3 2 1 0 353 352 351"
+).split()]
+# fmt: on
+
+# The tenth: a digit with no decomposition, Tibetan subjoined consonants beside their consonants, a
+# middle dot ahead of an l, control characters, the Hebrew maqaf and paseq, and `가`, which
+# an English-language account lists after the Latin names.
+_MADE_10 = [
+    "a",
+    "a\x01b",
+    "a-b",
+    "ab",
+    "ac",
+    "a\x7fb",
+    "a\u05beb",
+    "a\u05c0b",
+    "a\u2010b",
+    "l",
+    "la",
+    "x10",
+    "x5",
+    "xa",
+    "x\u278e",
+    "\xb7a",
+    "\xb7l",
+    "\u0f40\u0f40",
+    "\u0f40\u0f41",
+    "\u0f40\u0f62",
+    "\u0f40\u0f63",
+    "\u0f40\u0f90",
+    "\u0f40\u0fb2",
+    "\uac00",
+]
+_BY_NAME_NATURAL_10 = [
+    _MADE_10[i]
+    for i in (15, 16, 0, 2, 8, 6, 7, 5, 3, 1, 4, 9, 10, 12, 11, 14, 13, 17, 21, 18, 19, 22, 20, 23)
+]
+_BY_NAME_NATURAL_DESC_10 = [
+    _MADE_10[i]
+    for i in (23, 20, 22, 19, 18, 21, 17, 13, 14, 11, 12, 10, 9, 4, 5, 3, 1, 7, 6, 8, 2, 0, 16, 15)
+]
+# The eleventh: a Tai Viet vowel written ahead of its consonant, in a folder of its own, since ICU
+# orders the Tai Viet script among the others otherwise than `backlot.collation` does.
+_MADE_11 = ["\uaa80", "\uaa81", "\uaab5\uaa80"]
+_BY_NAME_NATURAL_11 = [_MADE_11[i] for i in (0, 2, 1)]
+_BY_NAME_NATURAL_DESC_11 = [_MADE_11[i] for i in (1, 2, 0)]
+# The twelfth: small kana of the Katakana Phonetic Extensions and of the Small Kana Extension
+# beside the letters they tie, and katakana `ア` beside a longer hiragana name.
+_MADE_12 = [
+    "\u3042",
+    "\u3042\u3044",
+    "\u304f",
+    "\u3053",
+    "\u30a2",
+    "\u30a2\u3044",
+    "\u30af",
+    "\u30b3",
+    "\u31f0",
+    "\U0001b132",
+    "\U0001b155",
+]
+_BY_NAME_NATURAL_12 = [_MADE_12[i] for i in (0, 4, 1, 5, 2, 8, 6, 9, 3, 10, 7)]
+_BY_NAME_NATURAL_DESC_12 = [_MADE_12[i] for i in (7, 10, 3, 9, 6, 8, 2, 5, 1, 4, 0)]
+# A Python whose `unicodedata` predates Unicode 15 does not know the Small Kana Extension's two
+# letters, which `backlot.collation` then sorts by code point, so the replay leaves those out there.
+_KEPT_12 = [n for n in _MADE_12 if "Cn" not in map(unicodedata.category, n)]
+
+
+@pytest.mark.parametrize(
+    "made, order_by, listed",
+    [
+        (_MADE, "name_natural", _BY_NAME_NATURAL),
+        (_MADE, "name_natural desc", _BY_NAME_NATURAL_DESC),
+        (_MADE, "name", _BY_NAME),
+        (_MADE_2, "name_natural", _BY_NAME_NATURAL_2),
+        (_MADE_2, "name_natural desc", _BY_NAME_NATURAL_DESC_2),
+        (_MADE_2, "name", _BY_NAME_2),
+        (_MADE_3, "name_natural", _BY_NAME_NATURAL_3),
+        (_MADE_3, "name_natural desc", _BY_NAME_NATURAL_DESC_3),
+        (_MADE_4, "name_natural", _BY_NAME_NATURAL_4),
+        (_MADE_4, "name_natural desc", _BY_NAME_NATURAL_DESC_4),
+        (_KEPT_5, "name_natural", [n for n in _BY_NAME_NATURAL_5 if n in _KEPT_5]),
+        (_KEPT_5, "name_natural desc", [n for n in _BY_NAME_NATURAL_5[::-1] if n in _KEPT_5]),
+        (_MADE_6, "name_natural", _BY_NAME_NATURAL_6),
+        (_MADE_6, "name_natural desc", _BY_NAME_NATURAL_DESC_6),
+        (_KEPT_7, "name_natural", [n for n in _BY_NAME_NATURAL_7 if n in _KEPT_7]),
+        (_KEPT_7, "name_natural desc", [n for n in _BY_NAME_NATURAL_DESC_7 if n in _KEPT_7]),
+        (_MADE_8, "name_natural", _BY_NAME_NATURAL_8),
+        (_MADE_8, "name_natural desc", _BY_NAME_NATURAL_DESC_8),
+        (_ELEVEN, "name_natural", _ELEVEN),
+        (_ELEVEN, "name_natural desc", _ELEVEN[::-1]),
+        (_MADE_9, "name_natural", _BY_NAME_NATURAL_9),
+        (_MADE_9, "name_natural desc", _BY_NAME_NATURAL_DESC_9),
+        (_MADE_10, "name_natural", _BY_NAME_NATURAL_10),
+        (_MADE_10, "name_natural desc", _BY_NAME_NATURAL_DESC_10),
+        (_MADE_11, "name_natural", _BY_NAME_NATURAL_11),
+        (_MADE_11, "name_natural desc", _BY_NAME_NATURAL_DESC_11),
+        (_KEPT_12, "name_natural", [n for n in _BY_NAME_NATURAL_12 if n in _KEPT_12]),
+        (_KEPT_12, "name_natural desc", [n for n in _BY_NAME_NATURAL_DESC_12 if n in _KEPT_12]),
+    ],
+)
+def test_drive_order_by_a_name_lists_a_folder_as_real_did(tmp_path, made, order_by, listed):
+    """Each file is modified after the one made before it, as the measured folder's were, so
+    names a key ties come out newest first, as they did on real."""
+    s = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "google_drive",
+                "doc_id": f"name-{i}",
+                "folder": "names",
+                "title": title,
+                "content": "p",
+                "created": f"2026-10-20T17:{36 + i // 60}:{i % 60:02d}Z",
+                "updated": f"2026-10-20T17:{36 + i // 60}:{i % 60:02d}Z",
+            }
+            for i, title in enumerate(made)
+        ],
     )
-    assert ok.status_code == 200
+    admin = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))["admin_token"]
+    with client_for(s, reload=True) as c:
+        r = c.get(
+            "/drive/v3/files",
+            headers={"Authorization": f"Bearer {admin}"},
+            params={
+                "orderBy": order_by,
+                "q": "mimeType != 'application/vnd.google-apps.folder'",
+                "pageSize": 1000,
+            },
+        )
+    assert r.status_code == 200, r.text
+    assert [f["name"] for f in r.json()["files"]] == listed
 
 
 _DUPLICATE_403 = (
@@ -4489,6 +5231,22 @@ _FULLTEXT_403 = (
     "forbidden",
     "Sorting is not supported for queries with fullText terms. Results are always in descending relevance order.",
 )
+_INVALID_400 = ("invalid", "Invalid Value")
+# The eleven keys the reference lists, each a 200 with ` asc` and with ` desc` on real.
+_ORDER_KEYS = ["createdTime", "folder", "modifiedByMeTime", "modifiedTime", "name", "name_natural"]
+_ORDER_KEYS += ["quotaBytesUsed", "recency", "sharedWithMeTime", "starred", "viewedByMeTime"]
+# The code points sent in the three places `_DRIVE_ORDER_SPACE` describes, as real answered them:
+# its 25 a 200 in each place, and every other one sent the 400, U+001C-U+001F among them.
+_ORDER_SPACES = [*range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x2000, 0x200B)]
+_ORDER_SPACES += [0x2028, 0x2029, 0x202F, 0x205F, 0x3000]
+_ORDER_NOT_SPACES = [*range(0x00, 0x09), *range(0x0E, 0x20), 0x7F, 0x180E, 0x200B, 0x2060]
+_ORDER_NOT_SPACES += [0x3164, 0xFEFF]
+_ORDER_SPACE_ROWS = [
+    (None, spelling.format(c=chr(cp)), *answer)
+    for cps, answer in ((_ORDER_SPACES, (200, None)), (_ORDER_NOT_SPACES, (400, _INVALID_400)))
+    for cp in cps
+    for spelling in ("name{c}desc", "{c}name", "name{c}")
+]
 
 
 @pytest.mark.parametrize(
@@ -4506,8 +5264,32 @@ _FULLTEXT_403 = (
         (None, "name_natural,name", 403, _DUPLICATE_403),
         (None, "name,name_natural", 403, _DUPLICATE_403),
         (None, "name,name,bogus", 403, _DUPLICATE_403),
-        (None, "name,bogus,name", 400, None),
-        (None, "name,name sideways", 400, None),
+        (None, "name,bogus,name", 400, _INVALID_400),
+        (None, "name,name sideways", 400, _INVALID_400),
+        (None, "bogus", 400, _INVALID_400),
+        (None, "name descending", 400, _INVALID_400),
+        (None, "NAME", 400, _INVALID_400),
+        (None, "name ASC", 400, _INVALID_400),
+        (None, "name Desc", 400, _INVALID_400),
+        (None, "name desc desc", 400, _INVALID_400),
+        (None, "name asc desc", 400, _INVALID_400),
+        (None, "asc", 400, _INVALID_400),
+        (None, "name,asc", 400, _INVALID_400),
+        (None, "name asc", 200, None),
+        (None, "name   asc", 200, None),
+        (None, "name asc,modifiedTime desc", 200, None),
+        (None, "folder,name desc", 200, None),
+        (None, ",name", 200, None),
+        (None, "name,", 200, None),
+        (None, "name asc,name", 403, _DUPLICATE_403),
+        (None, "name,name asc", 403, _DUPLICATE_403),
+        (None, "viewedByMeTime", 200, None),
+        (None, "viewedByMeTime desc", 200, None),
+        (None, "modifiedByMeTime asc", 200, None),
+        (None, "viewedByMeTime,modifiedByMeTime", 200, None),
+        (None, "viewedByMeTime,viewedByMeTime desc", 403, _DUPLICATE_403),
+        *_ORDER_SPACE_ROWS,
+        *[(None, f"{key} {way}", 200, None) for key in _ORDER_KEYS for way in ("asc", "desc")],
         (None, "starred", 200, None),
         (None, "starred desc", 200, None),
         (None, "starred,name", 200, None),
@@ -4524,7 +5306,8 @@ _FULLTEXT_403 = (
         (None, "name,,starred", 500, None),
         (None, "name,starred,name", 403, _DUPLICATE_403),
         (None, "starred,starred", 403, _DUPLICATE_403),
-        (None, "name,starred,bogus", 400, None),
+        (None, "name,starred,bogus", 400, _INVALID_400),
+        (None, "name asc,starred", 500, None),
         ("fullText contains 'the'", "name", 403, _FULLTEXT_403),
         ("fullText contains 'the'", "name desc", 403, _FULLTEXT_403),
         ("fullText contains 'the'", "name,modifiedTime", 403, _FULLTEXT_403),
@@ -4549,12 +5332,12 @@ _FULLTEXT_403 = (
 def test_drive_order_by_is_refused_where_real_refuses_it(
     client, admin_h, q, order_by, status, error
 ):
-    """`orderBy` on its own and beside a `q`, answered with the 403s `_drive_order_specs` and
-    `gerr.sorting_not_supported_fulltext` describe and the 500 `gerr.drive_internal_error`
-    describes, each `error` object the one real sends. An unusable token at or before a repeat is
-    the 400, the parse is refused ahead of the 500 wherever `starred` sits and the repeat ahead of
-    the `fullText` 403, and an absent or empty `orderBy`, or a `q` with no `fullText` term, is
-    served."""
+    """`orderBy` on its own and beside a `q`, answered with the 400 and the 403s
+    `_drive_order_specs` and `gerr.sorting_not_supported_fulltext` describe and the 500
+    `gerr.drive_internal_error` describes, each `error` object the one real sends. An unusable
+    token at or before a repeat is the 400, the parse is refused ahead of the 500 wherever
+    `starred` sits and the repeat ahead of the `fullText` 403, and an absent or empty `orderBy`, or
+    a `q` with no `fullText` term, is served."""
     params = {"pageSize": 1, "q": q, "orderBy": order_by}
     r = client.get(
         "/drive/v3/files",
@@ -4565,7 +5348,7 @@ def test_drive_order_by_is_refused_where_real_refuses_it(
     if error is not None:
         reason, message = error
         assert _gerr(r) == {
-            "code": 403,
+            "code": status,
             "message": message,
             "errors": [
                 {

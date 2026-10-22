@@ -30,7 +30,7 @@ from pydantic import BaseModel, ConfigDict
 from starlette.datastructures import QueryParams
 from starlette.routing import Match
 
-from backlot import auth, protojson, sheets_grid, store, synth
+from backlot import auth, collation, protojson, sheets_grid, store, synth
 from backlot.acl import Caller
 from backlot.config import get_settings
 from backlot.errors import google as gerr
@@ -2334,6 +2334,17 @@ def _shared_with_me_time(owner_email: str | None, me: str | None, created: int) 
     return {"sharedWithMeTime": synth.rfc3339(created)}
 
 
+def _modified_by_me(owner_email: str | None, me: str | None, modified: int) -> dict:
+    """``modifiedByMe``, and ``modifiedByMeTime`` when it is true, as a ``**``-mergeable fragment.
+    A row's author is its owner and the one user ``lastModifyingUser`` names, so the caller
+    modified a file exactly when it owns it, last at ``modifiedTime``. Real sends ``modifiedByMe``
+    on every file and the time only when it is true, and on 21,074 of the 21,085 files two
+    accounts owned and had modified the time was ``modifiedTime``, measured 2026-10-20."""
+    if not _drive_owned_by(owner_email, me):
+        return {"modifiedByMe": False}
+    return {"modifiedByMe": True, "modifiedByMeTime": synth.rfc3339(modified)}
+
+
 def _drive_created(row) -> int:
     """A file's creation second — its own, else one seeded from its id. `is not None`, because
     1970-01-01T00:00:00Z stores as 0 and a file that HAS a second must serve it rather than a
@@ -2413,6 +2424,7 @@ def _drive_folder_obj(conn, name: str, me: str | None = None) -> dict:
         "starred": False,
         "shared": True,
         "ownedByMe": False,
+        "modifiedByMe": False,
         "viewedByMe": False,
         "version": "1",
         "spaces": ["drive"],
@@ -2565,56 +2577,64 @@ def _drive_fill_shared(conn, files: list[dict], stored: set[str]) -> None:
 # --- `orderBy` -----------------------------------------------------------------------------
 
 
-def _natural_key(name: str) -> list[tuple]:
-    """Drive's ``name_natural``: digit runs compare numerically, so ``v2`` sorts before ``v10``."""
-    return [
-        (0, int(t), "") if t.isdigit() else (1, 0, t.casefold())
-        for t in re.split(r"(\d+)", name)
-        if t
-    ]
-
-
 # Real Drive's documented `orderBy` keys -> the sort key each takes from the served file object
-# (sorting what the client actually sees, so folders and stored rows order together). Names sort
-# case-insensitively, the way Drive's collation presents them. `recency` is Drive's "most recent
-# by any signal"; Backlot models exactly one modification timestamp, which stands in for it.
+# (sorting what the client actually sees, so folders and stored rows order together). `name`
+# compares names case-insensitively, code point by code point; `name_natural` is
+# `backlot.collation`'s.
 _DRIVE_ORDER_KEYS = {
     "createdTime": lambda f: f.get("createdTime") or "",
     "modifiedTime": lambda f: f.get("modifiedTime") or "",
-    "recency": lambda f: f.get("modifiedTime") or "",
     "name": lambda f: (f.get("name") or "").casefold(),
-    "name_natural": lambda f: _natural_key(f.get("name") or ""),
+    "name_natural": lambda f: collation.sort_key(f.get("name") or ""),
     "folder": lambda f: f.get("mimeType") != DRIVE_FOLDER_MIME,  # folders first
     "starred": lambda f: bool(f.get("starred")),
     "quotaBytesUsed": lambda f: int(f.get("quotaBytesUsed") or f.get("size") or 0),
-    # Sortable because Backlot DOES model the relation behind it — owner vs caller — even though it
-    # records no share event (see _shared_with_me_time). Absent for the admin/service token, where
-    # every key ties and the order falls back to the id, as it would on real Drive over nulls.
+    # The per-caller keys read the served object, so a file the caller never modified or was
+    # shared sorts as real sorts a file without the time: ahead of every time, and after every one
+    # under `desc`.
     "sharedWithMeTime": lambda f: f.get("sharedWithMeTime") or "",
+    "modifiedByMeTime": lambda f: f.get("modifiedByMeTime") or "",
+    # Real sorts a file shared with the caller that the caller never viewed after every file
+    # without a view time and ahead of every view time, one of 2001 included, measured 2026-10-21;
+    # a file reached through a shared folder carries no `sharedWithMeTime` and sorts with the
+    # first. Nothing here is viewed, as `viewedByMe` says on every file, so whether the caller was
+    # shared the file is all the key reads.
+    "viewedByMeTime": lambda f: bool(f.get("sharedWithMeTime")),
+    # The later of the caller's last view and last modification; a file with neither after every
+    # file with either.
+    "recency": lambda f: max(f.get("viewedByMeTime") or "", f.get("modifiedByMeTime") or ""),
 }
-# Documented by Drive, but derived from per-caller signals Backlot does not model at all: nothing
-# here is ever viewed or modified *by* anyone in particular. Sorting by one of these could only be a
-# no-op, and a silently unapplied sort is the very failure this fix is about — so they 400, which
-# tells a consumer "verify this against real Drive" instead of quietly agreeing.
-_DRIVE_ORDER_UNMODELLED = ("viewedByMeTime", "modifiedByMeTime")
+# Listed newest first whichever direction is asked for: real answered `recency` and `recency asc`
+# newest first, as it answers `recency desc`, measured 2026-10-20.
+_DRIVE_ORDER_NEWEST_FIRST = frozenset({"recency"})
+# What separates an `orderBy` key from its direction, and what may stand around either: the 25
+# code points of Unicode's White_Space property, each a 200 between `name` and `desc`, ahead of
+# `name` and after it, measured 2026-10-20. `str.split()` also splits on U+001C-U+001F, which real
+# refuses as part of the key.
+_DRIVE_ORDER_SPACE = re.compile(
+    "[\t-\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+"
+)
+
+
+def _drive_order_words(order_by: str | None) -> list[list[str]]:
+    """``orderBy``'s comma-separated keys, each as its words. A key with no words is no key:
+    ``,name``, ``name,`` and ``name,,modifiedTime`` are each served."""
+    words = ([w for w in _DRIVE_ORDER_SPACE.split(tok) if w] for tok in (order_by or "").split(","))
+    return [w for w in words if w]
 
 
 def _drive_order_specs(order_by: str | None) -> list[tuple]:
-    """Parse ``orderBy`` — comma-separated keys, each optionally suffixed ``desc`` — into
-    ``(key, reverse)`` pairs. An unusable key is a 400, as on the real API — accepting one and not
-    applying it would let a client relying on server-side ordering pass here and misbehave against
-    the real thing. A key named twice is a 403."""
+    """Parse ``orderBy`` — comma-separated keys, each optionally followed by ``asc`` or ``desc`` in
+    lower case — into ``(key, reverse)`` pairs. Anything else is real's 400 ``Invalid Value``: an
+    unknown key, a key or direction in another case, a third word. A key named twice is a 403."""
     specs = []
     seen: set[str] = set()
-    for tok in (order_by or "").split(","):
-        parts = tok.split()
-        if not parts:
-            continue
+    for parts in _drive_order_words(order_by):
         key = parts[0]
-        if len(parts) > 2 or (len(parts) == 2 and parts[1] != "desc"):
-            raise gerr.invalid_value("orderBy", f"Invalid sort key: {tok.strip()}")
-        if key not in _DRIVE_ORDER_KEYS and key not in _DRIVE_ORDER_UNMODELLED:
-            raise gerr.invalid_value("orderBy", f"Invalid sort key: {tok.strip()}")
+        if parts[1:] not in ([], ["asc"], ["desc"]):
+            raise gerr.invalid_value("orderBy")
+        if key not in _DRIVE_ORDER_KEYS:
+            raise gerr.invalid_value("orderBy")
         # Real Drive (measured 2026-10-04) 403s a key named twice whatever either direction is, and
         # reads `name_natural` as `name` but `recency` and `modifiedTime` as two keys — so this
         # compares names, not the key functions. It reads left to right and answers the first
@@ -2623,30 +2643,22 @@ def _drive_order_specs(order_by: str | None) -> list[tuple]:
         if name in seen:
             raise gerr.duplicate_sort_keys()
         seen.add(name)
-        specs.append((key, len(parts) == 2))
+        specs.append((key, parts[1:] == ["desc"]))
     return specs
 
 
-def _drive_order_keyfns(specs: list[tuple]) -> list[tuple]:
-    """``(key function, reverse)`` pairs for the keys ``_drive_order_specs`` passed. A key Backlot
-    cannot sort by is refused here, after the 403 a `fullText` term gets."""
-    for key, _ in specs:
-        if key in _DRIVE_ORDER_UNMODELLED:
-            raise gerr.invalid_value(
-                "orderBy",
-                f"Sorting by '{key}' is not supported by Backlot (it models no per-caller "
-                f"view/share timestamps). Supported: {', '.join(sorted(_DRIVE_ORDER_KEYS))}.",
-            )
-    return [(_DRIVE_ORDER_KEYS[key], reverse) for key, reverse in specs]
-
-
 def _drive_sort(files: list[dict], specs: list[tuple]) -> list[dict]:
-    """Apply the keys last-first: Python's sort is stable, so the first key wins. The id pre-sort
-    makes ties deterministic, which is what keeps a sorted walk from repeating or skipping a row
-    across pages."""
+    """Apply the keys last-first: Python's sort is stable, so the first key wins. Files the keys
+    tie stay newest modification first under either direction, as real lists them: of the tied
+    pairs in its `name`, `name_natural`, `folder,name`, `starred` and `quotaBytesUsed` listings of
+    two accounts' files on 2026-10-20, and in its `viewedByMeTime`, `sharedWithMeTime`,
+    `modifiedByMeTime` and `recency` listings of folders made for them on 2026-10-21, none had the
+    older first. The id under that keeps a sorted walk from repeating or skipping a row across
+    pages."""
     files.sort(key=lambda f: f.get("id") or "")
-    for keyfn, reverse in reversed(specs):
-        files.sort(key=keyfn, reverse=reverse)
+    files.sort(key=lambda f: f.get("modifiedTime") or "", reverse=True)
+    for key, reverse in reversed(specs):
+        files.sort(key=_DRIVE_ORDER_KEYS[key], reverse=reverse or key in _DRIVE_ORDER_NEWEST_FIRST)
     return files
 
 
@@ -2668,15 +2680,15 @@ def _drive_newest_first(objects, folders: list[dict], offset: int, limit: int) -
     ``offset - len(folders)``, and a folder ahead of every row from there sorts before the page."""
     start = max(0, offset - len(folders))
     window = objects(start, offset + limit - start, with_shared=False)
-    newest = [(_DRIVE_ORDER_KEYS["modifiedTime"], True)]
+    newest = [("modifiedTime", True)]
     return _drive_sort(window + folders, newest)[offset - start : offset - start + limit]
 
 
 def _drive_starred_after_another_key(order_by: str | None) -> bool:
     """Whether ``starred`` follows another key in an ``orderBy`` that ``_drive_order_specs`` passed,
-    the case `gerr.drive_internal_error` answers. An empty token is no key: `,starred` is served and
-    `name,,starred` is the 500."""
-    keys = [parts[0] for tok in (order_by or "").split(",") if (parts := tok.split())]
+    the case `gerr.drive_internal_error` answers: `,starred` is served and `name,,starred` is the
+    500."""
+    keys = [parts[0] for parts in _drive_order_words(order_by)]
     return "starred" in keys[1:]
 
 
@@ -3014,7 +3026,6 @@ async def drive_files_list(request: Request):
     fulltext = any(t.field == "fullText" for t in _drive_q_terms(query))
     if order and fulltext:
         raise gerr.sorting_not_supported_fulltext()
-    order = _drive_order_keyfns(order)
     # Measured 2026-09-23: a token the API did not issue is 400 `Invalid Value`, where an empty one
     # is the first page.
     offset = decode_cursor_or_none(gerr.first_repeat(params, "pageToken"))
@@ -5193,6 +5204,7 @@ def _drive_file(conn, row, shared: bool | None = None, me: str | None = None) ->
         "shared": bool(shared),
         "viewedByMe": False,
         "ownedByMe": _drive_owned_by(author, me),
+        **_modified_by_me(author, me, modified),
         **_shared_with_me_time(author, me, created),
         "version": str(2 if row["updated_ts"] else 1),
         "spaces": ["drive"],
