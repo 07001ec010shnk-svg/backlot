@@ -46,6 +46,7 @@ _FIELD_VALUES = {
 }
 _CONTAINER_VALUES = {
     "slack": "incidents",
+    "msteams": "Incidents",
     "gmail": "ops",
     "google_drive": "runbooks",
     "github": "gateway",
