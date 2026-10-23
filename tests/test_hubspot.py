@@ -397,46 +397,56 @@ def test_hubspot_0_18_0_72_0_64_are_their_types(tmp_path):
             assert (linked.status_code, linked.json()) == (200, {"results": []}), to
 
 
-@pytest.mark.parametrize(
-    "asked,named",
-    [
-        ("0-53", "invoices"),
-        ("0-54", "marketing_events"),
-        ("0-69", "subscriptions"),
-        ("0-74", "goal_targets"),
-        ("0-115", "users"),
-        ("0-123", "orders"),
-        ("0-136", "leads"),
-        ("0-142", "carts"),
-        ("0-145", "partner_clients"),
-        ("0-162", "services"),
-        ("0-410", "courses"),
-        ("0-420", "listings"),
-        ("0-421", "appointments"),
-    ],
-)
-def test_hubspot_a_measured_type_id_is_its_type(tmp_path, asked, named):
+_MEASURED_TYPE_IDS = [
+    ("0-53", "invoices"),
+    ("0-54", "marketing_events"),
+    ("0-69", "subscriptions"),
+    ("0-74", "goal_targets"),
+    ("0-115", "users"),
+    ("0-123", "orders"),
+    ("0-136", "leads"),
+    ("0-142", "carts"),
+    ("0-145", "partner_clients"),
+    ("0-162", "services"),
+    ("0-410", "courses"),
+    ("0-420", "listings"),
+    ("0-421", "appointments"),
+]
+
+
+@pytest.fixture(scope="module")
+def measured_types(tmp_path_factory):
+    """One record of each type `_MEASURED_TYPE_IDS` names."""
+    return tiny_corpus(
+        tmp_path_factory.mktemp("measured_types"),
+        [
+            {
+                "source_type": "hubspot",
+                "doc_id": f"hs-{named}",
+                "object_type": named,
+                "title": named,
+                "content": f"One of {named}.",
+                "author_email": "rep@acme.com",
+                "created": "2026-03-01T09:00:00Z",
+            }
+            for _, named in _MEASURED_TYPE_IDS
+        ],
+    )
+
+
+@pytest.mark.parametrize("asked,named", _MEASURED_TYPE_IDS)
+def test_hubspot_a_measured_type_id_is_its_type(measured_types, asked, named):
     """The thirteen pairings the comment above `_TYPE_IDS` records from real's 403s, over a corpus
-    holding one record of the type, so an id read as any other type lists nothing."""
+    holding one record of each of the thirteen types, so an id read as any other type lists another
+    type's record or nothing."""
     from tests._helpers import client_for
 
-    record = {
-        "source_type": "hubspot",
-        "doc_id": f"hs-{named}",
-        "object_type": named,
-        "title": named,
-        "content": f"One of {named}.",
-        "author_email": "rep@acme.com",
-        "created": "2026-03-01T09:00:00Z",
-    }
-    settings = tiny_corpus(tmp_path, [record])
+    settings = measured_types
     with client_for(settings, reload=True) as c:
         h = {"Authorization": f"Bearer {settings.admin_token}"}
         by_id = c.get(f"/hubspot/crm/v3/objects/{asked}", headers=h)
         assert by_id.status_code == 200, by_id.json()
-        assert [r["id"] for r in by_id.json()["results"]] == [
-            served_id("hubspot", record["doc_id"])
-        ]
+        assert [r["id"] for r in by_id.json()["results"]] == [served_id("hubspot", f"hs-{named}")]
 
 
 def test_hubspot_one_type_stated_both_ways_is_one_type(tmp_path):
@@ -1791,9 +1801,12 @@ def test_hubspot_batch_read_reads_a_bare_id_string_as_that_id(
 # --- HubSpot ---------------------------------------------------------------------
 
 
-def _hubspot_conn(tmp_path):
+@pytest.fixture(scope="module")
+def hubspot_conn(tmp_path_factory):
+    """A read-only connection to two companies, one archived, and a contact associated with the
+    live one."""
     s = tiny_corpus(
-        tmp_path,
+        tmp_path_factory.mktemp("hubspot_conn"),
         [
             {
                 "source_type": "hubspot",
@@ -1831,13 +1844,15 @@ def _hubspot_conn(tmp_path):
             },
         ],
     )
-    return store.connect_ro(s.db_path)
+    conn = store.connect_ro(s.db_path)
+    yield conn
+    conn.close()
 
 
-def test_hubspot_record_shape(tmp_path):
+def test_hubspot_record_shape(hubspot_conn):
     from backlot.routers.hubspot import _record
 
-    conn = _hubspot_conn(tmp_path)
+    conn = hubspot_conn
     row = store.get_document(conn, "hubspot", served_id("hubspot", "hf-co"))
     obj = _record(row)
     # a CRM record is {id, properties, createdAt, updatedAt, archived} — ids are numeric strings and
@@ -1858,17 +1873,17 @@ def test_hubspot_record_shape(tmp_path):
     )
 
 
-def test_hubspot_properties_projection(tmp_path):
+def test_hubspot_properties_projection(hubspot_conn):
     from backlot.routers.hubspot import _record
 
-    conn = _hubspot_conn(tmp_path)
+    conn = hubspot_conn
     row = store.get_document(conn, "hubspot", served_id("hubspot", "hf-co"))
     assert set(_record(row, ["name"])["properties"]) == {"name"}
     assert set(_record(row)["properties"]) == {"name", "domain"}  # no projection -> all
 
 
-def test_hubspot_association_shape(tmp_path):
-    conn = _hubspot_conn(tmp_path)
+def test_hubspot_association_shape(hubspot_conn):
+    conn = hubspot_conn
     rows = store.hubspot_associations(conn, served_id("hubspot", "hf-ct"), "companies")
     assert [r["to_id"] for r in rows] == [served_id("hubspot", "hf-co")]
     # the v4 payload is {toObjectId, associationTypes:[{category, typeId, label}]} -- toObjectId
@@ -1961,12 +1976,12 @@ def test_hubspot_route_reads_the_stored_served_id_under_a_collision(tmp_path, mo
         assert str(assoc["results"][0]["toObjectId"]) == ids[0]
 
 
-def test_hubspot_page_omits_paging_next_on_last_page(tmp_path):
+def test_hubspot_page_omits_paging_next_on_last_page(hubspot_conn):
     """The termination contract at the builder level: `paging.next` appears only when a further page
     exists, because the official client's fetch_all stops on its absence."""
     from backlot.routers.hubspot import _page
 
-    conn = _hubspot_conn(tmp_path)
+    conn = hubspot_conn
     rows = store.list_hubspot_objects(conn, "companies", limit=3)  # 1 non-archived company
     assert "paging" not in _page(rows, 10, None)
     assert _page(rows, 1, None)["results"]  # a full page still yields rows

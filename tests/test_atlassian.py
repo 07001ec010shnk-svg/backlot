@@ -329,6 +329,27 @@ def test_jira_project_search_refuses_an_order_by_naming_no_field(
     }
 
 
+@pytest.fixture(scope="module")
+def two_projects(tmp_path_factory):
+    """Two Jira projects of one issue each, built once for every page of the listing."""
+    return tiny_corpus(
+        tmp_path_factory.mktemp("two_projects"),
+        [
+            {
+                "source_type": "jira",
+                "doc_id": f"issue-{i}",
+                "project": name,
+                "key": f"{name.upper()}-1",
+                "title": name,
+                "content": "Issue",
+                "author_email": "a@x.com",
+                "visibility": "public",
+            }
+            for i, name in enumerate(("payments", "orders"))
+        ],
+    )
+
+
 @pytest.mark.parametrize(
     "query, start, limit",
     [
@@ -345,24 +366,9 @@ def test_jira_project_search_refuses_an_order_by_naming_no_field(
         ({"maxResults": "5000"}, 0, 100),
     ],
 )
-def test_jira_project_search_pages(tmp_path, query, start, limit):
+def test_jira_project_search_pages(two_projects, query, start, limit):
     """The project pagination measurement recorded in `jira_project_search` governs each page."""
-    settings = tiny_corpus(
-        tmp_path,
-        [
-            {
-                "source_type": "jira",
-                "doc_id": f"issue-{i}",
-                "project": name,
-                "key": f"{name.upper()}-1",
-                "title": name,
-                "content": "Issue",
-                "author_email": "a@x.com",
-                "visibility": "public",
-            }
-            for i, name in enumerate(("payments", "orders"))
-        ],
-    )
+    settings = two_projects
     with client_for(settings, reload=True) as client:
         admin_h = {"Authorization": f"Bearer {settings.admin_token}"}
         url = "/atlassian/rest/api/3/project/search"
@@ -1756,6 +1762,25 @@ _BOTH_LISTS = "restrictions{user group} _expandable{content} _links"
 _NO_LISTS = "_expandable{restrictions content} _links"
 
 
+@pytest.fixture(scope="module")
+def private_page(tmp_path_factory):
+    """One private Confluence page, built once for every `expand` row."""
+    return tiny_corpus(
+        tmp_path_factory.mktemp("private_page"),
+        [
+            {
+                "source_type": "confluence",
+                "doc_id": "c2",
+                "space": "hb",
+                "title": "P",
+                "content": "x",
+                "author_email": "a@x.com",
+                "visibility": "private",
+            },
+        ],
+    )
+
+
 @pytest.mark.parametrize(
     "query, members",
     [
@@ -1819,7 +1844,9 @@ _NO_LISTS = "_expandable{restrictions content} _links"
         ("expand=%20", "_expandable{read update} _links"),
     ],
 )
-def test_confluence_restrictions_answer_what_expand_names_in_real_shape(tmp_path, query, members):
+def test_confluence_restrictions_answer_what_expand_names_in_real_shape(
+    private_page, query, members
+):
     """Each row is real's answer to the same query, member names and order, as measured where
     `_restriction_expansions` and the comment in `confluence_restrictions` say. Every operation
     served links to itself, and the answer ends with real's links."""
@@ -1829,20 +1856,7 @@ def test_confluence_restrictions_answer_what_expand_names_in_real_shape(tmp_path
     from backlot.acl import Acl
     from backlot.routers.atlassian import _site, confluence_restrictions
 
-    s = tiny_corpus(
-        tmp_path,
-        [
-            {
-                "source_type": "confluence",
-                "doc_id": "c2",
-                "space": "hb",
-                "title": "P",
-                "content": "x",
-                "author_email": "a@x.com",
-                "visibility": "private",
-            },
-        ],
-    )
+    s = private_page
     conn = store.connect_ro(s.db_path)
     cid = served_id("confluence", "c2")
     app = types.SimpleNamespace(
@@ -3942,18 +3956,11 @@ def test_jira_search_max_results_range_wins_over_the_unbounded_jql_refusal_on_ge
     assert r.json()["errorMessages"] == [_MAX_RESULTS_RANGE_MESSAGE]
 
 
-@pytest.mark.parametrize("query", ["", "maxResults=", "maxResults=%20"])
-def test_jira_search_default_page_size_is_never_checked_against_the_range(
-    tmp_path, monkeypatch, query
-):
-    """`default_page_size` is Backlot's own setting, not a value the vendor ever validated, so a
-    deployment that misconfigures it outside 1-5000 must not turn a request that sent no
-    `maxResults` at all into a refusal — real never checks its own default against that range.
-    An empty or whitespace-only value is the same "not really sent" case on real (see
-    `_int_param`), so it gets the same exemption."""
-    monkeypatch.setenv("BACKLOT_DEFAULT_PAGE_SIZE", "0")
-    s = tiny_corpus(
-        tmp_path,
+@pytest.fixture(scope="module")
+def one_payments_issue(tmp_path_factory):
+    """One public issue in project `payments`."""
+    return tiny_corpus(
+        tmp_path_factory.mktemp("one_payments_issue"),
         [
             {
                 "source_type": "jira",
@@ -3966,6 +3973,19 @@ def test_jira_search_default_page_size_is_never_checked_against_the_range(
             }
         ],
     )
+
+
+@pytest.mark.parametrize("query", ["", "maxResults=", "maxResults=%20"])
+def test_jira_search_default_page_size_is_never_checked_against_the_range(
+    one_payments_issue, monkeypatch, query
+):
+    """`default_page_size` is Backlot's own setting, not a value the vendor ever validated, so a
+    deployment that misconfigures it outside 1-5000 must not turn a request that sent no
+    `maxResults` at all into a refusal — real never checks its own default against that range.
+    An empty or whitespace-only value is the same "not really sent" case on real (see
+    `_int_param`), so it gets the same exemption."""
+    monkeypatch.setenv("BACKLOT_DEFAULT_PAGE_SIZE", "0")
+    s = one_payments_issue
     with client_for(s, reload=True) as c:
         h = {"Authorization": f"Bearer {s.admin_token}"}
         get_r = c.get(

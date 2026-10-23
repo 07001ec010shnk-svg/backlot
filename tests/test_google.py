@@ -1833,24 +1833,33 @@ def test_drive_permissions_list_pages_in_the_unpaged_order(client, admin_h, driv
     }
 
 
+@pytest.fixture(scope="module")
+def three_readers(tmp_path_factory):
+    """One Drive file with its author and two readers."""
+    return tiny_corpus(
+        tmp_path_factory.mktemp("three_readers"),
+        [
+            {
+                "source_type": "google_drive",
+                "doc_id": "three",
+                "folder": "mk",
+                "title": "Three readers",
+                "content": "x",
+                "author_email": "a@x.com",
+                "readers": ["b@x.com", "c@x.com"],
+            }
+        ],
+    )
+
+
 @pytest.mark.parametrize("size, lengths", [(1, [1, 1, 1]), (2, [2, 1])])
-def test_drive_permissions_list_pages_a_file_with_three_permissions(tmp_path, size, lengths):
+def test_drive_permissions_list_pages_a_file_with_three_permissions(three_readers, size, lengths):
     """`_drive_permission_page` past the second page: at `pageSize=1` the page a token serves
     carries the token for the third, at `pageSize=2` the second page starts after the two the first
     served, and the pages joined are the unpaged list. The files measured had two permissions
     each, so neither was measured."""
-    from tests._helpers import corpus_client
-
-    record = {
-        "source_type": "google_drive",
-        "doc_id": "three",
-        "folder": "mk",
-        "title": "Three readers",
-        "content": "x",
-        "author_email": "a@x.com",
-        "readers": ["b@x.com", "c@x.com"],
-    }
-    with corpus_client(tmp_path, [record]) as (client, settings):
+    settings = three_readers
+    with client_for(settings) as client:
         h = {"Authorization": f"Bearer {settings.admin_token}"}
         q = {"q": "name = 'Three readers'"}
         (doc,) = client.get("/drive/v3/files", headers=h, params=q).json()["files"]
@@ -4943,26 +4952,9 @@ _CAPS_TRUE = {
 }
 
 
-@pytest.mark.parametrize(
-    "name, owned, kind",
-    [
-        ("Mine", True, "file"),
-        ("Theirs", False, "file"),
-        ("Plans", False, "folder"),
-        ("Figures", True, "folder"),
-        ("Drafts", False, "folder"),
-    ],
-)
-def test_drive_owned_by_me_can_share_and_modified_by_me_follow_the_caller(
-    tmp_path, name, owned, kind
-):
-    """`ownedByMe` is per caller, and `canShare` and `modifiedByMe` with it: what the caller owns it
-    can share, and what it can only read it cannot; `_modified_by_me` says why the caller modified
-    exactly what it owns. Real answered `canShare: true` on 117 of the 118 items a Google Workspace
-    member's `files.list` named as its own on 2026-10-18 and on 2026-10-19, and `false` on each
-    folder and each file shared with it to read. `Plans` is a folder a record's `folder` names, and
-    `Figures` and `Drafts` are `subtype: folder` records. The rest of `capabilities` is
-    `_CAPS_TRUE`'s."""
+@pytest.fixture(scope="module")
+def owned_and_lent(tmp_path_factory):
+    """A file and a folder record of ava's and of mia's in folder `Plans`, each readable by both."""
     record = {
         "source_type": "google_drive",
         "folder": "Plans",
@@ -4972,8 +4964,8 @@ def test_drive_owned_by_me_can_share_and_modified_by_me_follow_the_caller(
     }
     rows = [("mine", "Mine", "ava", None), ("theirs", "Theirs", "mia", None)]
     rows += [("figures", "Figures", "ava", "folder"), ("drafts", "Drafts", "mia", "folder")]
-    s = tiny_corpus(
-        tmp_path,
+    return tiny_corpus(
+        tmp_path_factory.mktemp("owned_and_lent"),
         [
             {
                 **record,
@@ -4985,6 +4977,29 @@ def test_drive_owned_by_me_can_share_and_modified_by_me_follow_the_caller(
             for doc_id, title, author, subtype in rows
         ],
     )
+
+
+@pytest.mark.parametrize(
+    "name, owned, kind",
+    [
+        ("Mine", True, "file"),
+        ("Theirs", False, "file"),
+        ("Plans", False, "folder"),
+        ("Figures", True, "folder"),
+        ("Drafts", False, "folder"),
+    ],
+)
+def test_drive_owned_by_me_can_share_and_modified_by_me_follow_the_caller(
+    owned_and_lent, name, owned, kind
+):
+    """`ownedByMe` is per caller, and `canShare` and `modifiedByMe` with it: what the caller owns it
+    can share, and what it can only read it cannot; `_modified_by_me` says why the caller modified
+    exactly what it owns. Real answered `canShare: true` on 117 of the 118 items a Google Workspace
+    member's `files.list` named as its own on 2026-10-18 and on 2026-10-19, and `false` on each
+    folder and each file shared with it to read. `Plans` is a folder a record's `folder` names, and
+    `Figures` and `Drafts` are `subtype: folder` records. The rest of `capabilities` is
+    `_CAPS_TRUE`'s."""
+    s = owned_and_lent
     tokens = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))
     ava = {"Authorization": f"Bearer {tok(tokens, 'ava@acme.com')}"}
     with client_for(s, reload=True) as c:
@@ -8126,6 +8141,25 @@ def test_drive_q_plain_folder_reads_a_folder_scope(q, scope):
     assert google._drive_q_plain_folder(google._drive_q_parse(q)) == scope
 
 
+@pytest.fixture(scope="module")
+def live_and_gone(tmp_path_factory):
+    """Two private files of mia's in folder `mk`, `Gone` in her trash."""
+    record = {
+        "source_type": "google_drive",
+        "folder": "mk",
+        "content": "x",
+        "visibility": "private",
+    }
+    return tiny_corpus(
+        tmp_path_factory.mktemp("live_and_gone"),
+        [
+            {**record, "doc_id": "live", "title": "Live", "author_email": "mia@acme.com"},
+            {**record, "doc_id": "gone", "title": "Gone", "author_email": "mia@acme.com"}
+            | {"trashed": True},
+        ],
+    )
+
+
 @pytest.mark.parametrize(
     "q, scan, listed",
     [
@@ -8136,7 +8170,9 @@ def test_drive_q_plain_folder_reads_a_folder_scope(q, scope):
         ("name contains 'e' and not trashed", "backlot.store.list_documents", {"Live"}),
     ],
 )
-def test_drive_a_folder_scope_or_a_name_is_listed_from_sql(tmp_path, monkeypatch, q, scan, listed):
+def test_drive_a_folder_scope_or_a_name_is_listed_from_sql(
+    live_and_gone, monkeypatch, q, scan, listed
+):
     """`'<id>' in parents`, LlamaIndex's Google Drive reader's `q`, is served by
     `store.list_drive_folder`, and a `name` term, mirage's lookup, by `store.list_drive_by_name`,
     each with its owner's trash and whatever `trashed` term sits beside it: with ``scan`` patched
@@ -8147,20 +8183,7 @@ def test_drive_a_folder_scope_or_a_name_is_listed_from_sql(tmp_path, monkeypatch
         raise AssertionError(f"{q} reached {scan}")
 
     monkeypatch.setattr(scan, fail)
-    record = {
-        "source_type": "google_drive",
-        "folder": "mk",
-        "content": "x",
-        "visibility": "private",
-    }
-    s = tiny_corpus(
-        tmp_path,
-        [
-            {**record, "doc_id": "live", "title": "Live", "author_email": "mia@acme.com"},
-            {**record, "doc_id": "gone", "title": "Gone", "author_email": "mia@acme.com"}
-            | {"trashed": True},
-        ],
-    )
+    s = live_and_gone
     tokens = yaml.safe_load(s.tokens_path.read_text(encoding="utf-8"))
     mia = {"Authorization": f"Bearer {tok(tokens, 'mia@acme.com')}"}
     params = {"q": q.format(folder=synth.drive_folder_id("mk")), "fields": "files(name)"}
@@ -8380,16 +8403,21 @@ _Q_RECORDS = [
 _FOLDER = "application/vnd.google-apps.folder"
 
 
-def test_drive_q_evaluates_the_operators_the_reference_lists(tmp_path):
+@pytest.fixture(scope="module")
+def q_corpus(tmp_path_factory):
+    """`_Q_RECORDS` built."""
+    return tiny_corpus(tmp_path_factory.mktemp("q_corpus"), _Q_RECORDS)
+
+
+def test_drive_q_evaluates_the_operators_the_reference_lists(q_corpus):
     """Every operator the reference lists for `name`, `mimeType`, `modifiedTime`, `createdTime`,
     `viewedByMeTime`, `trashed` and `starred`, over a corpus small enough to name the answer;
     `sharedWithMe`, `fullText` and the two collections are in the client-shapes test that closes
     this group. Folders are dropped here (their `createdTime` is seeded, so a time clause's answer
     for them is not this test's to state); the test below is where they go through the same
     evaluator."""
-    from tests._helpers import corpus_client
-
-    with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
+    settings = q_corpus
+    with client_for(settings) as client:
         h = {"Authorization": f"Bearer {settings.admin_token}"}
 
         def files(q):
@@ -8498,14 +8526,13 @@ def test_drive_q_evaluates_the_operators_the_reference_lists(tmp_path):
             assert files(q) == expected, q
 
 
-def test_drive_q_or_spans_folders_and_files(tmp_path):
+def test_drive_q_or_spans_folders_and_files(q_corpus):
     """The synthesized folders go through the same evaluator as stored rows, so a disjunction that
     names a folder by its mimeType and a file by its name answers both. A `'root' in parents`
     under an `or` scopes nothing — the parent shortcut reads only the terms every match must
     satisfy — so the files still come back."""
-    from tests._helpers import corpus_client
-
-    with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
+    settings = q_corpus
+    with client_for(settings) as client:
         h = {"Authorization": f"Bearer {settings.admin_token}"}
         r = client.get(
             "/drive/v3/files",
@@ -8525,12 +8552,11 @@ def test_drive_q_or_spans_folders_and_files(tmp_path):
         assert {f["name"] for f in r.json()["files"]} == {"mk", "fin", "Q1 Deck", "Q1 Revenue"}
 
 
-def test_drive_q_refuses_a_clause_it_cannot_parse(tmp_path):
+def test_drive_q_refuses_a_clause_it_cannot_parse(q_corpus):
     """A term `files.list` does not take, a clause that is not the grammar, or white space alone is
     the 400 `_drive_q_refused` raises."""
-    from tests._helpers import corpus_client
-
-    with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
+    settings = q_corpus
+    with client_for(settings) as client:
         h = {"Authorization": f"Bearer {settings.admin_token}"}
         for q in (
             "bogusField = 'x'",
@@ -8616,13 +8642,12 @@ _Q_PAST_THE_REFERENCE = [
 ]
 
 
-def test_drive_q_reads_what_real_reads_past_the_reference(tmp_path):
+def test_drive_q_reads_what_real_reads_past_the_reference(q_corpus):
     """Shapes the reference does not list and real answers with a 200, each with the files its
     answer names here, folders left out."""
-    from tests._helpers import corpus_client
-
     answered = {}
-    with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
+    settings = q_corpus
+    with client_for(settings) as client:
         h = {"Authorization": f"Bearer {settings.admin_token}"}
         for q, _ in _Q_PAST_THE_REFERENCE:
             r = client.get(
@@ -8635,12 +8660,11 @@ def test_drive_q_reads_what_real_reads_past_the_reference(tmp_path):
     assert answered == dict(_Q_PAST_THE_REFERENCE)
 
 
-def test_drive_q_refuses_a_documented_term_it_holds_no_fact_for(tmp_path):
+def test_drive_q_refuses_a_documented_term_it_holds_no_fact_for(q_corpus):
     """`writers`, `readers`, `visibility` and the two map-valued terms are the reference's, and a
     corpus record carries nothing to answer them from, so the refusal says so."""
-    from tests._helpers import corpus_client
-
-    with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
+    settings = q_corpus
+    with client_for(settings) as client:
         h = {"Authorization": f"Bearer {settings.admin_token}"}
         for q in (
             "'mia@x.com' in writers",
@@ -8658,13 +8682,12 @@ def test_drive_q_refuses_a_documented_term_it_holds_no_fact_for(tmp_path):
             assert err["errors"][0]["location"] == "q"
 
 
-def test_drive_q_shapes_clients_send_still_parse(tmp_path):
+def test_drive_q_shapes_clients_send_still_parse(q_corpus):
     """The shapes clients send, spaces and all — mirage's `'<id>' in parents and trashed=false` is
     the first — plus a bare `sharedWithMe`, keywords in either case, `in owners`, and a phrase and
     an `or` around `fullText`, whose index answer is a membership test rather than a pre-filter."""
-    from tests._helpers import corpus_client
-
-    with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
+    settings = q_corpus
+    with client_for(settings) as client:
         h = {"Authorization": f"Bearer {settings.admin_token}"}
         for q, expected in (
             ("'root' in parents and trashed=false", {"mk", "fin"}),
@@ -8703,14 +8726,13 @@ def test_drive_q_shapes_clients_send_still_parse(tmp_path):
             assert {f["name"] for f in r.json()["files"]} == expected, q
 
 
-def test_drive_q_me_is_the_caller(tmp_path):
+def test_drive_q_me_is_the_caller(q_corpus):
     """`'me' in owners` is the caller's own files and `not 'me' in owners` everyone else's, resolved
     through the identity `sharedWithMe` reads."""
     import yaml
 
-    from tests._helpers import corpus_client
-
-    with corpus_client(tmp_path, _Q_RECORDS) as (client, settings):
+    settings = q_corpus
+    with client_for(settings) as client:
         tokens = {
             u["email"]: u["token"]
             for u in yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))["users"]
@@ -11804,23 +11826,23 @@ _GMAIL_CC_BCC_ROWS = [
 ]
 
 
-@pytest.mark.parametrize("caller", ["ava", "admin"])
-def test_gmail_cc_bcc_searches_address_headers(tmp_path, caller):
-    """The rule `_gmail_address_match` records, on both listings: a message whose body or subject
-    names the address is not a match. `me` is the caller's address, and for the admin token, which
-    has no mailbox of its own, the address `_service_email` gives."""
-    records = [
-        {
-            "doc_id": "plan",
-            "title": "rollout plan",
-            "cc": "Lena Park <lena@acme.com>, ava@acme.com",
-        },
-        {"doc_id": "lunch", "title": "lunch", "bcc": "\uc5d0\ubc14 <ava@acme.com>"},
-        {"doc_id": "decoy", "title": "cc lena bcc ava", "content": "lena ava"},
-        {"doc_id": "standup", "title": "standup", "cc": "ops_team@corp.example, me@corp.example"},
-    ]
-    settings = tiny_corpus(
-        tmp_path,
+_GMAIL_CC_BCC_RECORDS = [
+    {
+        "doc_id": "plan",
+        "title": "rollout plan",
+        "cc": "Lena Park <lena@acme.com>, ava@acme.com",
+    },
+    {"doc_id": "lunch", "title": "lunch", "bcc": "\uc5d0\ubc14 <ava@acme.com>"},
+    {"doc_id": "decoy", "title": "cc lena bcc ava", "content": "lena ava"},
+    {"doc_id": "standup", "title": "standup", "cc": "ops_team@corp.example, me@corp.example"},
+]
+
+
+@pytest.fixture(scope="module")
+def cc_bcc_mailbox(tmp_path_factory):
+    """`_GMAIL_CC_BCC_RECORDS` in ava's mailbox."""
+    return tiny_corpus(
+        tmp_path_factory.mktemp("cc_bcc_mailbox"),
         [
             {
                 "source_type": "gmail",
@@ -11833,13 +11855,21 @@ def test_gmail_cc_bcc_searches_address_headers(tmp_path, caller):
                 "readers": ["ava@acme.com"],
                 **r,
             }
-            for r in records
+            for r in _GMAIL_CC_BCC_RECORDS
         ],
     )
+
+
+@pytest.mark.parametrize("caller", ["ava", "admin"])
+def test_gmail_cc_bcc_searches_address_headers(cc_bcc_mailbox, caller):
+    """The rule `_gmail_address_match` records, on both listings: a message whose body or subject
+    names the address is not a match. `me` is the caller's address, and for the admin token, which
+    has no mailbox of its own, the address `_service_email` gives."""
+    settings = cc_bcc_mailbox
     tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
     token = tokens["admin_token"] if caller == "admin" else tok(tokens, "ava@acme.com")
     rows = [(query, expected) for who, query, expected in _GMAIL_CC_BCC_ROWS if who == caller]
-    assert _gmail_searched(settings, token, records, rows) == _gmail_listed(rows)
+    assert _gmail_searched(settings, token, _GMAIL_CC_BCC_RECORDS, rows) == _gmail_listed(rows)
 
 
 _GMAIL_FROM_TO_ROWS = [
@@ -11904,45 +11934,44 @@ _GMAIL_FROM_TO_ROWS = [
 ]
 
 
-@pytest.mark.parametrize("caller", ["ava", "admin"])
-def test_gmail_from_to_searches_address_headers(tmp_path, caller):
-    """A `from:` search matches author email, and `to:` matches any recipient header (To, Cc, or
-    Bcc) as whole words or address. `me` resolves to the caller's address, and for admin callers,
-    the address `_service_email` gives. Empty address operators are ignored, and a `-` in front of
-    an operator or its value negates it (`_GMAIL_NEGATED_ADDRESS`)."""
-    records = [
-        {
-            "doc_id": "plan",
-            "title": "Rollout plan",
-            "content": "attached",
-            "author_email": "bob@acme.com",
-            "to": "ava@acme.com",
-            "readers": ["ava@acme.com"],
-            "created": "2026-03-01T09:00:00Z",
-        },
-        {
-            "doc_id": "lunch",
-            "title": "Lunch",
-            "content": "Friday?",
-            "author_email": "mia@acme.com",
-            "to": "lena@acme.com",
-            "bcc": "ava@acme.com",
-            "readers": ["ava@acme.com"],
-            "created": "2026-03-02T09:00:00Z",
-        },
-        {
-            "doc_id": "reply",
-            "title": "Re: Rollout plan",
-            "content": "ok",
-            "author_email": "ava@acme.com",
-            "to": "bob@acme.com",
-            "cc": "dev@acme.com",
-            "readers": ["ava@acme.com"],
-            "created": "2026-03-03T09:00:00Z",
-        },
-    ]
-    settings = tiny_corpus(
-        tmp_path,
+_GMAIL_FROM_TO_RECORDS = [
+    {
+        "doc_id": "plan",
+        "title": "Rollout plan",
+        "content": "attached",
+        "author_email": "bob@acme.com",
+        "to": "ava@acme.com",
+        "readers": ["ava@acme.com"],
+        "created": "2026-03-01T09:00:00Z",
+    },
+    {
+        "doc_id": "lunch",
+        "title": "Lunch",
+        "content": "Friday?",
+        "author_email": "mia@acme.com",
+        "to": "lena@acme.com",
+        "bcc": "ava@acme.com",
+        "readers": ["ava@acme.com"],
+        "created": "2026-03-02T09:00:00Z",
+    },
+    {
+        "doc_id": "reply",
+        "title": "Re: Rollout plan",
+        "content": "ok",
+        "author_email": "ava@acme.com",
+        "to": "bob@acme.com",
+        "cc": "dev@acme.com",
+        "readers": ["ava@acme.com"],
+        "created": "2026-03-03T09:00:00Z",
+    },
+]
+
+
+@pytest.fixture(scope="module")
+def from_to_mailbox(tmp_path_factory):
+    """`_GMAIL_FROM_TO_RECORDS` in ava's mailbox."""
+    return tiny_corpus(
+        tmp_path_factory.mktemp("from_to_mailbox"),
         [
             {
                 "source_type": "gmail",
@@ -11950,13 +11979,22 @@ def test_gmail_from_to_searches_address_headers(tmp_path, caller):
                 "visibility": "public",
                 **r,
             }
-            for r in records
+            for r in _GMAIL_FROM_TO_RECORDS
         ],
     )
+
+
+@pytest.mark.parametrize("caller", ["ava", "admin"])
+def test_gmail_from_to_searches_address_headers(from_to_mailbox, caller):
+    """A `from:` search matches author email, and `to:` matches any recipient header (To, Cc, or
+    Bcc) as whole words or address. `me` resolves to the caller's address, and for admin callers,
+    the address `_service_email` gives. Empty address operators are ignored, and a `-` in front of
+    an operator or its value negates it (`_GMAIL_NEGATED_ADDRESS`)."""
+    settings = from_to_mailbox
     tokens = yaml.safe_load(settings.tokens_path.read_text(encoding="utf-8"))
     token = tokens["admin_token"] if caller == "admin" else tok(tokens, f"{caller}@acme.com")
     rows = [(query, expected) for who, query, expected in _GMAIL_FROM_TO_ROWS if who == caller]
-    assert _gmail_searched(settings, token, records, rows) == _gmail_listed(rows)
+    assert _gmail_searched(settings, token, _GMAIL_FROM_TO_RECORDS, rows) == _gmail_listed(rows)
 
 
 _GMAIL_EMPTY_OPERATOR_ROWS = [

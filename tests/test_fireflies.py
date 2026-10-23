@@ -719,11 +719,6 @@ def test_fireflies_declares_no_mutations(client, admin_h):
     assert r.json()["data"]["__schema"]["mutationType"] is None
 
 
-def _fireflies_client(tmp_path):
-    """Same, over FIREFLIES_CORPUS."""
-    return corpus_client(tmp_path, FIREFLIES_CORPUS)
-
-
 # --- fireflies -------------------------------------------------------------------
 # Fireflies' shape differs from every other GraphQL source here in two ways that clients depend
 # on: snake_case field names, and offset pagination returning a BARE LIST rather than a Relay
@@ -766,17 +761,24 @@ FIREFLIES_CORPUS = [
 ]
 
 
+@pytest.fixture(scope="module")
+def fireflies_corpus(tmp_path_factory):
+    """FIREFLIES_CORPUS built."""
+    return tiny_corpus(tmp_path_factory.mktemp("fireflies_corpus"), FIREFLIES_CORPUS)
+
+
 def _ff(client, settings, query, **variables):
     return gql(
         client, "/fireflies/graphql", query, f"Bearer {settings.admin_token}", **variables
     ).json()
 
 
-def test_fireflies_accepts_the_vendors_documented_raw_http_post(tmp_path):
+def test_fireflies_accepts_the_vendors_documented_raw_http_post(fireflies_corpus):
     """There is no Fireflies SDK: the vendor's quickstart is curl / requests.post / axios.post /
     Java HttpClient against one endpoint with a Bearer key. That IS the client story, so the exact
     shape those examples send has to work."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         r = client.post(
             "/fireflies/graphql",
             json={
@@ -793,10 +795,11 @@ def test_fireflies_accepts_the_vendors_documented_raw_http_post(tmp_path):
         assert r.json()["data"]["transcripts"][0]["title"] == "Fidelity discovery call"
 
 
-def test_fireflies_transcripts_is_a_bare_list_not_a_relay_connection(tmp_path):
+def test_fireflies_transcripts_is_a_bare_list_not_a_relay_connection(fireflies_corpus):
     """Fireflies pages with limit/skip. Wrapping it in `{ nodes, pageInfo }` — the shape every
     other GraphQL source here uses — would break every generated client."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         got = _ff(client, settings, "{ transcripts(limit: 5) { id } }")
         assert isinstance(got["data"]["transcripts"], list)
         # asking for a connection's fields must be a validation error, i.e. they do not exist
@@ -804,9 +807,10 @@ def test_fireflies_transcripts_is_a_bare_list_not_a_relay_connection(tmp_path):
         assert "data" not in bad and bad["errors"]
 
 
-def test_fireflies_field_names_are_snake_case(tmp_path):
+def test_fireflies_field_names_are_snake_case(fireflies_corpus):
     """Fireflies' own convention, not a translation — a camelCase spelling must NOT resolve."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         ok = _ff(
             client,
             settings,
@@ -824,19 +828,21 @@ def test_fireflies_field_names_are_snake_case(tmp_path):
             assert "data" not in bad and bad["errors"], camel
 
 
-def test_fireflies_duration_is_minutes(tmp_path):
+def test_fireflies_duration_is_minutes(fireflies_corpus):
     """The API's unit. Serving seconds would make every meeting read as 60x too long."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         t = _ff(client, settings, "{ transcripts(limit: 1) { duration } }")["data"]["transcripts"][
             0
         ]
         assert t["duration"] == 45.0
 
 
-def test_fireflies_action_items_are_a_newline_joined_string(tmp_path):
+def test_fireflies_action_items_are_a_newline_joined_string(fireflies_corpus):
     """Fireflies returns `summary.action_items` as ONE string, not a list — a client doing
     `.split("\\n")` on it must not get a JSON array."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         s = _ff(
             client,
             settings,
@@ -850,10 +856,11 @@ def test_fireflies_action_items_are_a_newline_joined_string(tmp_path):
         assert s["meeting_type"] == "discovery"
 
 
-def test_fireflies_sentence_times_are_seconds_while_duration_is_minutes(tmp_path):
+def test_fireflies_sentence_times_are_seconds_while_duration_is_minutes(fireflies_corpus):
     """The two units really do differ in the real API; a server that made them agree would look
     tidier and be wrong."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         t = _ff(
             client,
             settings,
@@ -864,8 +871,9 @@ def test_fireflies_sentence_times_are_seconds_while_duration_is_minutes(tmp_path
         assert t["sentences"][-1]["end_time"] <= t["duration"] * 60
 
 
-def test_fireflies_speaker_id_is_an_integer_scoped_to_the_meeting(tmp_path):
-    with _fireflies_client(tmp_path) as (client, settings):
+def test_fireflies_speaker_id_is_an_integer_scoped_to_the_meeting(fireflies_corpus):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         sents = _ff(
             client,
             settings,
@@ -919,10 +927,11 @@ def test_fireflies_a_page_costs_the_same_queries_as_one_transcript(tmp_path):
         assert queries("{ transcripts(limit: 5) { channels { id members { email } } } }") == 2
 
 
-def test_fireflies_stubbed_fields_are_null_not_invented(tmp_path):
+def test_fireflies_stubbed_fields_are_null_not_invented(fireflies_corpus):
     """The SDL declares more than a document corpus can back. Everything unbacked must be null —
     an invented sentiment or classifier flag is worse than an honest gap."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         t = _ff(
             client,
             settings,
@@ -953,10 +962,11 @@ def test_fireflies_stubbed_fields_are_null_not_invented(tmp_path):
         assert t["user"]["minutes_consumed"] is None and t["user"]["is_admin"] is None
 
 
-def test_fireflies_analytics_sentiments_sum_to_one_hundred(tmp_path):
+def test_fireflies_analytics_sentiments_sum_to_one_hundred(fireflies_corpus):
     """Synthesized, never derived from the text — but it still has to be internally coherent, or a
     consumer charting it gets nonsense."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         s = _ff(
             client,
             settings,
@@ -967,10 +977,11 @@ def test_fireflies_analytics_sentiments_sum_to_one_hundred(tmp_path):
         assert all(v >= 0 for v in s.values())
 
 
-def test_fireflies_speaker_analytics_are_computed_from_the_sentences(tmp_path):
+def test_fireflies_speaker_analytics_are_computed_from_the_sentences(fireflies_corpus):
     """Talk time and word counts ARE derivable from the transcript, so unlike sentiment they are
     real rather than synthesized."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         t = _ff(
             client,
             settings,
@@ -986,11 +997,12 @@ def test_fireflies_speaker_analytics_are_computed_from_the_sentences(tmp_path):
         assert by_name["Ava Chen"]["duration"] == 20.0  # 0 -> 20, its own window
 
 
-def test_fireflies_speaker_shares_sum_to_one_hundred(tmp_path):
+def test_fireflies_speaker_shares_sum_to_one_hundred(fireflies_corpus):
     """`duration_pct` shares out the TALK TIME, not the declared meeting length: a corpus
     transcript often does not span its whole meeting, and dividing by the declared length emits
     shares summing to ~4%, which reads as a bug in anything that charts them."""
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         speakers = _ff(
             client,
             settings,
@@ -1002,12 +1014,13 @@ def test_fireflies_speaker_shares_sum_to_one_hundred(tmp_path):
         assert sum(s["duration"] for s in speakers) < 45 * 60
 
 
-def test_fireflies_no_openapi_entry_for_the_graphql_route(tmp_path):
+def test_fireflies_no_openapi_entry_for_the_graphql_route(fireflies_corpus):
     """Describing one POST that accepts an arbitrary query tells an OpenAPI->MCP bridge nothing,
     so the route is deliberately absent from the document (and from SOURCE_PREFIXES)."""
     from backlot import openapi
 
-    with _fireflies_client(tmp_path) as (client, settings):
+    settings = fireflies_corpus
+    with client_for(settings) as client:
         spec = client.get("/openapi.json").json()
         assert not [p for p in spec["paths"] if p.startswith("/fireflies")]
         assert "fireflies" not in openapi.SOURCE_PREFIXES

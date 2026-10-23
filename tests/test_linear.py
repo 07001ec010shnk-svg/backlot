@@ -1958,21 +1958,11 @@ def test_linear_root_connections_reject_sort_with_order_by(client, admin_h):
 # --- Linear relations / children / attachments / releases -----------------------
 
 
-@pytest.mark.parametrize(
-    ("args", "served"),
-    [
-        ("", ["ENG-3", "ENG-2"]),
-        ("(orderBy: createdAt)", ["ENG-3", "ENG-2"]),
-        ("(orderBy: updatedAt)", ["ENG-2", "ENG-3"]),
-        ("(first: 1)", ["ENG-3"]),
-        ("(last: 1)", ["ENG-2"]),
-    ],
-)
-def test_linear_children_are_newest_first(tmp_path, args, served):
-    """Each row is an issue's `children` in the order the comment on `LINEAR_DEFAULT_ORDER_BY`
-    records; `ENG-2` was created first and edited last, so the two fields disagree."""
-    settings = build_corpus(
-        tmp_path,
+@pytest.fixture(scope="module")
+def two_children(tmp_path_factory):
+    """ENG-1 and its two children, ENG-2 created first and edited last, ENG-3 the reverse."""
+    return build_corpus(
+        tmp_path_factory.mktemp("two_children"),
         [
             {
                 "source_type": "linear",
@@ -2016,6 +2006,22 @@ def test_linear_children_are_newest_first(tmp_path, args, served):
             },
         ],
     )
+
+
+@pytest.mark.parametrize(
+    ("args", "served"),
+    [
+        ("", ["ENG-3", "ENG-2"]),
+        ("(orderBy: createdAt)", ["ENG-3", "ENG-2"]),
+        ("(orderBy: updatedAt)", ["ENG-2", "ENG-3"]),
+        ("(first: 1)", ["ENG-3"]),
+        ("(last: 1)", ["ENG-2"]),
+    ],
+)
+def test_linear_children_are_newest_first(two_children, args, served):
+    """Each row is an issue's `children` in the order the comment on `LINEAR_DEFAULT_ORDER_BY`
+    records; `ENG-2` was created first and edited last, so the two fields disagree."""
+    settings = two_children
     query = '{ issue(id: "ENG-1") { children%s { nodes { identifier } } } }' % args
     with client_for(settings) as client:
         body = gql(client, query, {"Authorization": settings.admin_token}).json()
@@ -4559,19 +4565,9 @@ LINEAR_CORPUS = [
 ]
 
 
-@pytest.mark.parametrize(
-    "caller, unassigned",
-    [
-        ("mia@acme.com", "mia/eng-2-rotate-the-signing-keys"),
-        # the admin token has no address, so there is no user segment
-        ("admin", "eng-2-rotate-the-signing-keys"),
-    ],
-)
-def test_an_unassigned_issue_branch_name_starts_with_the_callers_handle(
-    tmp_path, caller, unassigned
-):
-    """An issue with no assignee takes the caller's email local part as its branch prefix.
-    An assigned issue keeps the assignee's local part in front of the same slug."""
+@pytest.fixture(scope="module")
+def assigned_and_unassigned(tmp_path_factory):
+    """ENG-1 assigned to raj and ENG-2 unassigned, both titled alike."""
     records = [
         {
             "source_type": "linear",
@@ -4597,7 +4593,24 @@ def test_an_unassigned_issue_branch_name_starts_with_the_callers_handle(
             "created": "2026-02-01T09:00:00Z",
         },
     ]
-    with corpus_client(tmp_path, records) as (client, settings):
+    return build_corpus(tmp_path_factory.mktemp("assigned_and_unassigned"), records)
+
+
+@pytest.mark.parametrize(
+    "caller, unassigned",
+    [
+        ("mia@acme.com", "mia/eng-2-rotate-the-signing-keys"),
+        # the admin token has no address, so there is no user segment
+        ("admin", "eng-2-rotate-the-signing-keys"),
+    ],
+)
+def test_an_unassigned_issue_branch_name_starts_with_the_callers_handle(
+    assigned_and_unassigned, caller, unassigned
+):
+    """An issue with no assignee takes the caller's email local part as its branch prefix.
+    An assigned issue keeps the assignee's local part in front of the same slug."""
+    settings = assigned_and_unassigned
+    with client_for(settings) as client:
         users = client.get("/_meta/users").json()["users"]
         if caller == "admin":
             token = settings.admin_token
@@ -5164,15 +5177,9 @@ _BACKWARD_ROOTS = {
 }
 
 
-@pytest.mark.parametrize("root", list(_BACKWARD_ROOTS))
-def test_linear_backward_pages_name_the_served_nodes(tmp_path, root):
-    """The measurement on ``linear_resolvers._connection`` covers these connections.
-
-    Its before endCursor continues backward; before startCursor overlaps the preceding page.
-    Distinct timestamps make position independent of database tie ordering. ENG-1 holds eight
-    comments, labels and attachments, a relation to each other issue and one release, every other
-    issue a relation to ENG-2, and each team past the first one issue.
-    """
+@pytest.fixture(scope="module")
+def backward_pages(tmp_path_factory):
+    """The corpus `test_linear_backward_pages_name_the_served_nodes` describes."""
     records = [
         {
             "source_type": "linear",
@@ -5219,7 +5226,19 @@ def test_linear_backward_pages_name_the_served_nodes(tmp_path, root):
         }
         for i in range(1, 8)
     ]
-    settings = build_corpus(tmp_path, records)
+    return build_corpus(tmp_path_factory.mktemp("backward_pages"), records)
+
+
+@pytest.mark.parametrize("root", list(_BACKWARD_ROOTS))
+def test_linear_backward_pages_name_the_served_nodes(backward_pages, root):
+    """The measurement on ``linear_resolvers._connection`` covers these connections.
+
+    Its before endCursor continues backward; before startCursor overlaps the preceding page.
+    Distinct timestamps make position independent of database tie ordering. ENG-1 holds eight
+    comments, labels and attachments, a relation to each other issue and one release, every other
+    issue a relation to ENG-2, and each team past the first one issue.
+    """
+    settings = backward_pages
     with client_for(settings) as client:
 
         def page(args):

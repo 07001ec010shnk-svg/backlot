@@ -17,7 +17,7 @@ import pytest
 from backlot import store, synth
 from backlot.routers.notion import DATA_SOURCES_VERSION, PUBLISHED_VERSIONS
 from backlot.routers.notion import router as notion_router
-from tests._helpers import corpus_client, sent_as, served_id, tiny_corpus, tok
+from tests._helpers import client_for, sent_as, served_id, tiny_corpus, tok
 
 
 @pytest.fixture
@@ -1483,9 +1483,11 @@ def test_notion_responses_unchanged_by_enrichment(client, notion_h):
 # --- Notion ---------------------------------------------------------------------
 
 
-def _notion_conn(tmp_path):
+@pytest.fixture(scope="module")
+def notion_conn(tmp_path_factory):
+    """A read-only connection to a page with a comment, a database and one row of it."""
     s = tiny_corpus(
-        tmp_path,
+        tmp_path_factory.mktemp("notion_conn"),
         [
             {
                 "source_type": "notion",
@@ -1522,13 +1524,15 @@ def _notion_conn(tmp_path):
             },
         ],
     )
-    return store.connect_ro(s.db_path)
+    conn = store.connect_ro(s.db_path)
+    yield conn
+    conn.close()
 
 
-def test_notion_page_shape(tmp_path):
+def test_notion_page_shape(notion_conn):
     from backlot.routers.notion import _page_obj
 
-    conn = _notion_conn(tmp_path)
+    conn = notion_conn
     obj = _page_obj(conn, store.get_document(conn, "notion", served_id("notion", "nf-page")))
     assert obj["object"] == "page"
     assert obj["id"] == synth.notion_id("nf-page")
@@ -1548,10 +1552,10 @@ def test_notion_page_shape(tmp_path):
     assert row["properties"]["Status"]["select"]["name"] == "In Progress"
 
 
-def test_notion_database_and_data_source_shape(tmp_path):
+def test_notion_database_and_data_source_shape(notion_conn):
     from backlot.routers.notion import _data_source_obj, _database_obj
 
-    conn = _notion_conn(tmp_path)
+    conn = notion_conn
     dbrow = store.get_document(conn, "notion", served_id("notion", "nf-db"))
     new = _database_obj(conn, dbrow, "2025-09-03")
     assert new["object"] == "database"
@@ -1564,10 +1568,10 @@ def test_notion_database_and_data_source_shape(tmp_path):
     assert ds["object"] == "data_source" and ds["properties"]["title"]["type"] == "title"
 
 
-def test_notion_user_and_block_shape(tmp_path):
+def test_notion_user_and_block_shape(notion_conn):
     from backlot.routers.notion import _user_obj
 
-    conn = _notion_conn(tmp_path)
+    conn = notion_conn
     u = _user_obj(conn, "ava@acme.com")
     assert u["object"] == "user" and u["type"] == "person"
     assert list(u["person"]) == ["email", "email_verified"]
@@ -1818,6 +1822,13 @@ _PARENT_RECORDS = [
     },
 ]
 
+
+@pytest.fixture(scope="module")
+def parent_corpus(tmp_path_factory):
+    """`_PARENT_RECORDS` built."""
+    return tiny_corpus(tmp_path_factory.mktemp("parent_corpus"), _PARENT_RECORDS)
+
+
 _PARENT_ROWS = [
     # label, the record, version, its parent on the page and on its block alike
     ("page under a page", "nf-child", "2025-09-03", {"type": "page_id", "page_id": "nf-parent"}),
@@ -1838,13 +1849,14 @@ _PARENT_ROWS = [
 ]
 
 
-def test_notion_a_page_and_its_block_name_the_parent_the_version_reads(tmp_path):
+def test_notion_a_page_and_its_block_name_the_parent_the_version_reads(parent_corpus):
     def served(value):
         if value.startswith("ds:"):
             return synth.notion_data_source_id(value[3:])
         return served_id("notion", value)
 
-    with corpus_client(tmp_path, _PARENT_RECORDS) as (client, settings):
+    settings = parent_corpus
+    with client_for(settings) as client:
         for label, doc, version, parent in _PARENT_ROWS:
             h = {"Authorization": f"Bearer {settings.admin_token}", "Notion-Version": version}
             expected = {k: served(v) if k.endswith("_id") else v for k, v in parent.items()}
@@ -1890,8 +1902,9 @@ def test_notion_url_is_the_app_host_and_a_data_source_names_its_databases(client
     )
 
 
-def test_notion_a_page_its_blocks_and_a_data_source_answer_millisecond_timestamps(tmp_path):
-    with corpus_client(tmp_path, _PARENT_RECORDS) as (client, settings):
+def test_notion_a_page_its_blocks_and_a_data_source_answer_millisecond_timestamps(parent_corpus):
+    settings = parent_corpus
+    with client_for(settings) as client:
         h = {"Authorization": f"Bearer {settings.admin_token}", "Notion-Version": "2025-09-03"}
         page = served_id("notion", "nf-parent")
         answers = [
@@ -4172,6 +4185,12 @@ _PAGING_RECORDS = [
 ]
 
 
+@pytest.fixture(scope="module")
+def paging_corpus(tmp_path_factory):
+    """`_PAGING_RECORDS` built."""
+    return tiny_corpus(tmp_path_factory.mktemp("paging_corpus"), _PAGING_RECORDS)
+
+
 def _lister(route: str):
     """How to ask one list for a page: a function of the client, the headers and the paging members,
     answering the response."""
@@ -4191,12 +4210,13 @@ def _lister(route: str):
 
 
 @pytest.mark.parametrize("route", ["users", "children", "comments", "search", "query"])
-def test_notion_a_cursor_starts_the_page_at_the_item_it_names(tmp_path, route):
+def test_notion_a_cursor_starts_the_page_at_the_item_it_names(paging_corpus, route):
     """The page a cursor asks for starts with the item it names, and the cursor after a page is the
     next item's id (``routers.notion._start``). A cursor naming nothing is refused, `comments` with
     the three members real adds there."""
     ask = _lister(route)
-    with corpus_client(tmp_path, _PAGING_RECORDS) as (client, settings):
+    settings = paging_corpus
+    with client_for(settings) as client:
         h = {
             "Authorization": f"Bearer {settings.admin_token}",
             "Notion-Version": DATA_SOURCES_VERSION,
@@ -4254,11 +4274,12 @@ def test_notion_a_cursor_starts_the_page_at_the_item_it_names(tmp_path, route):
         ("search", {"query": "zzzqqq", "page_size": -1}, "nothing"),
     ],
 )
-def test_notion_a_page_is_as_long_as_real_reads_its_page_size(tmp_path, route, members, shown):
+def test_notion_a_page_is_as_long_as_real_reads_its_page_size(paging_corpus, route, members, shown):
     """Real's page for each `page_size`, as ``routers.notion._size`` reads it; the trash holds
     nothing here, and a data source holds no data source."""
     ask = _lister(route)
-    with corpus_client(tmp_path, _PAGING_RECORDS) as (client, settings):
+    settings = paging_corpus
+    with client_for(settings) as client:
         h = {
             "Authorization": f"Bearer {settings.admin_token}",
             "Notion-Version": DATA_SOURCES_VERSION,
@@ -4280,11 +4301,12 @@ def test_notion_a_page_is_as_long_as_real_reads_its_page_size(tmp_path, route, m
             ]
 
 
-def test_notion_data_source_query_reads_its_cursor_as_real_does(tmp_path):
+def test_notion_data_source_query_reads_its_cursor_as_real_does(paging_corpus):
     """Each spelling of a data source query's cursor, as ``routers.notion._row_start`` reads it:
     where the page starts, or what the refusal names, and the cursor after it."""
     ds = synth.notion_data_source_id("np-db")
-    with corpus_client(tmp_path, _PAGING_RECORDS) as (client, settings):
+    settings = paging_corpus
+    with client_for(settings) as client:
         h = {
             "Authorization": f"Bearer {settings.admin_token}",
             "Notion-Version": DATA_SOURCES_VERSION,
@@ -4355,7 +4377,9 @@ def test_notion_a_cursor_naming_a_page_the_caller_cannot_see_names_nothing(
 
 
 @pytest.mark.parametrize("value", ["page", "data_source", None])
-def test_notion_search_fills_a_page_of_the_object_type_it_filters_to(tmp_path, monkeypatch, value):
+def test_notion_search_fills_a_page_of_the_object_type_it_filters_to(
+    paging_corpus, monkeypatch, value
+):
     """A page of one object type, or of any with no filter, holds the next results and names the
     one after it, an empty page names the first, and a cursor starts at its result wherever that
     sits in the corpus. With the window ``routers.notion._OVERFETCH`` sizes cut to the page and one
@@ -4364,7 +4388,8 @@ def test_notion_search_fills_a_page_of_the_object_type_it_filters_to(tmp_path, m
     from backlot.routers import notion as notion_routes
 
     monkeypatch.setattr(notion_routes, "_OVERFETCH", 1)
-    with corpus_client(tmp_path, _PAGING_RECORDS) as (client, settings):
+    settings = paging_corpus
+    with client_for(settings) as client:
         h = {
             "Authorization": f"Bearer {settings.admin_token}",
             "Notion-Version": DATA_SOURCES_VERSION,
@@ -4397,13 +4422,14 @@ def test_notion_search_fills_a_page_of_the_object_type_it_filters_to(tmp_path, m
     ],
 )
 def test_notion_search_starts_at_a_database_by_the_ids_its_version_reads(
-    tmp_path, version, by, starts
+    paging_corpus, version, by, starts
 ):
     """Real's search starts at a database named by the id each version lists it under, and under
     2022-06-28 by its data source's too."""
     db, ds = synth.notion_id("np-db"), synth.notion_data_source_id("np-db")
     listed = ds if version == DATA_SOURCES_VERSION else db
-    with corpus_client(tmp_path, _PAGING_RECORDS) as (client, settings):
+    settings = paging_corpus
+    with client_for(settings) as client:
         h = {"Authorization": f"Bearer {settings.admin_token}", "Notion-Version": version}
         body = {"start_cursor": db if by == "database" else ds, "page_size": 1}
         r = client.post("/notion/v1/search", json=body, headers=h)
