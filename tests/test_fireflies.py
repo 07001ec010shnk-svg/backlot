@@ -85,33 +85,35 @@ _FIREFLIES_BYTES = {
 }
 
 
-def _fireflies_credentials() -> list:
-    """`_FIREFLIES_SPELLINGS`, then each of `SWEPT_BYTES` in each place `_FIREFLIES_BYTES` names,
-    less the values the table already holds."""
-    rows = list(_FIREFLIES_SPELLINGS)
-    seen = {row.values[0] for row in rows}
-    for shape, (served, refusal) in _FIREFLIES_BYTES.items():
-        for byte in SWEPT_BYTES:
-            value = shape.replace("{x}", chr(byte))
-            if value not in seen:
-                seen.add(value)
-                answer = None if byte in served else refusal
-                rows.append(pytest.param(value, answer, id=f"{shape} {byte:#04x}"))
-    return rows
-
-
-@pytest.mark.parametrize("value, refusal", _fireflies_credentials())
-def test_fireflies_reads_a_credential_as_fireflies_does(client, tokens_yaml, value, refusal):
+def _fireflies_answer(client, tokens_yaml, value: str | None) -> bytes | None:
+    """The 500 `Authorization: value` draws, `{t}` the admin key and None for no header, or None
+    where it serves the query."""
     headers = {"Content-Type": "application/json"}
     if value is not None:
         headers["Authorization"] = value.replace("{t}", tokens_yaml["admin_token"])
     r = sent_as(
         client, "POST", "/fireflies/graphql", headers, content=b'{"query":"{ __typename }"}'
     )
-    if refusal is None:
-        assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
-    else:
-        assert (r.status_code, r.content) == (500, refusal)
+    if r.status_code == 500:
+        return r.content
+    assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
+    return None
+
+
+@pytest.mark.parametrize("value, refusal", _FIREFLIES_SPELLINGS)
+def test_fireflies_reads_a_credential_as_fireflies_does(client, tokens_yaml, value, refusal):
+    assert _fireflies_answer(client, tokens_yaml, value) == refusal
+
+
+def test_fireflies_reads_a_swept_byte_as_fireflies_does(client, tokens_yaml):
+    """Each of `SWEPT_BYTES` in each place `_FIREFLIES_BYTES` names draws the answer Fireflies gave
+    it."""
+    expected = {
+        shape.replace("{x}", chr(byte)): None if byte in served else refusal
+        for shape, (served, refusal) in _FIREFLIES_BYTES.items()
+        for byte in SWEPT_BYTES
+    }
+    assert {value: _fireflies_answer(client, tokens_yaml, value) for value in expected} == expected
 
 
 # --- a body Fireflies reads ahead of the credential ----------------------------------------------
@@ -310,18 +312,29 @@ _FIREFLIES_BODIES = [
 
 # Each credential the body table is sent with, and the 500 a body Fireflies reads draws under it.
 _BODY_CREDENTIALS = {"key": None, "none": _BAD_KEY, "Bearer nope": _BAD_KEY, "nope": _NO_PREFIX}
+# The rows every credential but the key is sent with: one for each `_body_refusal` (`_NOT_JSON` for
+# a body that does not parse and for a poisoned one, `_EMPTY`, `_TOO_LARGE`), one it serves, and a
+# `_REQUEST_ERROR` row.
+_EACH_WAY_READ = ("{", "__proto__ key", "empty", "past the limit", "a query", "an array")
 
 
-@pytest.mark.parametrize("credential", _BODY_CREDENTIALS)
-@pytest.mark.parametrize(
-    "headers,body,answer",
-    [pytest.param((), *row.values, id=row.id) for row in _FIREFLIES_BODIES] + _FIREFLIES_READS,
-)
+def _fireflies_body_cases() -> list:
+    rows = [pytest.param((), *row.values, id=row.id) for row in _FIREFLIES_BODIES]
+    rows += _FIREFLIES_READS
+    return [
+        pytest.param(credential, *row.values, id=f"{row.id}-{credential}")
+        for credential in _BODY_CREDENTIALS
+        for row in rows
+        if credential == "key" or row.id in _EACH_WAY_READ
+    ]
+
+
+@pytest.mark.parametrize("credential,headers,body,answer", _fireflies_body_cases())
 def test_fireflies_reads_the_body_before_the_credential(
     client, admin_h, credential, headers, body, answer
 ):
-    """Each row is answered as the comment over `_FIREFLIES_BODIES` says, and no credential
-    changes a `_body_refusal`."""
+    """Each row is answered as the comment over `_FIREFLIES_BODIES` says with the key, and no
+    credential changes a `_body_refusal` of `_EACH_WAY_READ`."""
     if not any(name == "Content-Type" for name, _ in headers):
         headers = (("Content-Type", "application/json"), *headers)
     if credential != "none":

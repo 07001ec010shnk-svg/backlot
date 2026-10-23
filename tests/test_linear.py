@@ -1794,19 +1794,39 @@ _LINEAR_READS = [
 
 # `Bearer` and a value in a Linear API key's shape that no account holds.
 _KEY_SHAPED = "Bearer lin_api_" + "0" * 40
-
-
-@pytest.mark.parametrize("credential", ["key", "none", "nope", "Bearer key", "Bearer, key-shaped"])
-@pytest.mark.parametrize(
-    "headers,body,answer",
-    [pytest.param((), *row.values, id=row.id) for row in _LINEAR_BODIES] + _LINEAR_READS,
+# The rows every credential but the key is sent with: one for each way `_read` refuses a body (V8's
+# words, `strict`'s, graphql-js's, a body it cannot decode, an unsupported charset, past the limit),
+# one it reads and serves, and a `_REQUEST_ERROR` row.
+_EACH_WAY_READ = (
+    "{",
+    "top-level 5",
+    "empty",
+    "gzip over a plain body",
+    "latin1",
+    "past the limit",
+    "__proto__ key",
+    "an array",
 )
+
+
+def _linear_body_cases() -> list:
+    rows = [pytest.param((), *row.values, id=row.id) for row in _LINEAR_BODIES] + _LINEAR_READS
+    return [
+        pytest.param(credential, *row.values, id=f"{row.id}-{credential}")
+        for credential in ("key", "none", "nope", "Bearer key", "Bearer, key-shaped")
+        for row in rows
+        if credential == "key" or row.id in _EACH_WAY_READ
+    ]
+
+
+@pytest.mark.parametrize("credential,headers,body,answer", _linear_body_cases())
 def test_linear_orders_the_body_and_the_credential(
     client, tokens_yaml, credential, headers, body, answer
 ):
-    """Each row answers as the comment over `_LINEAR_BODIES` says, and every refusal but a
-    `_REQUEST_ERROR` row's is the same for the key, no credential and `nope`; an API key under
-    `Bearer`, and `_KEY_SHAPED`, are `_API_KEY_AS_BEARER` ahead of every body."""
+    """Each row answers as the comment over `_LINEAR_BODIES` says with the key. Under no credential
+    and `nope`, each refusal `_EACH_WAY_READ` names is the key's, and a body the key is served or
+    `_REQUEST_ERROR` for is the 401; an API key under `Bearer`, and `_KEY_SHAPED`, are
+    `_API_KEY_AS_BEARER` ahead of each of those bodies."""
     admin = tokens_yaml["admin_token"]
     if not any(name == "Content-Type" for name, _ in headers):
         headers = (("Content-Type", "application/json"), *headers)
@@ -2687,16 +2707,15 @@ _COMMENT_OR_CELLS = [
 ]
 
 
-@pytest.mark.parametrize(
-    "literal,expected", _COMMENT_OR_CELLS, ids=[c[0] for c in _COMMENT_OR_CELLS]
-)
-def test_comment_filter_or_reads_a_branch_as_linear(fclient, literal, expected):
+def test_comment_filter_or_reads_a_branch_as_linear(fclient):
     """Linear's `or` on `CommentFilter` is the `or` `_issue_parts` compiles: the keys of one branch
     are alternatives, a branch with nothing in it is dropped, and a branch whose key constrains
     nothing makes the whole `or` constrain nothing. Compiling a branch as one conjunction, as this
     router used to, answered `{or: [{body: {eq: A}, id: {eq: B}}]}` with no comment where Linear
     answers two, and nothing in the well-formed empty list said so."""
-    assert comment_bodies(fclient, literal) == expected
+    assert {literal: comment_bodies(fclient, literal) for literal, _ in _COMMENT_OR_CELLS} == dict(
+        _COMMENT_OR_CELLS
+    )
 
 
 def test_issue_comments_connection_reads_an_or_branch_the_same_way(fclient):
@@ -3157,15 +3176,16 @@ _LABEL_CELLS = [
 ]
 
 
-@pytest.mark.parametrize("literal,expected", _LABEL_CELLS, ids=[c[0] for c in _LABEL_CELLS])
-def test_labels_quantifiers_answer_as_linear(fclient, literal, expected):
+def test_labels_quantifiers_answer_as_linear(fclient):
     """Linear pushes a negation outside the quantifier: `some` over a negative predicate is the
     complement of `every` over its positive form, so it answers an issue with no labels; and `every`
     over a positive predicate needs at least one label, so it does not. The textbook EXISTS and
     NOT EXISTS answer the opposite on both counts, which is what #112 measured over label-less
     issues. Each cell here is one measured answer; the mapping to the fixture is above
     `_LABEL_CELLS`."""
-    assert ids(fclient, "{labels: %s}" % literal) == sorted(expected)
+    assert {literal: ids(fclient, "{labels: %s}" % literal) for literal, _ in _LABEL_CELLS} == {
+        literal: sorted(expected) for literal, expected in _LABEL_CELLS
+    }
 
 
 # The whole `IssueFilter`, where an `or` branch that constrains nothing is the case that matters:
@@ -3268,14 +3288,15 @@ _ISSUE_CELLS = [
 ]
 
 
-@pytest.mark.parametrize("literal,expected", _ISSUE_CELLS, ids=[c[0] for c in _ISSUE_CELLS])
-def test_issue_filter_or_answers_a_vacuous_branch_as_linear(fclient, literal, expected):
+def test_issue_filter_or_answers_a_vacuous_branch_as_linear(fclient):
     """An `or` branch that constrains nothing is not dropped by api.linear.app: it makes the whole
     `or` constrain nothing, so `{or: [{labels: {}}, X]}` answers every issue where X alone answers
     a few. Dropping it, which the empty fragment invites, is a refusal turned into a quietly
     narrower answer. A branch with nothing in it IS dropped, and a null operand is a condition of
     its own. Each cell is one measured answer; the stand-ins are above `_ISSUE_CELLS`."""
-    assert ids(fclient, literal) == sorted(expected)
+    assert {literal: ids(fclient, literal) for literal, _ in _ISSUE_CELLS} == {
+        literal: sorted(expected) for literal, expected in _ISSUE_CELLS
+    }
 
 
 # A nullable relation's `null: true` beside other keys. api.linear.app reads nothing else in the
@@ -3323,15 +3344,14 @@ _RELATION_NULL_CELLS = [
 ]
 
 
-@pytest.mark.parametrize(
-    "literal,expected", _RELATION_NULL_CELLS, ids=[c[0] for c in _RELATION_NULL_CELLS]
-)
-def test_relation_null_true_reads_nothing_else_in_the_object_as_linear(fclient, literal, expected):
+def test_relation_null_true_reads_nothing_else_in_the_object_as_linear(fclient):
     """`null: true` on a nullable relation is not one condition among the object's keys: Linear
     answers the issues without the relation whatever else the object says, where ANDing the keys
     answers none. `null: false` does AND with them. Each cell is one measured answer; the mapping
     to the fixture is above `_RELATION_NULL_CELLS`."""
-    assert ids(fclient, literal) == sorted(expected)
+    assert {literal: ids(fclient, literal) for literal, _ in _RELATION_NULL_CELLS} == {
+        literal: sorted(expected) for literal, expected in _RELATION_NULL_CELLS
+    }
 
 
 # An `or` on a nullable relation, cell by cell, as api.linear.app answered it on 2026-09-04. The
@@ -3711,18 +3731,17 @@ def rclient(tmp_path_factory):
         yield c
 
 
-@pytest.mark.parametrize(
-    "relation,literal,expected",
-    _RELATION_OR_CELLS,
-    ids=[f"{r}: {c}" for r, c, _ in _RELATION_OR_CELLS],
-)
-def test_relation_or_reads_a_branch_as_linear(rclient, relation, literal, expected):
+def test_relation_or_reads_a_branch_as_linear(rclient):
     """An `or` on a nullable relation is not the union of its branches each read as an object:
     the keys of one branch are alternatives, a branch that says nothing about the related row
     beside one that does adds the issues without the relation, and every branch carrying
     `null: true` is those issues alone. The full rule is on `_sub_filter`; each cell is one
     measured answer, the mapping to the fixture above `_RELATION_OR_CORPUS`."""
-    assert ids(rclient, "{%s: %s}" % (relation, literal)) == sorted(expected)
+    cells = {f"{r}: {literal}": sorted(expected) for r, literal, expected in _RELATION_OR_CELLS}
+    assert {
+        f"{r}: {literal}": ids(rclient, "{%s: %s}" % (r, literal))
+        for r, literal, _ in _RELATION_OR_CELLS
+    } == cells
 
 
 def test_relation_negative_operators_do_not_shadow_the_labels_polarity_rule():
@@ -4795,28 +4814,9 @@ _LINEAR_BYTES = {
 }
 
 
-def _linear_credentials() -> list:
-    """`_LINEAR_SPELLINGS`, then each of `SWEPT_BYTES` in each place `_LINEAR_BYTES` names and
-    each of the 64 casings of the scheme, less the values the table already holds."""
-    rows = list(_LINEAR_SPELLINGS)
-    seen = {row.values[0] for row in rows}
-
-    def add(value: str, status: int, id: str) -> None:
-        if value not in seen:
-            seen.add(value)
-            rows.append(pytest.param(value, status, id=id))
-
-    for shape, answers in _LINEAR_BYTES.items():
-        for byte in SWEPT_BYTES:
-            add(shape.replace("{x}", chr(byte)), answers.get(byte, 401), f"{shape} {byte:#04x}")
-    for letters in itertools.product(*[(c, c.upper()) for c in "bearer"]):
-        scheme = "".join(letters)
-        add(f"{scheme} {{t}}", 400 if scheme in ("Bearer", "bearer") else 401, scheme)
-    return rows
-
-
-@pytest.mark.parametrize("value, status", _linear_credentials())
-def test_linear_reads_a_credential_as_linear_does(client, tokens_yaml, value, status):
+def _linear_status(client, tokens_yaml, value: str) -> int:
+    """The status `Authorization: value` draws, `{t}` the admin key, a 200 serving the query and a
+    400 being `_API_KEY_AS_BEARER`."""
     header = value.replace("{t}", tokens_yaml["admin_token"])
     r = sent_as(
         client,
@@ -4825,11 +4825,30 @@ def test_linear_reads_a_credential_as_linear_does(client, tokens_yaml, value, st
         {"Authorization": header, "Content-Type": "application/json"},
         content=b'{"query":"{ viewer { id } }"}',
     )
-    assert r.status_code == status
-    if status == 200:
+    if r.status_code == 200:
         assert r.json()["data"]["viewer"]["id"]
-    elif status == 400:
+    elif r.status_code == 400:
         assert r.content == _API_KEY_AS_BEARER
+    return r.status_code
+
+
+@pytest.mark.parametrize("value, status", _LINEAR_SPELLINGS)
+def test_linear_reads_a_credential_as_linear_does(client, tokens_yaml, value, status):
+    assert _linear_status(client, tokens_yaml, value) == status
+
+
+def test_linear_reads_a_swept_byte_and_a_casing_of_the_scheme_as_linear_does(client, tokens_yaml):
+    """Each of `SWEPT_BYTES` in each place `_LINEAR_BYTES` names, and each of the 64 casings of the
+    scheme, draws the status Linear gave it."""
+    expected = {
+        shape.replace("{x}", chr(byte)): answers.get(byte, 401)
+        for shape, answers in _LINEAR_BYTES.items()
+        for byte in SWEPT_BYTES
+    }
+    for letters in itertools.product(*[(c, c.upper()) for c in "bearer"]):
+        scheme = "".join(letters)
+        expected[f"{scheme} {{t}}"] = 400 if scheme in ("Bearer", "bearer") else 401
+    assert {value: _linear_status(client, tokens_yaml, value) for value in expected} == expected
 
 
 def test_linear_issue_asserts_rather_than_re_derive_a_missing_identifier():
@@ -5146,10 +5165,7 @@ _BACKWARD_ROOTS = {
 
 
 @pytest.mark.parametrize("root", list(_BACKWARD_ROOTS))
-@pytest.mark.parametrize(
-    "operation", ["order", "end", "start", "walk", "edges", "forward", "flags"]
-)
-def test_linear_backward_pages_name_the_served_nodes(tmp_path, root, operation):
+def test_linear_backward_pages_name_the_served_nodes(tmp_path, root):
     """The measurement on ``linear_resolvers._connection`` covers these connections.
 
     Its before endCursor continues backward; before startCursor overlaps the preceding page.
@@ -5228,46 +5244,44 @@ def test_linear_backward_pages_name_the_served_nodes(tmp_path, root, operation):
         def got(result):
             return [node["id"] for node in result["nodes"]]
 
-        if operation == "order":
-            assert got(backward) == forward[-3:][::-1]
-        elif operation == "end":
-            following = page("last: 3, before: " + lit(backward["pageInfo"]["endCursor"]))
-            assert got(following) == forward[-6:-3][::-1]
-        elif operation == "start":
-            overlapping = page("last: 3, before: " + lit(backward["pageInfo"]["startCursor"]))
-            assert got(overlapping) == forward[-4:-1][::-1]
-        elif operation == "edges":
-            first = page("first: 1")
-            assert first["pageInfo"]["startCursor"] == first["pageInfo"]["endCursor"]
-            empty = page("last: 3, before: " + lit(first["pageInfo"]["startCursor"]))
-            assert empty["nodes"] == []
-            assert empty["pageInfo"]["startCursor"] is None
-            assert empty["pageInfo"]["endCursor"] is None
-            assert got(page("last: 50")) == forward[::-1]
-        elif operation == "flags":
-            after = page("first: 1, after: " + lit(page("first: 1")["pageInfo"]["endCursor"]))
-            assert after["pageInfo"]["hasPreviousPage"] is False
-            assert after["pageInfo"]["hasNextPage"] is (len(forward) > 2)
-            before = page("last: 1, before: " + lit(backward["pageInfo"]["endCursor"]))
-            assert before["pageInfo"]["hasNextPage"] is False
-            assert before["pageInfo"]["hasPreviousPage"] is (len(forward) > 4)
-        elif operation == "forward":
-            current = page("first: 3")
-            after_first = page("first: 2, after: " + lit(current["pageInfo"]["startCursor"]))
-            assert got(after_first) == forward[1:3]
-            seen = []
-            for _ in range(len(forward) + 1):
-                seen.extend(got(current))
-                if not current["nodes"]:
-                    break
-                current = page("first: 3, after: " + lit(current["pageInfo"]["endCursor"]))
-            assert seen == forward
-        else:
-            seen = []
-            for _ in range(len(forward) + 1):
-                seen.extend(got(backward))
-                if not backward["nodes"]:
-                    break
-                backward = page("last: 3, before: " + lit(backward["pageInfo"]["endCursor"]))
-            assert seen == forward[::-1]
-            assert len(seen) == len(set(seen))
+        assert got(backward) == forward[-3:][::-1]
+
+        following = page("last: 3, before: " + lit(backward["pageInfo"]["endCursor"]))
+        assert got(following) == forward[-6:-3][::-1]
+        overlapping = page("last: 3, before: " + lit(backward["pageInfo"]["startCursor"]))
+        assert got(overlapping) == forward[-4:-1][::-1]
+
+        first = page("first: 1")
+        assert first["pageInfo"]["startCursor"] == first["pageInfo"]["endCursor"]
+        empty = page("last: 3, before: " + lit(first["pageInfo"]["startCursor"]))
+        assert empty["nodes"] == []
+        assert empty["pageInfo"]["startCursor"] is None
+        assert empty["pageInfo"]["endCursor"] is None
+        assert got(page("last: 50")) == forward[::-1]
+
+        after = page("first: 1, after: " + lit(first["pageInfo"]["endCursor"]))
+        assert after["pageInfo"]["hasPreviousPage"] is False
+        assert after["pageInfo"]["hasNextPage"] is (len(forward) > 2)
+        before = page("last: 1, before: " + lit(backward["pageInfo"]["endCursor"]))
+        assert before["pageInfo"]["hasNextPage"] is False
+        assert before["pageInfo"]["hasPreviousPage"] is (len(forward) > 4)
+
+        current = page("first: 3")
+        after_first = page("first: 2, after: " + lit(current["pageInfo"]["startCursor"]))
+        assert got(after_first) == forward[1:3]
+        seen = []
+        for _ in range(len(forward) + 1):
+            seen.extend(got(current))
+            if not current["nodes"]:
+                break
+            current = page("first: 3, after: " + lit(current["pageInfo"]["endCursor"]))
+        assert seen == forward
+
+        seen = []
+        for _ in range(len(forward) + 1):
+            seen.extend(got(backward))
+            if not backward["nodes"]:
+                break
+            backward = page("last: 3, before: " + lit(backward["pageInfo"]["endCursor"]))
+        assert seen == forward[::-1]
+        assert len(seen) == len(set(seen))
