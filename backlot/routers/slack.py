@@ -1482,6 +1482,14 @@ async def conversations_history(request: Request):
     offset = decode_cursor_or_none(_param(request, "cursor"))
     if offset is None:
         return _err("invalid_cursor")
+    # Each page is newest first. The pages walk back in time from the newest message or from
+    # `latest`, or forward from `oldest` when it is the only bound. Measured against slack.com/api
+    # on 2026-10-23 over a 330-message channel with limit=3: no bound, `oldest=0` and a `latest`
+    # past the newest message served the newest three and then the three before those; `latest`,
+    # alone or beside `oldest`, the three just before it and then the three before those; `oldest`
+    # alone, or beside a `latest` of `0` or an empty one, the three just after it and then the
+    # next three.
+    from_oldest = lo is not None and hi is None
     if lo is not None or hi is not None:  # time-bounded (e.g. a single day): filter, then paginate
         # Measured against slack.com/api on 2026-10-18: only absent, empty, "0" and
         # case-insensitive "false" exclude the bound. Other strings, including "00", "no"
@@ -1516,15 +1524,25 @@ async def conversations_history(request: Request):
         matched = [
             r
             for r in store.list_slack_top_level(
-                conn, name, ids, limit=10**9, ts_lo=lo_sec, ts_hi=hi_sec
+                conn,
+                name,
+                ids,
+                limit=10**9,
+                ts_lo=lo_sec,
+                ts_hi=hi_sec,
+                newest_first=not from_oldest,
             )
             if _in_window(r)
         ]
         total = len(matched)
         rows = matched[offset : offset + limit]
+        if from_oldest:
+            rows.reverse()
     else:
         total = store.count_slack_top_level(conn, name, ids)
-        rows = store.list_slack_top_level(conn, name, ids, limit=limit, offset=offset)
+        rows = store.list_slack_top_level(
+            conn, name, ids, limit=limit, offset=offset, newest_first=True
+        )
     messages = []
     for r in rows:
         rc = store.slack_reply_count(conn, name, r["ts"], ids) if r["thread_ts"] else 0
