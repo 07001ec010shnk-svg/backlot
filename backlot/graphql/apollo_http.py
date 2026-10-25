@@ -60,8 +60,9 @@ _JS_ANY = r"[^\n\r\u2028\u2029]"
 # negotiator's `simpleMediaTypeRegExp`.
 _S = re.escape(_JS_SPACE)
 _ACCEPT_ENTRY = re.compile(rf"[{_S}]*([^{_S}/;]+)/([^;{_S}]+)[{_S}]*(?:;({_JS_ANY}*))?\Z")
-# The literal JavaScript's `parseFloat` reads, past the white space it skips.
-_FLOAT = re.compile(r"[+-]?(?:Infinity|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)")
+# The literal JavaScript's `parseFloat` reads, past the white space it skips, each of which Python's
+# `float` reads alike.
+_FLOAT = re.compile(r"[+-]?(?:Infinity|(?:[0-9]+[.]?[0-9]*|[.][0-9]+)(?:[eE][+-]?[0-9]+)?)")
 
 
 def _js_or(*values: float) -> float:
@@ -73,16 +74,11 @@ def _js_or(*values: float) -> float:
     return values[-1]
 
 
-def _parse_float(text: str | None) -> float:
+def _parse_float(text: str) -> float:
     """JavaScript's ``parseFloat``: the longest decimal literal at the start of ``text`` past its
     white space, or ``NaN``."""
-    match = _FLOAT.match((text or "").lstrip(_JS_SPACE))
-    if text is None or match is None:
-        return math.nan
-    literal = match.group()
-    if literal.lstrip("+-") == "Infinity":
-        return -math.inf if literal.startswith("-") else math.inf
-    return float(literal)
+    match = _FLOAT.match(text.lstrip(_JS_SPACE))
+    return math.nan if match is None else float(match.group())
 
 
 def _split_quoted(text: str, separator: str) -> list[str]:
@@ -104,12 +100,12 @@ def _media_range(text: str, index: int | None) -> dict | None:
     match = _ACCEPT_ENTRY.match(text)
     if match is None:
         return None
-    params: dict[str, str | None] = {}
+    params: dict[str, str] = {}
     q = 1.0
     if match.group(3):
         for parameter in _split_quoted(match.group(3), ";"):
-            key, equals, value = parameter.strip(_JS_SPACE).partition("=")
-            value = value if equals else None
+            # A parameter with no `=` has an undefined value there, which reads as "" does.
+            key, _, value = parameter.strip(_JS_SPACE).partition("=")
             if value and value[0] == '"' and value[-1] == '"':
                 value = value[1:-1]
             if key.lower() == "q":
@@ -133,7 +129,7 @@ def _specificity(provided: dict, spec: dict, index: int) -> dict | None:
         return None
     if spec["params"]:
         if all(
-            value == "*" or (value or "").lower() == (provided["params"].get(key) or "").lower()
+            value == "*" or value.lower() == provided["params"].get(key, "").lower()
             for key, value in spec["params"].items()
         ):
             s |= 1
@@ -220,8 +216,8 @@ def mime_essence(value: str) -> str | None:
     """``whatwg-mimetype``'s ``MIMEType.parse(value).essence``: the type and subtype in lower case,
     or ``None`` where it parses none. The parameters cannot make it ``None``."""
     value = value.strip(_HTTP_SPACE)
-    type_, slash, rest = value.partition("/")
-    if not slash or not _TOKEN.fullmatch(type_):
+    type_, _, rest = value.partition("/")
+    if not _TOKEN.fullmatch(type_):
         return None
     subtype = rest.partition(";")[0].rstrip(_HTTP_SPACE)
     if not _TOKEN.fullmatch(subtype):
@@ -243,14 +239,19 @@ CSRF = (
 
 def headers_seen(raw: list[tuple[bytes, bytes]]) -> dict[str, str]:
     """The request headers as Apollo Server reads them behind Node, from the ASGI ``raw`` list:
-    each name in lower case, the values of a name sent more than once joined with ``", "`` but
-    ``content-type``'s, of which Node keeps the first, and a header with no value left out. Both
-    vendors read an empty ``Content-Type`` as none on 2026-10-25 (UTC): Linear refused a POST
-    carrying one as a POST with none, and Fireflies served a GET carrying one with the preflight
-    header, where it refuses a GET carrying a content type that is not JSON."""
+    each name in lower case and each value without the spaces and tabs at its ends, the values of
+    a name sent more than once joined with ``", "`` but ``content-type``'s, of which Node keeps the
+    first, and a header with no value left out. Both vendors answered so on 2026-10-25 (UTC):
+    `Accept` sent as `application/json` and as `text/html`, in either order, was served;
+    `apollo-require-preflight` sent empty and as `1`, in either order, let a GET through, and an
+    `x-apollo-operation-name` of a space did not; a `Content-Type` sent twice was the first to
+    Fireflies; an empty `Content-Type` was none to Linear, which refused a POST carrying one as a
+    POST with none, and to Fireflies, which served a GET carrying one with the preflight header
+    where it refuses a GET carrying one that is not JSON. Linear reads `Content-Type` on its own
+    (``backlot.routers.linear``)."""
     seen: dict[str, str] = {}
     for name, value in raw:
-        key, text = name.decode("latin-1").lower(), value.decode("latin-1")
+        key, text = name.decode("latin-1").lower(), value.decode("latin-1").strip(" \t")
         if key in seen:
             if key != "content-type":
                 seen[key] = f"{seen[key]}, {text}"

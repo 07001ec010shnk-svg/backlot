@@ -156,7 +156,7 @@ async def graphql(request: Request):
     if refusal is not None:
         return _answer(seen, engine.refused(refusal))
     token = auth.fireflies_bearer_token(request)
-    caller = None if token is None else auth.acl(request).resolve(token)
+    caller = auth.acl(request).resolve(token)
     if caller is None:
         return _auth_failed(seen, _NO_PREFIX if token is None else _BAD_KEY)
     if method == "HEAD":
@@ -182,8 +182,7 @@ async def graphql(request: Request):
     result = ENGINE.execute_payload(
         payload, context=context, on_document=_fragments_unreached, get=method == "GET"
     )
-    if not result.refusals:
-        request.state.graphql_raised = result.raised
+    request.state.graphql_raised = result.raised
     return _answer(seen, result)
 
 
@@ -215,20 +214,24 @@ _PREFLIGHT = (
 
 def _preflight(request: Request) -> Response:
     """``@fastify/cors``'s answer to an `OPTIONS`, ahead of the body and the credential: its 204,
-    with :data:`_PREFLIGHT` and `Access-Control-Request-Headers` echoed back as sent, to one
-    carrying both `Origin` and `Access-Control-Request-Method`, and its 400 to any other.
+    with :data:`_PREFLIGHT` and `Access-Control-Request-Headers` echoed back as Node reads it, to
+    one carrying both `Origin` and `Access-Control-Request-Method`, and its 400 to any other.
     api.fireflies.ai answered so with no credential and `Bearer nope`, with
     `Access-Control-Request-Method` naming `POST` or `PUT`, with `Origin: null`, and with a JSON
-    body or `{`."""
+    body or `{`; it echoed ` a , b ` as `a , b`, `a` and `b` in two copies as `a, b`, and a value
+    with a space, a tab, U+0085 or U+00A0 inside it, U+00A0 at either end or U+0085 after it, as
+    sent."""
     if "origin" not in request.headers or "access-control-request-method" not in request.headers:
         return Response(
             b"Invalid Preflight Request", status_code=400, headers={"content-type": "text/plain"}
         )
     response = Response(status_code=204)
-    asked = request.headers.get("access-control-request-headers")
-    # Node's parser drops the spaces and tabs around a header's value, where uvicorn keeps those
-    # after it.
-    echoed = () if asked is None else (("access-control-allow-headers", asked.strip(" \t")),)
+    # Node joins the copies of a header with ", ", each without the spaces and tabs at its ends,
+    # which uvicorn keeps after a value.
+    asked = ", ".join(
+        v.strip(" \t") for v in request.headers.getlist("access-control-request-headers")
+    )
+    echoed = (("access-control-allow-headers", asked),) if asked else ()
     response.raw_headers += [(k.encode(), v.encode("latin-1")) for k, v in (*_PREFLIGHT, *echoed)]
     return response
 
@@ -239,8 +242,8 @@ def _not_found(request: Request) -> Response:
     answered so each of the 28 methods of :data:`apollo_http.METHODS` but GET, HEAD, POST, OPTIONS
     and Cloudflare's three on 2026-10-25 (UTC), `PUT`, `DELETE` and `PATCH` once Fastify had read
     their body (:func:`_fastify_read`), and quoted `/graphql?x=%7B%20y&z&a=b+c` as sent."""
-    raw = request.scope.get("raw_path", request.url.path.encode()).decode("latin-1")
-    path = raw.removeprefix(router.prefix) if raw.startswith(f"{router.prefix}/") else "/graphql"
+    # The path as sent, but for the segment that names Fireflies here.
+    path = "/" + request.scope["raw_path"].decode("latin-1").split("/", 2)[2]
     query = request.scope["query_string"].decode("latin-1")
     message = f"Cannot {request.method} {path}{'?' if query else ''}{query}"
     return _body_refusal(message, 404, "not_found")

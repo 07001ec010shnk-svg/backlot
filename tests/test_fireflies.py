@@ -1363,6 +1363,15 @@ _J = (("Content-Type", "application/json"),)
 _P = (("apollo-require-preflight", "1"),)
 _PREFLIGHT_ASKED = (("Origin", "https://example.com"), ("Access-Control-Request-Method", "POST"))
 _Q = "?query=%7B%20__typename%20%7D"
+
+
+class _Chunked(bytes):
+    """A body sent in chunks, with no `Content-Length`."""
+
+    async def chunks(self):
+        yield bytes(self)
+
+
 _PAST_THE_LIMIT = b"x" * (2**20 + 10)
 _LANDING_PAGE = object()  # Apollo Server's page for a browser, `landing_page`'s
 
@@ -1525,7 +1534,32 @@ _FIREFLIES_HTTP = [
     ),
     *(
         _http_row(m, "?_=1", (*_J, *_P), None, "key", 404, _JSON_UTF8, _not_found(m, "?_=1"), id=m)
-        for m in ("PROPFIND", "QUERY", "NOTIFY", "BIND", "M-SEARCH", "SOURCE")
+        for m in (
+            "BIND",
+            "CHECKOUT",
+            "COPY",
+            "LINK",
+            "LOCK",
+            "M-SEARCH",
+            "MERGE",
+            "MKACTIVITY",
+            "MKCALENDAR",
+            "MKCOL",
+            "MOVE",
+            "NOTIFY",
+            "PROPFIND",
+            "PROPPATCH",
+            "QUERY",
+            "REBIND",
+            "REPORT",
+            "SEARCH",
+            "SOURCE",
+            "SUBSCRIBE",
+            "UNBIND",
+            "UNLINK",
+            "UNLOCK",
+            "UNSUBSCRIBE",
+        )  # fmt: skip
     ),
     _http_row(
         "PROPFIND",
@@ -1904,6 +1938,202 @@ _FIREFLIES_HTTP = [
         _not_found("PUT", ""),
         id="PUT, Accept graphql-response",
     ),
+    # Fastify reads the body of a DELETE before its 404, and leaves a type it has no parser for
+    # unread there.
+    _http_row("DELETE", "", (*_J, *_P), b"{", "key", 400, _JSON_UTF8, _NOT_JSON, id="DELETE {"),
+    _http_row(
+        "PUT",
+        "",
+        (("Content-Type", "application/graphql"), *_P),
+        _TYPENAME,
+        "key",
+        404,
+        _JSON_UTF8,
+        _not_found("PUT", ""),
+        id="PUT application/graphql",
+    ),
+    _http_row(
+        "OPTIONS",
+        "",
+        (
+            *_PREFLIGHT_ASKED,
+            ("Access-Control-Request-Headers", "a"),
+            ("Access-Control-Request-Headers", "b"),
+        ),
+        None,
+        "key",
+        204,
+        None,
+        b"",
+        id="asked twice",
+        answered={**_FIREFLIES_PREFLIGHT, "access-control-allow-headers": "a, b"},
+    ),
+    *(
+        _http_row(
+            "OPTIONS",
+            "",
+            (*_PREFLIGHT_ASKED, ("Access-Control-Request-Headers", asked)),
+            None,
+            "key",
+            204,
+            None,
+            b"",
+            id=f"asked {asked!r}",
+            answered={**_FIREFLIES_PREFLIGHT, "access-control-allow-headers": allowed},
+        )
+        for asked, allowed in (
+            ("a\xa0b", "a\xa0b"),
+            ("a b", "a b"),
+            ("a\x85b", "a\x85b"),
+            ("a\tb", "a\tb"),
+            ("a\xa0", "a\xa0"),
+            ("\xa0a", "\xa0a"),
+            ("a\x85", "a\x85"),
+            ("a\t", "a"),
+            ("a,  ,b", "a,  ,b"),
+            ("A-B, c_d", "A-B, c_d"),
+        )
+    ),
+    # A header sent twice: `Accept` and the preflight header joined, `Content-Type` the first.
+    *(
+        _http_row("POST", "", h, _TYPENAME, "key", s, _JSON_UTF8, a, id=i)
+        for h, s, a, i in (
+            (
+                (*_J, ("Accept", "application/json"), ("Accept", "text/html")),
+                200,
+                _TYPENAME_DATA,
+                "Accept json, html",
+            ),
+            (
+                (*_J, ("Accept", "text/html"), ("Accept", "application/json")),
+                200,
+                _TYPENAME_DATA,
+                "Accept html, json",
+            ),
+            (
+                (*_J, ("Content-Type", "text/plain")),
+                200,
+                _TYPENAME_DATA,
+                "Content-Type json, text/plain",
+            ),
+            ((("Content-Type", "text/plain"), *_J), 400, _CSRF, "Content-Type text/plain, json"),
+            ((*_J, ("Content-Type", "")), 200, _TYPENAME_DATA, "Content-Type json, empty"),
+            ((("Content-Type", ""), *_J), 415, _UNSUPPORTED, "Content-Type empty, json"),
+            ((*_J, *_J), 200, _TYPENAME_DATA, "Content-Type json twice"),
+            (
+                (("Content-Type", "text/plain"), ("x-apollo-operation-name", " ")),
+                400,
+                _CSRF,
+                "operation name a space",
+            ),
+        )
+    ),
+    *(
+        _http_row("GET", _Q, h, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id=i)
+        for h, i in (
+            ((("apollo-require-preflight", ""), *_P), "preflight empty, 1"),
+            ((*_P, ("apollo-require-preflight", "")), "preflight 1, empty"),
+        )
+    ),
+    # A JSON type with no body and no length is read as empty by each method Fastify reads one for.
+    *(
+        _http_row(
+            m,
+            t,
+            (("Content-Type", "application/json; charset=latin1"),),
+            None,
+            "key",
+            s,
+            ty,
+            a,
+            id=f"{m}, latin1, no body",
+        )
+        for m, t, s, ty, a in (
+            ("POST", "", 400, _JSON_UTF8, _EMPTY),
+            ("PUT", "", 400, _JSON_UTF8, _EMPTY),
+            ("PATCH", "", 400, _JSON_UTF8, _EMPTY),
+            ("DELETE", "", 400, _JSON_UTF8, _EMPTY),
+            ("OPTIONS", "", 400, "text/plain", b"Invalid Preflight Request"),
+            ("PROPFIND", "", 404, _JSON_UTF8, _not_found("PROPFIND", "")),
+            (
+                "GET",
+                "",
+                400,
+                _JSON_UTF8,
+                _apollo(
+                    b"GraphQL operations must contain a non-empty `query` or a `persistedQuery` extension."
+                ),
+            ),
+            ("HEAD", "", 405, _JSON_UTF8, b""),
+        )
+    ),
+    _http_row("POST", "", (), None, "key", 400, _JSON_UTF8, _CSRF, id="no type, no body"),
+    _http_row(
+        "POST", "", _P, None, "key", 400, _JSON_UTF8, _NO_KEYS, id="no type, no body, preflight"
+    ),
+    _http_row(
+        "POST",
+        "",
+        _P,
+        _Chunked(_TYPENAME),
+        "key",
+        415,
+        _JSON_UTF8,
+        _UNSUPPORTED,
+        id="no type, chunked, preflight",
+    ),
+    _http_row(
+        "POST",
+        "",
+        _J,
+        _Chunked(_TYPENAME),
+        "key",
+        200,
+        _JSON_UTF8,
+        _TYPENAME_DATA,
+        id="JSON, chunked",
+    ),
+    _http_row(
+        "GET",
+        "?query=%7B&query=%7B",
+        (),
+        None,
+        "key",
+        400,
+        _JSON_UTF8,
+        _CSRF,
+        id="GET, unpreflighted, query twice",
+    ),
+    _http_row(
+        "GET",
+        _Q + "&variables=%7B%7D&operationName=",
+        _P,
+        None,
+        "key",
+        400,
+        _JSON_UTF8,
+        _apollo(b'Unknown operation named \\"\\".', b"OPERATION_RESOLUTION_FAILURE"),
+        id="GET, variables {}, operationName empty",
+    ),
+    *(
+        _http_row(
+            m,
+            t,
+            (*h, ("Origin", "https://example.com")),
+            b,
+            "key",
+            s,
+            _JSON_UTF8,
+            a,
+            id=f"{m}, Origin",
+        )
+        for m, t, h, b, s, a in (
+            ("POST", "", _J, _TYPENAME, 200, _TYPENAME_DATA),
+            ("GET", _Q, _P, None, 200, _TYPENAME_DATA),
+            ("HEAD", _Q, _P, None, 405, b""),
+            ("PUT", "", _J, _TYPENAME, 404, _not_found("PUT", "")),
+        )
+    ),
 ]
 _FIREFLIES_CREDENTIALS = {
     "none": None,
@@ -1935,7 +2165,8 @@ def test_fireflies_answers_each_method_type_and_accept_as_fireflies_does(
     if _FIREFLIES_CREDENTIALS[credential] is not None:
         value = _FIREFLIES_CREDENTIALS[credential].format(t=tokens_yaml["admin_token"])
         sent += [("Authorization", value)] * (2 if credential == "twice" else 1)
-    r = sent_as(client, method, f"/fireflies/graphql{target}", sent, content=body)
+    content = body.chunks() if isinstance(body, _Chunked) else body
+    r = sent_as(client, method, f"/fireflies/graphql{target}", sent, content=content, bare=True)
     assert r.status_code == status
     assert r.headers.get("content-type") == media_type
     if answer is _LANDING_PAGE:

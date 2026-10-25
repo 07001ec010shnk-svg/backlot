@@ -2041,6 +2041,22 @@ _ACCEPTED = [
     ("application/json;q=0.5x", apollo_http.JSON, False),
     ("application/json ;q=0", None, False),
     ("application/json;q =0", None, False),
+    (
+        "application/json;charset=utf-8;q=0.1, application/json;q=0.9, application/graphql-response+json;q=0.5",
+        apollo_http.GRAPHQL_RESPONSE,
+        False,
+    ),
+    ("application/json;q=abc, application/json;q=0.5", apollo_http.JSON, False),
+    ('text/html;x=",application/json,"', None, False),
+    ('application/json;x="a;q=0"', None, False),
+    ('application/json;charset="utf-8"', apollo_http.JSON, False),
+    ('application/json;charset=autf-8"', None, False),
+    ('application/json;charset="utf-8a', None, False),
+    ("application/json;charset=*", apollo_http.JSON, False),
+    ("application/json;foo", apollo_http.JSON, False),
+    ("multipart/mixed; deferSpec=20220824, text/html;q=0.9", None, False),
+    ("multipart/mixed; incrementalSpec=v0.2, text/html;q=0.9", None, False),
+    ("multipart/mixed, text/html;q=0.9", None, False),
 ]
 
 

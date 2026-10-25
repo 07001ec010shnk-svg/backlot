@@ -298,11 +298,12 @@ class WithTheKey(bytes):
         return self
 
 
-def sent_as(client, method: str, path: str, headers, content=None):
+def sent_as(client, method: str, path: str, headers, content=None, bare: bool = False):
     """``method`` on ``path`` with each header's latin-1 bytes as sent, ``headers`` a mapping or a
     sequence of pairs, which can name a header twice. The TestClient re-encodes a header's bytes
     above 0x7F as UTF-8 (`\\x85` reaches the app as `\\xc2\\x85`), where httpx's own
-    `ASGITransport` hands the app what it was given, over the app the fixture started."""
+    `ASGITransport` hands the app what it was given, over the app the fixture started. ``bare``
+    leaves out the headers httpx sends unasked, `Accept: */*` among them."""
     import asyncio
 
     import httpx
@@ -313,6 +314,8 @@ def sent_as(client, method: str, path: str, headers, content=None):
     async def send():
         transport = httpx.ASGITransport(app=client.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+            if bare:
+                c.headers.clear()
             return await c.request(method, path, headers=raw, content=content)
 
     return asyncio.run(send())

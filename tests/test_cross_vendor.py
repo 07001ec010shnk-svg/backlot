@@ -392,6 +392,46 @@ def test_cloudflare_refuses_a_repeated_authorization(
         assert r.content == page
 
 
+# Cloudflare's answer to each method it refuses in front of Linear and Fireflies, on each path
+# api.linear.app and api.fireflies.ai answered it on, and behind its 400 for `Authorization` sent
+# twice; `backlot.main.refuse_cloudflares_methods_on_linear_and_fireflies` records them. The last
+# row is the control: a path that only starts with the vendor's name is not the vendor's.
+_PAGE = (
+    b"<html>\r\n<head><title>%s</title></head>\r\n<body>\r\n<center><h1>%s</h1></center>\r\n"
+    b"<hr><center>cloudflare</center>\r\n</body>\r\n</html>\r\n"
+)
+_NOT_ALLOWED = (405, "text/html", _PAGE % ((b"405 Not Allowed",) * 2))
+_ERROR_1045 = (400, "text/plain; charset=UTF-8", b"error code: 1045\n")
+_PURGED = (400, "text/html; charset=UTF-8", _PAGE % ((b"400 Bad Request",) * 2))
+_TWICE = (400, "text/html", _PAGE % ((b"400 Bad Request",) * 2))
+_CLOUDFLARE_METHODS = [
+    *(
+        pytest.param(m, path, 1, answer, id=f"{m} {path or '/'}")
+        for m, answer in (("TRACE", _NOT_ALLOWED), ("CONNECT", _ERROR_1045), ("PURGE", _PURGED))
+        for path in ("/graphql/", "/nosuch", "")
+    ),
+    *(
+        pytest.param(m, "/graphql", 2, _TWICE, id=f"{m}, twice")
+        for m in ("TRACE", "CONNECT", "PURGE")
+    ),
+    pytest.param("TRACE", "x/graphql", 1, None, id="a longer name"),
+]
+
+
+@pytest.mark.parametrize("vendor", ["linear", "fireflies"])
+@pytest.mark.parametrize("method, path, copies, answer", _CLOUDFLARE_METHODS)
+def test_cloudflare_refuses_trace_connect_and_purge(
+    client, tokens_yaml, vendor, method, path, copies, answer
+):
+    admin = tokens_yaml["admin_token"]
+    key = admin if vendor == "linear" else f"Bearer {admin}"
+    r = client.request(method, f"/{vendor}{path}", headers=[("Authorization", key)] * copies)
+    if answer is None:
+        assert b"cloudflare" not in r.content and r.status_code == 404
+        return
+    assert (r.status_code, r.headers["content-type"], r.content) == answer
+
+
 @pytest.mark.parametrize(
     "vendor, reader, body",
     [

@@ -167,34 +167,24 @@ def _charset(content_type: str | None) -> str:
     return charset.lower() or "utf-8"
 
 
-# content-type 1.0.5's `TYPE_REGEXP`, and media-typer 1.1.0's, which type-is 2.0.1 also asks.
-_CONTENT_TYPE = re.compile(rf"{_TOKEN}/{_TOKEN}")
-_MEDIA_TYPER = re.compile(
-    r" *[A-Za-z0-9][A-Za-z0-9!#$&^_-]{0,126}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126} *"
-)
-
-
 def express_reads_json(content_type: str | None) -> bool:
     """Whether Linear's ``body-parser`` reads a body under ``content_type`` as JSON, which
     ``type-is`` 2.0.1 decides as ``content-type`` 1.0.5 parses the header: the type before the
     first ``;``, trimmed, is ``application/json`` in any case, and each parameter after it is a
     token, ``=`` and a token or a quoted string, to the end. A body under any other is not read,
-    and reaches Apollo Server as none. api.linear.app answered as these two packages do 71 content
+    and reaches Apollo Server as none. api.linear.app answered as these two packages do 66 content
     types on 2026-10-25 (UTC), where ``content-type`` 2.1.0, which ``type-is`` 2.1.0 asks, reads
-    ``application/json;``, ``application/json; foo`` and five more as JSON that Linear did not."""
+    ``application/json;``, ``application/json; foo`` and six more as JSON that Linear did not."""
     if not content_type:
         return False
     index = content_type.find(";")
-    type_ = (content_type if index == -1 else content_type[:index]).strip(JS_SPACE)
-    if not _CONTENT_TYPE.fullmatch(type_):
+    type_ = content_type if index == -1 else content_type[:index]
+    if type_.strip(JS_SPACE).lower() != "application/json":
         return False
     if index != -1:
         while (parameter := PARAMETER.match(content_type, index)) is not None:
             index = parameter.end()
-        if index != len(content_type):
-            return False
-    type_ = type_.lower()
-    return _MEDIA_TYPER.fullmatch(type_) is not None and type_ == "application/json"
+    return index in (-1, len(content_type))
 
 
 # Fastify's `typeNameReg` and `subtypeNameReg`, the latter with no white space to end it once

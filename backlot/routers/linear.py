@@ -134,9 +134,8 @@ async def graphql(request: Request):
     if method != "OPTIONS" and auth.linear_api_key_under_bearer(request):
         return _api_key_as_bearer()
     payload: Any = None
-    content_type = request.headers.get("content-type")
-    has_body = "transfer-encoding" in request.headers or "content-length" in request.headers
-    if has_body and request_body.express_reads_json(content_type):
+    content_type = request_body.joined_header(request.headers.getlist("content-type"))
+    if _has_body(request) and request_body.express_reads_json(content_type):
         # In a worker thread: `_read` can take seconds over a body near the 10 MiB limit, which
         # would hold up every other request on the event loop.
         payload = await run_in_threadpool(
@@ -151,6 +150,9 @@ async def graphql(request: Request):
         # The telemetry middleware names the call by this document (backlot.telemetry.naming).
         request.state.graphql_payload = payload
     seen = apollo_http.headers_seen(request.headers.raw)
+    seen.pop("content-type", None)
+    if content_type:
+        seen["content-type"] = content_type
     refusal = apollo_http.csrf_refusal(seen)
     if refusal is None and method not in ("GET", "POST"):
         refusal = apollo_http.method_refusal()
@@ -190,6 +192,15 @@ async def graphql(request: Request):
     return _answer(seen, ENGINE.run(resolved, context=context), payload, request)
 
 
+def _has_body(request: Request) -> bool:
+    """Whether ``body-parser`` finds a body to read, as ``type-is``'s ``hasBody`` decides behind
+    Linear's front: under any method but `GET` and `HEAD`, which that front gives a length of 0
+    where it has none. api.linear.app refused a `Content-Type` naming `charset=latin1` with no body
+    and no length with its 415 under `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `PROPFIND` on
+    2026-10-25 (UTC), and read no body under `GET` and `HEAD`, a length of 0 among them."""
+    return request.method not in ("GET", "HEAD")
+
+
 #: The headers ``cors`` writes on each preflight, as api.linear.app answered every one sent with
 #: `Origin` on 2026-10-25 (UTC), and the edge's ``Cache-Control`` and ``Cache-Tag`` beside them.
 _PREFLIGHT = (
@@ -208,17 +219,18 @@ _PREFLIGHT = (
 
 def _preflight(request: Request) -> Response:
     """Linear's 204 to an `OPTIONS` carrying `Origin`, ahead of the credential and the body:
-    `Origin` echoed back, :data:`_PREFLIGHT`, and each name `Access-Control-Request-Headers` lists
-    without the spaces around it. api.linear.app answered so with no credential, `nope` and an API
-    key under `Bearer`, with `Access-Control-Request-Method` naming `POST`, `PUT` or none, with
-    `Origin: null`, and with `Content-Type, X-Foo`, ` a , b ` and `a,,b` asked for, which came back
-    `Content-Type,X-Foo`, `a,b` and `a,,b`. An `OPTIONS` without `Origin` is Apollo Server's."""
+    `Origin` echoed back, :data:`_PREFLIGHT`, and each name `Access-Control-Request-Headers` lists,
+    in each copy of it, without the spaces and tabs around it. api.linear.app answered so with no
+    credential, `nope` and an API key under `Bearer`, with `Access-Control-Request-Method` naming
+    `POST`, `PUT` or none, with `Origin: null`, and with `Content-Type, X-Foo`, ` a , b `, `a,,b`,
+    `a,  ,b`, a tab after `a` and `a` and `b` in two copies asked for, which came back
+    `Content-Type,X-Foo`, `a,b`, `a,,b`, `a,,b`, `a` and `a,b`. An `OPTIONS` without `Origin` is
+    Apollo Server's."""
     headers = [("access-control-allow-origin", request.headers["origin"].strip(" \t"))]
-    asked = request.headers.get("access-control-request-headers")
-    if asked is not None:
-        headers.append(
-            ("access-control-allow-headers", ",".join(name.strip(" ") for name in asked.split(",")))
-        )
+    asked = request.headers.getlist("access-control-request-headers")
+    if asked:
+        names = ", ".join(asked).split(",")
+        headers.append(("access-control-allow-headers", ",".join(n.strip(" \t") for n in names)))
     response = Response(status_code=204)
     response.raw_headers += [(k.encode(), v.encode("latin-1")) for k, v in (*headers, *_PREFLIGHT)]
     return response
@@ -291,17 +303,17 @@ def _answer(
     request: Request | None = None,
 ) -> Response:
     """Apollo Server's answer to ``result`` in Linear's envelope (:func:`_envelope`), or to Linear's
-    401 where ``result`` is ``None``, which ``request``, where an operation ran, is told of
-    (``graphql_raised``). A refusal thrown before the request pipeline is in the media type
+    401 where ``result`` is ``None``. ``request`` is passed where ``result`` is a run, and is told
+    whether it raised (``graphql_raised``). A refusal thrown before the request pipeline is in the media type
     ``Accept`` takes or ``application/json``; any other answer is Apollo Server's 406 where it takes
     none (:data:`~backlot.graphql.apollo_http.NOT_ACCEPTABLE`). api.linear.app answered each of the
     two kinds so on 2026-10-25 (UTC), the 401 among the second."""
+    if request is not None:
+        request.state.graphql_raised = result.raised
     media_type = apollo_http.response_type(seen.get("accept"))
     thrown = result is not None and bool(result.refusals) and result.refusals[0].thrown
     if media_type is None and not thrown:
         result = engine.refused(apollo_http.NOT_ACCEPTABLE)
-    if request is not None and result is not None and not result.refusals:
-        request.state.graphql_raised = result.raised
     if result is None:
         body, status, headers = _UNAUTHENTICATED, 401, ()
     else:
