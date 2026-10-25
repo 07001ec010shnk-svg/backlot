@@ -257,11 +257,12 @@ PERSISTED_QUERY_MISMATCH = "provided sha does not match query"
 
 def persisted_query_refusal(payload: dict) -> Result | None:
     """Apollo Server's answer to the ``persistedQuery`` extension of ``payload``, or ``None`` for
-    a request it runs. Both vendors answered on 2026-10-25 (UTC) as a server that keeps no query:
-    a hash sent with no ``query``, or with ``null``, ``false`` or ``0``, was
-    ``PersistedQueryNotFound`` at 200, even after the query that hashes to it had been sent with it
-    and served. A version other than the number 1 is refused, then a hash that is not the SHA-256
-    of the query sent, in lower-case hex, before the query is parsed."""
+    a request it runs, as a server that keeps no query answers: a hash sent with no ``query``, or
+    with ``null``, ``false`` or ``0``, is ``PersistedQueryNotFound`` at 200. Both vendors answered
+    so on 2026-10-25 (UTC). Once a query had been sent with its hash and served, Linear answered
+    its hash alone so to each of 16 requests, and Fireflies to 15 of 16, serving the query to the
+    other. A version other than the number 1 is refused, then a hash that is not the SHA-256 of the
+    query sent, in lower-case hex, before the query is parsed."""
     extensions = payload.get("extensions")
     persisted = extensions.get("persistedQuery") if isinstance(extensions, dict) else None
     if not _js_truthy(persisted):
