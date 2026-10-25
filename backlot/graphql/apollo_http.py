@@ -242,7 +242,7 @@ def headers_seen(raw: list[tuple[bytes, bytes]]) -> dict[str, str]:
     """The request headers as Apollo Server reads them behind Node, from the ASGI ``raw`` list:
     each name in lower case and each value without the spaces and tabs at its ends, the values of
     a name sent more than once joined with ``", "`` but ``content-type``'s, of which Node keeps the
-    first, and a header with no value left out. Both vendors answered so on 2026-10-25 (UTC):
+    first, and a header with no value left out. Each vendor answered so on 2026-10-25 (UTC):
     `Accept` sent as `application/json` and as `text/html`, in either order, was served;
     `apollo-require-preflight` sent empty and as `1`, in either order, let a GET through, and an
     `x-apollo-operation-name` of a space did not; a `Content-Type` sent twice was the first to

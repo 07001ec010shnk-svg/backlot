@@ -305,7 +305,7 @@ def _answer(
     401 where ``result`` is ``None``, in the media type
     :func:`~backlot.graphql.apollo_http.response_type` picks as Express writes it
     (:func:`_as_express_sends`), or Apollo Server's 406. ``request``, passed where ``result`` is a
-    run, carries whether it raised (``graphql_raised``)."""
+    run, is given ``result.raised`` as ``graphql_raised``."""
     if request is not None:
         request.state.graphql_raised = result.raised
     media_type = apollo_http.response_type(seen.get("accept"))

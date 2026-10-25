@@ -1327,9 +1327,9 @@ def _roster_emails(settings):
 
 
 # --- Fastify, @fastify/cors and Apollo Server in front of Fireflies' GraphQL ----------------------
-# The request, the credential (`_FIREFLIES_CREDENTIALS`) and the answer api.fireflies.ai gave it on
-# 2026-10-25 (UTC): its status, its media type and its body but for the newline Apollo Server ends
-# one with, `_TYPENAME_DATA` where it served the query, and none for a `HEAD`.
+# Each row: a request, its credential (`_FIREFLIES_CREDENTIALS`), and api.fireflies.ai's answer to
+# it on 2026-10-25 (UTC), status, media type and body less the newline Apollo Server ends one with:
+# `_TYPENAME_DATA` where the query was served, nothing for a `HEAD`.
 _CSRF = _apollo(
     b"This operation has been blocked as a potential Cross-Site Request Forgery (CSRF). Please"
     b" either specify a 'content-type' header (with a type that is not one of"
@@ -1360,7 +1360,7 @@ _FIREFLIES_PREFLIGHT = {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET,HEAD,POST",
     "vary": "Access-Control-Request-Headers",
-    # Sent no `Access-Control-Request-Headers`, a preflight is answered none.
+    # A preflight asking for no header names gets none back.
     "access-control-allow-headers": None,
 }
 _J = (("Content-Type", "application/json"),)
@@ -2019,7 +2019,7 @@ _FIREFLIES_HTTP = [
             ((*_P, ("apollo-require-preflight", "")), "preflight 1, empty"),
         )
     ),
-    # No body and no length under a JSON type, by method.
+    # Each method under a JSON type, with no body and no length.
     *(
         http_row(
             m,

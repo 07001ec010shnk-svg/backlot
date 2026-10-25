@@ -61,8 +61,7 @@ def _body_refusal(message: str, status: int = 400, code: str = "http") -> Respon
     :data:`_NOT_JSON` the 400 for every other one :mod:`backlot.graphql.body` cannot read or finds
     :func:`~backlot.graphql.body.prototype_poisoned`, as api.fireflies.ai answered on 2026-10-18;
     :data:`_TOO_LARGE` is the 413 for one over :data:`_LIMIT` and :data:`_UNSUPPORTED` the 415
-    for one of a type it does not read (:func:`_fastify_read`). :func:`_not_found` is the same
-    envelope."""
+    for one of a type it does not read. :func:`_not_found` is the same envelope."""
     envelope = {
         "statusCode": status,
         "status": False,
