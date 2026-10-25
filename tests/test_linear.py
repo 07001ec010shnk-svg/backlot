@@ -5699,9 +5699,10 @@ def test_linear_backward_pages_name_the_served_nodes(tmp_path, root, operation):
 
 
 # --- the load balancer, Express, cors and Apollo Server in front of Linear's GraphQL --------------
-# The request, the credential (`_LINEAR_CREDENTIALS`) and the answer api.linear.app gave it on
-# 2026-10-25 (UTC): its status, its media type and its body but for the newline Apollo Server ends
-# one with, `_TYPENAME_DATA` where it served the query, and none for a `HEAD`.
+# The request, the credential (`_LINEAR_CREDENTIALS`) and the answer api.linear.app gave it, as
+# `graphql` records the layers it was measured through: its status, its media type and its body but
+# for the newline Apollo Server ends one with, `_TYPENAME_DATA` where it served the query, and none
+# for a `HEAD`.
 _CSRF = (
     b'{"errors":[{"message":"This operation has been blocked as a potential Cross-Site Request'
     b" Forgery (CSRF). Please either specify a 'content-type' header (with a type that is not one"

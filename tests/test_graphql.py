@@ -1998,7 +1998,7 @@ def test_a_tool_carries_its_fields_description(tools):
 
 # --- the Node libraries `apollo_http` and `body` are read off -------------------------------------
 # Each value and what the library behind the port each test names answered for it under Node
-# 24.18.0, on 2026-10-25; the ports' docstrings name each library's release.
+# 24.18.0; the ports' docstrings name each library's release.
 _ACCEPTED = [
     ("*/*", apollo_http.JSON, False),
     ("application/*", apollo_http.JSON, False),

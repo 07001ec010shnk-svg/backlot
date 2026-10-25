@@ -1328,8 +1328,9 @@ def _roster_emails(settings):
 
 # --- Fastify, @fastify/cors and Apollo Server in front of Fireflies' GraphQL ----------------------
 # Each row: a request, its credential (`_FIREFLIES_CREDENTIALS`), and api.fireflies.ai's answer to
-# it on 2026-10-25 (UTC), status, media type and body less the newline Apollo Server ends one with:
-# `_TYPENAME_DATA` where the query was served, nothing for a `HEAD`.
+# it, as `graphql` records the layers it was measured through: status, media type and body less
+# the newline Apollo Server ends one with, `_TYPENAME_DATA` where the query was served, nothing for
+# a `HEAD`.
 _CSRF = _apollo(
     b"This operation has been blocked as a potential Cross-Site Request Forgery (CSRF). Please"
     b" either specify a 'content-type' header (with a type that is not one of"
