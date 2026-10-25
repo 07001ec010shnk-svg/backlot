@@ -9,6 +9,7 @@ from __future__ import annotations
 import gzip
 import json
 import sqlite3
+import time
 
 import pytest
 from graphql import build_client_schema, parse, validate
@@ -581,7 +582,9 @@ def test_fireflies_reads_a_fragment_once_however_many_spreads_reach_it():
 
     document = " ".join(f"fragment F{i} on Query {{ ...F{i + 1} ...F{i + 1} }}" for i in range(25))
     document += " fragment F25 on Query { __typename } { ...F0 }"
+    started = time.perf_counter()
     assert fireflies._fragments_unreached(parse(document)) is None
+    assert time.perf_counter() - started < 1
 
 
 def test_fireflies_admin_crawl_sees_every_stored_transcript(client, admin_h, ro_conn):
