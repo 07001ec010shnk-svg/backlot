@@ -234,7 +234,7 @@ def _built_in_refusal(name: str, value: Any) -> str | None:
     elif name == "Boolean":
         if not isinstance(value, bool):
             return f"Boolean cannot represent a non boolean value: {inspect(value)}"
-    elif name == "ID" and not (isinstance(value, str) or integral):
+    elif not (isinstance(value, str) or integral):  # ID, the last of `_BUILT_IN`
         return f"ID cannot represent value: {inspect(value)}"
     return None
 

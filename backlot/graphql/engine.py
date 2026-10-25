@@ -259,9 +259,10 @@ PERSISTED_QUERY_MISMATCH = "provided sha does not match query"
 def persisted_query_refusal(payload: dict) -> Result | None:
     """Apollo Server's answer to the ``persistedQuery`` extension of ``payload``, or ``None`` for
     a request it runs. Both vendors answered on 2026-10-25 (UTC) as a server that keeps no query:
-    a hash sent alone was ``PersistedQueryNotFound`` at 200 even after the query that hashes to it
-    had been sent with it and served. A version other than the number 1 is refused, then a hash
-    that is not the SHA-256 of the query sent, in lower-case hex, before the query is parsed."""
+    a hash sent with no ``query``, or with ``null``, ``false`` or ``0``, was
+    ``PersistedQueryNotFound`` at 200, even after the query that hashes to it had been sent with it
+    and served. A version other than the number 1 is refused, then a hash that is not the SHA-256
+    of the query sent, in lower-case hex, before the query is parsed."""
     extensions = payload.get("extensions")
     persisted = extensions.get("persistedQuery") if isinstance(extensions, dict) else None
     if not _js_truthy(persisted):
@@ -270,15 +271,12 @@ def persisted_query_refusal(payload: dict) -> Result | None:
     if isinstance(version, bool) or version != 1:
         return _refusal(PERSISTED_QUERY_VERSION, INTERNAL_SERVER_ERROR)
     query = payload.get("query")
-    if query is None:
+    if not isinstance(query, str):
         return _refusal("PersistedQueryNotFound", PERSISTED_QUERY_NOT_FOUND, status=200)
     # Both vendors hashed a query holding U+D800 as the same query with U+FFFD in its place on
     # 2026-10-25 (UTC), the UTF-8 Node writes for a lone surrogate.
-    digest = None
-    if isinstance(query, str):
-        units = query.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
-        digest = hashlib.sha256(units.encode("utf-8")).hexdigest()
-    if digest is None or persisted.get("sha256Hash") != digest:
+    units = query.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    if persisted.get("sha256Hash") != hashlib.sha256(units.encode("utf-8")).hexdigest():
         return _refusal(PERSISTED_QUERY_MISMATCH, INTERNAL_SERVER_ERROR)
     return None
 

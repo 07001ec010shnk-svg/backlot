@@ -574,8 +574,9 @@ def test_fireflies_orders_the_body_and_the_credential(
 
 
 def test_fireflies_reads_a_fragment_once_however_many_spreads_reach_it():
-    """A document whose twenty-six fragments each spread the next twice reaches the last one by
-    2**25 paths, and `_fragments_unreached` reads each fragment once rather than once a path."""
+    """A document whose first twenty-five fragments each spread the next one twice reaches the
+    twenty-sixth by 2**25 paths, and `_fragments_unreached` reads each fragment once rather than
+    once a path."""
     from backlot.routers import fireflies
 
     document = " ".join(f"fragment F{i} on Query {{ ...F{i + 1} ...F{i + 1} }}" for i in range(25))

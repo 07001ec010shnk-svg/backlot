@@ -243,9 +243,6 @@ def _crashed(_root, _info):
     ],
 )
 def test_a_field_error_is_marked_by_who_made_it(query, variables, raised, assigned):
-    """``raised`` marks Backlot's own failure, and ``assigned`` each error graphql-core raised as a
-    ``GraphQLError`` (:func:`backlot.graphql.engine._made_by_graphql`), which alone carries
-    ``INTERNAL_SERVER_ERROR``."""
     gql = engine.Engine(
         SDL.replace(
             "boom: String",
@@ -939,6 +936,13 @@ _APOLLO_CHECKS = [
     pytest.param(_persisted(sha256=_HASH.upper(), query=_TYPENAME), _MISMATCH, id="pq upper hash"),
     pytest.param(_persisted(sha256=5, query=_TYPENAME), _MISMATCH, id="pq hash 5"),
     pytest.param(_persisted(query=""), _MISMATCH, id="pq, an empty query"),
+    pytest.param(_persisted(query=False), _NOT_FOUND, id="pq, query false"),
+    pytest.param(_persisted(query=0), _NOT_FOUND, id="pq, query 0"),
+    pytest.param(
+        {"query": False, "extensions": {"persistedQuery": {"version": 1}}},
+        _NOT_FOUND,
+        id="pq with no hash, query false",
+    ),
     pytest.param(
         _persisted(query=None),
         _NOT_FOUND,
