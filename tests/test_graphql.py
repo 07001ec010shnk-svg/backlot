@@ -2054,6 +2054,13 @@ _ACCEPTED = [
     ("multipart/mixed; deferSpec=20220824, text/html;q=0.9", None, False),
     ("multipart/mixed; incrementalSpec=v0.2, text/html;q=0.9", None, False),
     ("multipart/mixed, text/html;q=0.9", None, False),
+    ("application/json;q=.5, application/graphql-response+json;q=0.4", apollo_http.JSON, False),
+    (
+        "application/json;q=1e-1, application/graphql-response+json;q=0.4",
+        apollo_http.GRAPHQL_RESPONSE,
+        False,
+    ),
+    ("application/json;q=+0.1, application/graphql-response+json;q=0.05", apollo_http.JSON, False),
 ]
 
 
@@ -2086,6 +2093,7 @@ _ESSENCES = [
     ("application/x-www-form-urlencoded", "application/x-www-form-urlencoded"),
     ("*/*", "*/*"),
     ("text/plain\x0c", None),
+    ("te!xt/plain", "te!xt/plain"),
 ]
 
 
@@ -2142,6 +2150,9 @@ _FASTIFY_TYPES = [
     ("app_lication/json", "app_lication/json"),
     ("application/json@", None),
     ("text/plain\x0b", "text/plain"),
+    ("t\xe9xt/plain", None),
+    ("application; charset=utf-8", None),
+    ("text/pl\xe1in;x=y", None),
 ]
 
 
@@ -2165,6 +2176,9 @@ _FORMS = [
     ("x=%F0%9F%98%80", {"x": "\U0001f600"}),
     ("__proto__=1", {"__proto__": "1"}),
     ("a=1&b", {"a": "1", "b": ""}),
+    ("x=a%zz%41", {"x": "a%zz%41"}),
+    ("%41=1", {"A": "1"}),
+    ("x=%c3%a9", {"x": "\xe9"}),
 ]
 
 

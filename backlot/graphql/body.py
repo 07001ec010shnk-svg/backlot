@@ -167,7 +167,7 @@ def _charset(content_type: str | None) -> str:
     return charset.lower() or "utf-8"
 
 
-def express_reads_json(content_type: str | None) -> bool:
+def express_reads_json(content_type: str) -> bool:
     """Whether Linear's ``body-parser`` reads a body under ``content_type`` as JSON, which
     ``type-is`` 2.0.1 decides as ``content-type`` 1.0.5 parses the header: the type before the
     first ``;``, trimmed, is ``application/json`` in any case, and each parameter after it is a
@@ -175,16 +175,13 @@ def express_reads_json(content_type: str | None) -> bool:
     and reaches Apollo Server as none. api.linear.app answered as these two packages do 66 content
     types on 2026-10-25 (UTC), where ``content-type`` 2.1.0, which ``type-is`` 2.1.0 asks, reads
     ``application/json;``, ``application/json; foo`` and six more as JSON that Linear did not."""
-    if not content_type:
-        return False
-    index = content_type.find(";")
-    type_ = content_type if index == -1 else content_type[:index]
+    type_, semicolon, _ = content_type.partition(";")
     if type_.strip(JS_SPACE).lower() != "application/json":
         return False
-    if index != -1:
-        while (parameter := PARAMETER.match(content_type, index)) is not None:
-            index = parameter.end()
-    return index in (-1, len(content_type))
+    index = len(type_)
+    while semicolon and (parameter := PARAMETER.match(content_type, index)) is not None:
+        index = parameter.end()
+    return index == len(content_type)
 
 
 # Fastify's `typeNameReg` and `subtypeNameReg`, the latter with no white space to end it once
@@ -197,29 +194,16 @@ def fastify_media_type(content_type: str) -> str | None:
     header, or ``None`` for one it calls invalid: read off ``lib/content-type.js`` in Fastify
     5.10.0. The parameters are not read for it: a type is before the first ``;`` or, with none,
     is the whole value, and splits at its first ``/`` into two tokens, white space allowed before
-    the first and after the second. An empty value and ``undefined`` are invalid.
+    the first and after the second.
 
     Fastify 5.7.4 to 5.10.0 answered alike each of 661 content types sent to them on 2026-10-25
     (UTC), and as api.fireflies.ai did each of its requests replayed to them but Cloudflare's four
     and a persisted query's, where 5.5.0 refuses ``application/json\\t;``, 5.7.0 serves
     ``application/json ,`` and 5.11.3 reads the body of a ``QUERY``, which Fireflies answered with
     its 404 without reading ``{``."""
-    if content_type in ("", "undefined"):
-        return None
-    index = content_type.find(";")
-    if index == -1:
-        index = content_type.find("/")
-        if index == -1:
-            return None
-        type_ = content_type[:index].lstrip(JS_SPACE).lower()
-        subtype = content_type[index + 1 :].rstrip(JS_SPACE).lower()
-    else:
-        media = content_type[:index].lower()
-        index = media.find("/")
-        if index == -1:
-            return None
-        type_, subtype = media[:index].lstrip(JS_SPACE), media[index + 1 :].rstrip(JS_SPACE)
-    if not (_FASTIFY_TOKEN.fullmatch(type_) and _FASTIFY_TOKEN.fullmatch(subtype)):
+    type_, slash, subtype = content_type.partition(";")[0].lower().partition("/")
+    type_, subtype = type_.lstrip(JS_SPACE), subtype.rstrip(JS_SPACE)
+    if not (slash and _FASTIFY_TOKEN.fullmatch(type_) and _FASTIFY_TOKEN.fullmatch(subtype)):
         return None
     return f"{type_}/{subtype}"
 
@@ -230,8 +214,6 @@ _PERCENT_RUN = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
 def _fast_decode(text: str) -> str | None:
     """``fast-decode-uri-component``: ``text`` with each run of ``%XX`` read as UTF-8, or ``None``
     where a ``%`` is not followed by two hexadecimal digits or a run is not UTF-8."""
-    if "%" not in text:
-        return text
     out, last = [], 0
     for run in _PERCENT_RUN.finditer(text):
         if "%" in text[last : run.start()]:
