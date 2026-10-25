@@ -172,15 +172,16 @@ def _raised(error: GraphQLError) -> bool:
     cannot serialize. A ``GraphQLError`` a resolver raises (:func:`_marking_refusals` marks it) is a
     refusal, and so is graphql-core's refusal of an argument the request sent, which it makes as it
     runs the field, such as a null variable, declared with a default, where the field or a directive
-    on it takes a non-null argument. graphql-core gives that refusal the argument's value as its
-    node."""
+    on it takes a non-null argument, and its refusal of an operation of a type the schema does not
+    have, such as a subscription to Fireflies. graphql-core gives the first the argument's value as
+    its node and the second the operation."""
     original = error.original_error
     if getattr(error, "refusal", False) or getattr(original, "refusal", False):
         return False
+    made = original if isinstance(original, GraphQLError) else error
     return not (
-        isinstance(original, GraphQLError)
-        and original.nodes
-        and all(isinstance(node, ValueNode) for node in original.nodes)
+        made.nodes
+        and all(isinstance(node, (ValueNode, OperationDefinitionNode)) for node in made.nodes)
     )
 
 
@@ -203,8 +204,8 @@ def _refusal(message: str, code: str = BAD_REQUEST, status: int = 400) -> Result
 
 def _js_truthy(value: Any) -> bool:
     """Whether JavaScript reads the JSON value ``value`` as true: all but ``null``, ``false``,
-    ``""`` and zero."""
-    return value not in (None, False, "", 0)
+    ``""`` and zero, the last of which ``false`` equals in Python."""
+    return value not in (None, "", 0)
 
 
 _NOT_A_STRING = "GraphQL queries must be strings."
@@ -305,7 +306,7 @@ def _with_roots(schema: GraphQLSchema, roots: tuple[str, ...]) -> GraphQLSchema:
         query=schema.query_type,
         mutation=GraphQLObjectType("Mutation", {}) if "Mutation" in roots else None,
         subscription=GraphQLObjectType("Subscription", {}) if "Subscription" in roots else None,
-        types=[t for name, t in schema.type_map.items() if not name.startswith("__")],
+        types=list(schema.type_map.values()),
         directives=schema.directives,
     )
     shadow._validation_errors = []

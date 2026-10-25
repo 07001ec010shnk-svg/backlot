@@ -240,6 +240,9 @@ def _crashed(_root, _info):
             False,
             [1],
         ),
+        # graphql-core refusing an operation of a type the schema does not have
+        ("mutation { __typename }", None, False, [0]),
+        ("subscription { __typename }", None, False, [0]),
     ],
 )
 def test_a_field_error_is_marked_by_who_made_it(query, variables, raised, assigned):

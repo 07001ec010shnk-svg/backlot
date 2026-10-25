@@ -541,7 +541,14 @@ TEAM = "/msgraph/v1.0/teams/778451ab-3734-4e45-beba-caf1bd343541"
             {"headers": JSON, "content": b"x" * (1024 * 1024 + 1)},
             ("fireflies", "unparsed", "unknown", 413, "http", "client"),
         ),
-        # Fireflies' 500 for a fragment it does not define is its answer, not a Backlot bug.
+        # Fireflies' refusal of a subscription, a 200, and its 500 for a fragment it does not
+        # define, are its answers, not Backlot bugs.
+        (
+            "POST",
+            "/fireflies/graphql",
+            {"json": {"query": "subscription { __typename }"}},
+            ("fireflies", "subscription", "unknown", 200, "INTERNAL_SERVER_ERROR", "client"),
+        ),
         (
             "POST",
             "/fireflies/graphql",
