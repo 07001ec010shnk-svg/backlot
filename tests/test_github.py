@@ -2622,6 +2622,9 @@ def test_github_a_wrong_method_is_not_dressed_as_a_measured_answer(gh_client, gh
     assert r.json() == {"detail": "Method Not Allowed"}
 
 
+_TOKEN_SHAPED = {"Authorization": "Basic " + base64.b64encode(b"x:ghp_" + b"A" * 36).decode()}
+
+
 #: (method, path, whether it is refused, the status a caller it does not refuse gets). The first
 #: nine are in `backlot.routers.github._PUBLISHED_NOT_SERVED`, the eighth as the `/orgs/{}` path
 #: `/organizations/{id}` is rewritten to and the ninth on a path whose slash-terminated spelling a
@@ -2688,8 +2691,15 @@ def test_github_an_unserved_operation_is_refused_for_its_credential_first(
         assert (r.status_code, r.json()["message"]) == (401, "Requires authentication"), headers
         assert "x-github-api-version-selected" not in r.headers, headers
         assert any(name.startswith("x-ratelimit-") for name in r.headers) == counted, headers
-    bad = c.request(method, url, headers={"Authorization": "Bearer nope", **bad_version})
-    assert (bad.status_code, bad.json()["message"]) == (401, "Bad credentials")
+    for headers in (
+        {"Authorization": "Bearer nope", **bad_version},
+        _TOKEN_SHAPED,
+        {**_TOKEN_SHAPED, **bad_version},
+    ):
+        bad = c.request(method, url, headers=headers)
+        assert (bad.status_code, bad.json()["message"]) == (401, "Bad credentials"), headers
+        assert "x-github-api-version-selected" not in bad.headers, headers
+        assert not any(name.startswith("x-ratelimit-") for name in bad.headers), headers
     basic = {"Authorization": "Basic Zm9vOmJhcg=="}
     for headers, answered in ((gh_admin_h, status), (basic, 401)):
         r = c.request(method, url, headers=headers)
@@ -2719,6 +2729,9 @@ _NO_CREDENTIAL = "Requires authentication"
         ({"Authorization": "Bearer nope"}, 401, "Bad credentials", None, False),
         ({"Authorization": "Bearer nope", "X-GitHub-Api-Version": "1999-01-01"}, 401,
          "Bad credentials", None, False),
+        (_TOKEN_SHAPED, 401, "Bad credentials", None, False),
+        ({**_TOKEN_SHAPED, "X-GitHub-Api-Version": "1999-01-01"}, 401, "Bad credentials", None,
+         False),
     ],
 )  # fmt: skip
 def test_github_deleting_the_installation_token_is_answered_as_a_served_route(
@@ -2759,6 +2772,8 @@ _NO_CREDENTIAL_ROWS = [
             ({"Authorization": "Digest x", **_V1999}, _REFUSED_UNCOUNTED),
             ({"Authorization": "Bearer\tnope", **_V1999}, _REFUSED_UNCOUNTED),
             ({"Authorization": "token"}, (401, "Bad credentials", None, False)),
+            (_TOKEN_SHAPED, (401, "Bad credentials", None, False)),
+            ({**_TOKEN_SHAPED, **_V1999}, (401, "Bad credentials", None, False)),
         ]
     ),
     *(
