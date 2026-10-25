@@ -328,7 +328,9 @@ def test_a_graphql_vendor_quotes_a_number_as_javascript_prints_it(
     credential = admin if vendor == "linear" else f"Bearer {admin}"
     body = '{"query":"%s","variables":{"x":%s}}' % (document, number)
     r = client.post(
-        f"/{vendor}/graphql", content=body.encode(), headers={"Authorization": credential}
+        f"/{vendor}/graphql",
+        content=body.encode(),
+        headers={"Authorization": credential, "Content-Type": "application/json"},
     )
     assert r.status_code == 400
     message = r.json()["errors"][0]["message"]

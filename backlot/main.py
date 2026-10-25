@@ -1224,6 +1224,62 @@ async def warn_slack_post_charset(request: Request, call_next):
     )
 
 
+#: Cloudflare's answer to each method it refuses in front of Linear and Fireflies, as
+#: api.linear.app and api.fireflies.ai answered each on `/graphql`, `/graphql/`, `/nosuch` and `/`
+#: on 2026-10-25 (UTC): a page with CRLF line ends, or a line of text, and the headers it puts on it.
+_CLOUDFLARE_METHOD = {
+    "TRACE": (
+        405,
+        "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n"
+        "<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>cloudflare</center>\r\n"
+        "</body>\r\n</html>\r\n",
+        {"content-type": "text/html"},
+    ),
+    "CONNECT": (
+        400,
+        "error code: 1045\n",
+        {
+            "content-type": "text/plain; charset=UTF-8",
+            "cache-control": "private, max-age=0, no-store, no-cache, must-revalidate, "
+            "post-check=0, pre-check=0",
+            "expires": "Thu, 01 Jan 1970 00:00:01 GMT",
+            "referrer-policy": "same-origin",
+            "x-frame-options": "SAMEORIGIN",
+        },
+    ),
+    "PURGE": (
+        400,
+        "<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n"
+        "<center><h1>400 Bad Request</h1></center>\r\n<hr><center>cloudflare</center>\r\n"
+        "</body>\r\n</html>\r\n",
+        {
+            "content-type": "text/html; charset=UTF-8",
+            "x-frame-options": "SAMEORIGIN",
+            "cache-control": "private, max-age=0, no-store, no-cache, must-revalidate, "
+            "post-check=0, pre-check=0",
+            "expires": "Thu, 01 Jan 1970 00:00:01 GMT",
+            "referrer-policy": "same-origin",
+        },
+    ),
+}
+
+
+@_middleware(
+    lambda scope: (
+        scope["method"] in _CLOUDFLARE_METHOD
+        and _at_or_under(_url_path(scope), ("/linear", "/fireflies"))
+    )
+)
+async def refuse_cloudflares_methods_on_linear_and_fireflies(request: Request, call_next):
+    """Answer a `/linear` or `/fireflies` request by one of :data:`_CLOUDFLARE_METHOD`'s methods
+    with Cloudflare's answer, ahead of the route and the credential. Registered before
+    :func:`refuse_a_repeated_authorization_on_linear_and_fireflies`, which answers first: a
+    `TRACE`, `CONNECT` or `PURGE` carrying `Authorization` twice drew its 400 from both vendors on
+    2026-10-25 (UTC)."""
+    status, body, headers = _CLOUDFLARE_METHOD[request.method]
+    return Response(body.encode(), status_code=status, headers=headers)
+
+
 #: The page Cloudflare, in front of Linear and Fireflies, answers a request carrying `Authorization`
 #: more than once with: `text/html` with no charset, CRLF line ends, 155 bytes.
 _CLOUDFLARE_REPEATED_AUTHORIZATION = (
