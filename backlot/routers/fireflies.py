@@ -43,7 +43,7 @@ router = APIRouter(prefix="/fireflies", tags=["fireflies"])
 # schema fails at startup instead of on the first request.
 ENGINE = build_engine()
 
-# The media type of every answer Fastify writes from an object.
+# The media type api.fireflies.ai answered each envelope of `_body_refusal` and `_not_found` in.
 _JSON = "application/json; charset=utf-8"
 _EMPTY = "Body cannot be empty when content-type is set to 'application/json'"
 _UNSUPPORTED = "Unsupported Media Type"
@@ -91,8 +91,8 @@ def _auth_failed(seen: dict[str, str], message: str) -> Response:
     entry, as api.fireflies.ai answered on 2026-10-18 with no ``Authorization``, with ``nope``,
     ``Basic …``, ``token <key>``, the bare key, ``Bearer nope`` and ``Bearer <key> extra``. The
     document is not read first: ``{"query":"{"}``, ``[]`` and ``5`` drew the same 500. Apollo
-    Server makes it from the error its context function throws, so it is in the media type
-    ``Accept`` takes, as a refusal thrown before the request pipeline is (:func:`_answer`)."""
+    Server makes it from the error its context function throws, so it takes a thrown refusal's
+    media type (:mod:`backlot.graphql.apollo_http`)."""
     return Response(
         request_body.node_json(
             {
@@ -127,12 +127,10 @@ async def graphql(request: Request):
     Introspection is the schema description for this endpoint.
 
     The layers answer in this order, each measured against api.fireflies.ai on 2026-10-25 (UTC)
-    with the one after it wrong too: ``@fastify/cors``'s preflight (:func:`_preflight`); Fastify's
-    reading of the body (:func:`_fastify_read`) and its 404 for a method its route does not take
-    (:func:`_not_found`); then Apollo Server: its page for a browser, its CSRF check
-    (:func:`~backlot.graphql.apollo_http.csrf_refusal`), the credential (:func:`_auth_failed`),
-    its 405 for a `HEAD`, then the request as a GET's query string or a POST's body carries it,
-    and the run. Its answer is in the media type ``Accept`` takes, or its 406 (:func:`_answer`)."""
+    with the one after it wrong too: ``@fastify/cors`` (:func:`_preflight`), Fastify
+    (:func:`_fastify_read`, :func:`_not_found`), then Apollo Server
+    (:mod:`backlot.graphql.apollo_http`): its page for a browser and its CSRF check ahead of the
+    credential (:func:`_auth_failed`), and the rest after it (:func:`_answer`)."""
     method = request.method
     if method == "OPTIONS":
         return _preflight(request)
@@ -187,11 +185,8 @@ async def graphql(request: Request):
 
 
 def _answer(seen: dict[str, str], result: engine.Result) -> Response:
-    """Apollo Server's answer to ``result`` in Fireflies' envelope (:func:`_envelope`). A refusal
-    thrown before the request pipeline is in the media type ``Accept`` takes or
-    ``application/json``; any other answer is Apollo Server's 406 where it takes none
-    (:data:`~backlot.graphql.apollo_http.NOT_ACCEPTABLE`), as api.fireflies.ai answered each of
-    the two kinds on 2026-10-25 (UTC)."""
+    """Apollo Server's answer to ``result`` in Fireflies' envelope (:func:`_envelope`), in the
+    media type :func:`~backlot.graphql.apollo_http.response_type` picks, or Apollo Server's 406."""
     media_type = apollo_http.response_type(seen.get("accept"))
     if media_type is None and not (result.refusals and result.refusals[0].thrown):
         result = engine.refused(apollo_http.NOT_ACCEPTABLE)
@@ -226,22 +221,19 @@ def _preflight(request: Request) -> Response:
             b"Invalid Preflight Request", status_code=400, headers={"content-type": "text/plain"}
         )
     response = Response(status_code=204)
-    # Node joins the copies of a header with ", ", each without the spaces and tabs at its ends,
-    # which uvicorn keeps after a value.
-    asked = ", ".join(
-        v.strip(" \t") for v in request.headers.getlist("access-control-request-headers")
-    )
-    echoed = (("access-control-allow-headers", asked),) if asked else ()
+    asked = apollo_http.headers_seen(request.headers.raw).get("access-control-request-headers")
+    echoed = () if asked is None else (("access-control-allow-headers", asked),)
     response.raw_headers += [(k.encode(), v.encode("latin-1")) for k, v in (*_PREFLIGHT, *echoed)]
     return response
 
 
 def _not_found(request: Request) -> Response:
     """Fireflies' 404 for a method its route does not take, the method and the path quoted in it as
-    a client puts them after ``https://api.fireflies.ai``, the query string as sent. api.fireflies.ai
-    answered so each of the 28 methods of :data:`apollo_http.METHODS` but GET, HEAD, POST, OPTIONS
-    and Cloudflare's three on 2026-10-25 (UTC), `PUT`, `DELETE` and `PATCH` once Fastify had read
-    their body (:func:`_fastify_read`), and quoted `/graphql?x=%7B%20y&z&a=b+c` as sent."""
+    a client puts them after ``https://api.fireflies.ai``, the query string as sent.
+    api.fireflies.ai answered so each of the 28 methods of :data:`apollo_http.METHODS` but GET,
+    HEAD, POST, OPTIONS and Cloudflare's three on 2026-10-25 (UTC), `PUT`, `DELETE` and `PATCH` once
+    Fastify had read their body (:func:`_fastify_read`), and quoted `/graphql?x=%7B%20y&z&a=b+c` as
+    sent."""
     # The path as sent, but for the segment that names Fireflies here.
     path = "/" + request.scope["raw_path"].decode("latin-1").split("/", 2)[2]
     query = request.scope["query_string"].decode("latin-1")
@@ -253,19 +245,19 @@ _FASTIFY_PARSED = ("application/json", "text/plain", "application/x-www-form-url
 
 
 async def _fastify_read(request: Request, routed: bool) -> Any:
-    """The body Fastify 5.10.0 hands a request's handler, or its refusal of it, read off
-    ``lib/handle-request.js`` and ``lib/content-type-parser.js``. With no ``Content-Type``, a
-    request with no ``Content-Length`` or one of 0, and no ``Transfer-Encoding``, has none, and
-    any other is the 415 (:data:`_UNSUPPORTED`); a type it cannot parse
-    (:func:`~backlot.graphql.body.fastify_media_type`) is the 415. It reads JSON, plain text and a
-    form (:func:`~backlot.graphql.body.form_fields`): each up to :data:`_LIMIT` bytes, the first as
-    :func:`_read` does. On a request its route does not take, ``routed`` false, any other type
-    and no type are left unread, where a routed request gets the 415.
+    """The body Fastify 5.10.0 hands a request's handler, or :func:`_body_refusal`'s refusal of it,
+    read off ``lib/handle-request.js`` and ``lib/content-type-parser.js``. With no
+    ``Content-Type``, a request with no ``Content-Length`` or one of 0, and no
+    ``Transfer-Encoding``, has none, and any other is the 415; a type it cannot parse
+    (:func:`~backlot.graphql.body.fastify_media_type`) is the 415. It reads JSON as :func:`_read`
+    does, plain text and a form (:func:`~backlot.graphql.body.form_fields`). On a request its route
+    does not take, ``routed`` false, any other type and no type are left unread, where a routed
+    request gets the 415.
 
     api.fireflies.ai answered so each body sent on 2026-10-25 (UTC) to `POST`, `PUT`, `DELETE`
     and `PATCH`: no type with a body was the 415 by `POST` and the 404 by `PUT`, `a/b/c` and an
-    empty type the 415 by both, `application/graphql` the 415 by `POST` and the 404 by `PUT`, also
-    past the limit, and a form or plain text past the limit the 413 by both."""
+    empty type the 415 by both, `application/graphql` the 415 by `POST`, past the limit too, and
+    the 404 by `PUT`, and a form or plain text past the limit the 413 by both."""
     content_type = request.headers.get("content-type")
     if content_type is None:
         length = request.headers.get("content-length")
@@ -366,8 +358,8 @@ def _fragments_unreached(doc: DocumentNode) -> engine.Result | None:
 
 
 def _read(raw: bytes) -> Any:
-    """The payload Fireflies reads from the body ``raw``, or :func:`_body_refusal`'s refusal of
-    it."""
+    """The payload Fireflies reads from the JSON body ``raw``, or :func:`_body_refusal`'s refusal
+    of it."""
     if len(raw) > _LIMIT:
         return _body_refusal(_TOO_LARGE, 413)
     if not raw:

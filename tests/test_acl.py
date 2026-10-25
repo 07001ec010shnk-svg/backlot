@@ -9,8 +9,8 @@ from backlot import store
 from tests._helpers import client_for, gql
 
 # The two ways but a POST of JSON a document reaches each GraphQL server's resolvers: a GET with it
-# in the query string, and on Fireflies a POST of a form. Apollo Server serves both only with its
-# preflight header.
+# in the query string, and on Fireflies a POST of a form, each sent with Apollo Server's preflight
+# header (`backlot.graphql.apollo_http.csrf_refusal`).
 _ADMIN = "admin-service-token"
 
 

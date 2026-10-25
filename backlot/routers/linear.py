@@ -21,11 +21,12 @@ credential and with ``nope``, an empty body, ``{}``, an array, a ``query`` of ``
 string ``variables``, an ``extensions`` or ``operationName`` of ``5``, a persisted query's hash
 alone or one that does not match, a document that does not parse or validate and one of two
 operations with no ``operationName`` drew what the key drew on 2026-10-25 (UTC), and a document
-missing a variable the 401. An API key under ``Bearer`` is refused ahead of the body: with
-``Bearer <key>``, ``{``, an empty body and a body holding ``NaN`` drew
-:func:`_api_key_as_bearer`'s 400 on 2026-10-18, and ``charset=latin1``, ``Content-Encoding: bogus``
-and a body past the size limit did on 2026-10-19, when a key in an API key's shape that Linear never
-issued drew it under ``Bearer`` with ``{``, ``NaN``, ``5``, ``charset=latin1`` and an empty body.
+missing a variable the 401. An API key under ``Bearer`` is refused ahead of the body on any method
+but ``OPTIONS``: with ``Bearer <key>``, ``{``, an empty body and a body holding
+``NaN`` drew :func:`_api_key_as_bearer`'s 400 on 2026-10-18, and ``charset=latin1``,
+``Content-Encoding: bogus`` and a body past the size limit did on 2026-10-19, when a key in an API
+key's shape that Linear never issued drew it under ``Bearer`` with ``{``, ``NaN``, ``5``,
+``charset=latin1`` and an empty body.
 """
 
 from __future__ import annotations
@@ -104,7 +105,7 @@ def _express(message: str, status: int = 400, length: int | None = None) -> Resp
 
 #: The methods Linear's load balancer answers with an empty 501 before Linear sees them, as
 #: api.linear.app answered each on 2026-10-25 (UTC). Of the rest of :data:`apollo_http.METHODS`,
-#: Cloudflare answers `TRACE`, `CONNECT` and `PURGE` (``backlot.main``) and Apollo Server the others.
+#: Cloudflare answers those ``backlot.main._CLOUDFLARE_METHOD`` holds and Apollo Server the others.
 _LOAD_BALANCER_501 = frozenset(
     {"BIND", "LINK", "M-SEARCH", "MKCALENDAR", "REBIND", "SOURCE", "UNBIND", "UNLINK"}
 )
@@ -119,13 +120,11 @@ async def graphql(request: Request):
     description for this endpoint.
 
     The layers answer in this order, each measured against api.linear.app on 2026-10-25 (UTC) with
-    the one after it wrong too: ``cors``'s preflight (:func:`_preflight`), the API key under
-    ``Bearer`` on any method but `OPTIONS`, ``body-parser`` on a body under a JSON type
-    (:func:`~backlot.graphql.body.express_reads_json`) whatever the method, then Apollo Server: its
-    CSRF check (:func:`~backlot.graphql.apollo_http.csrf_refusal`), its 405 for a method but GET and
-    POST, then the request as a GET's query string or a POST's body carries it, up to the choice of
-    operation; then the credential, and the run. Its answer is in the media type ``Accept`` takes,
-    or its 406 (:func:`_answer`)."""
+    the one after it wrong too: the load balancer (:data:`_LOAD_BALANCER_501`), ``cors``
+    (:func:`_preflight`), :func:`_api_key_as_bearer`, ``body-parser`` (:func:`_has_body`,
+    :func:`~backlot.graphql.body.express_reads_json`), Apollo Server
+    (:mod:`backlot.graphql.apollo_http`) up to the choice of operation, then the credential and the
+    run (:func:`_answer`)."""
     method = request.method
     if method in _LOAD_BALANCER_501:
         return Response(status_code=501)
@@ -227,10 +226,10 @@ def _preflight(request: Request) -> Response:
     `Content-Type,X-Foo`, `a,b`, `a,,b`, `a,,b`, `a` and `a,b`. An `OPTIONS` without `Origin` is
     Apollo Server's."""
     headers = [("access-control-allow-origin", request.headers["origin"].strip(" \t"))]
-    asked = request.headers.getlist("access-control-request-headers")
-    if asked:
-        names = ", ".join(asked).split(",")
-        headers.append(("access-control-allow-headers", ",".join(n.strip(" \t") for n in names)))
+    asked = apollo_http.headers_seen(request.headers.raw).get("access-control-request-headers")
+    if asked is not None:
+        names = (name.strip(" \t") for name in asked.split(","))
+        headers.append(("access-control-allow-headers", ",".join(names)))
     response = Response(status_code=204)
     response.raw_headers += [(k.encode(), v.encode("latin-1")) for k, v in (*headers, *_PREFLIGHT)]
     return response
@@ -302,12 +301,11 @@ def _answer(
     payload: Any,
     request: Request | None = None,
 ) -> Response:
-    """Apollo Server's answer to ``result`` in Linear's envelope (:func:`_envelope`), or to Linear's
-    401 where ``result`` is ``None``. ``request`` is passed where ``result`` is a run, and is told
-    whether it raised (``graphql_raised``). A refusal thrown before the request pipeline is in the media type
-    ``Accept`` takes or ``application/json``; any other answer is Apollo Server's 406 where it takes
-    none (:data:`~backlot.graphql.apollo_http.NOT_ACCEPTABLE`). api.linear.app answered each of the
-    two kinds so on 2026-10-25 (UTC), the 401 among the second."""
+    """Apollo Server's answer to ``result`` in Linear's envelope (:func:`_envelope`), or Linear's
+    401 where ``result`` is ``None``, in the media type
+    :func:`~backlot.graphql.apollo_http.response_type` picks as Express writes it
+    (:func:`_as_express_sends`), or Apollo Server's 406. ``request``, passed where ``result`` is a
+    run, carries whether it raised (``graphql_raised``)."""
     if request is not None:
         request.state.graphql_raised = result.raised
     media_type = apollo_http.response_type(seen.get("accept"))

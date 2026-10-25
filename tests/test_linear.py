@@ -25,12 +25,14 @@ from backlot.graphql import linear_filters, mcp_tools
 from backlot.graphql.body import node_json
 from tests._helpers import (
     SWEPT_BYTES,
+    Chunked,
     WithTheKey,
     build_corpus,
     client_for,
     complete,
     corpus_client,
     db_count,
+    http_row,
     padded_query,
     selected_field_count,
     selected_fields,
@@ -5696,7 +5698,7 @@ def test_linear_backward_pages_name_the_served_nodes(tmp_path, root, operation):
             assert len(seen) == len(set(seen))
 
 
-# --- the HTTP layer: methods, content types, Accept and CORS -------------------------------------
+# --- the load balancer, Express, cors and Apollo Server in front of Linear's GraphQL --------------
 # The request, the credential (`_LINEAR_CREDENTIALS`) and the answer api.linear.app gave it on
 # 2026-10-25 (UTC): its status, its media type and its body but for the newline Apollo Server ends
 # one with, `_TYPENAME_DATA` where it served the query, and none for a `HEAD`.
@@ -5744,19 +5746,14 @@ _LINEAR_PREFLIGHT = {
     "access-control-expose-headers": "Cache-Control,Content-Language,Content-Length,Content-Type,"
     "Expires,Last-Modified,Pragma,x-request-id,cf-ray,cf-cache-status,Retry-After",
     "access-control-max-age": "86400",
+    # Sent no `Access-Control-Request-Headers`, a preflight is answered none.
+    "access-control-allow-headers": None,
 }
 _J = (("Content-Type", "application/json"),)
 _P = (("apollo-require-preflight", "1"),)
 _ORIGIN = (("Origin", "https://example.com"),)
 _PREFLIGHT_ASKED = (*_ORIGIN, ("Access-Control-Request-Method", "POST"))
 _Q = "?query=%7B%20__typename%20%7D"
-
-
-class _Chunked(bytes):
-    """A body sent in chunks, with no `Content-Length`."""
-
-    async def chunks(self):
-        yield bytes(self)
 
 
 def _search_refusal(message: bytes) -> bytes:
@@ -5766,18 +5763,9 @@ def _search_refusal(message: bytes) -> bytes:
     )
 
 
-def _http_row(
-    method, target, sent, body, credential, status, media_type, answer, id, answered=None
-):
-    """A row: the request, the credential, and the answer, ``answered`` naming headers on it."""
-    return pytest.param(
-        method, target, sent, body, credential, status, media_type, answer, answered or {}, id=id
-    )
-
-
 _LINEAR_HTTP = [
     # Cloudflare, then Linear's load balancer, ahead of everything.
-    _http_row(
+    http_row(
         "TRACE",
         "",
         (),
@@ -5788,7 +5776,7 @@ _LINEAR_HTTP = [
         _CLOUDFLARE_PAGE % ((b"405 Not Allowed",) * 2),
         id="TRACE",
     ),
-    _http_row(
+    http_row(
         "CONNECT",
         "",
         (),
@@ -5799,7 +5787,7 @@ _LINEAR_HTTP = [
         b"error code: 1045\n",
         id="CONNECT",
     ),
-    _http_row(
+    http_row(
         "PURGE",
         "",
         (),
@@ -5810,7 +5798,7 @@ _LINEAR_HTTP = [
         _CLOUDFLARE_PAGE % ((b"400 Bad Request",) * 2),
         id="PURGE",
     ),
-    _http_row(
+    http_row(
         "TRACE",
         "",
         (),
@@ -5822,11 +5810,11 @@ _LINEAR_HTTP = [
         id="TRACE, Authorization twice",
     ),
     *(
-        _http_row(m, "", (*_J, *_P), None, "key", 501, None, b"", id=m)
+        http_row(m, "", (*_J, *_P), None, "key", 501, None, b"", id=m)
         for m in ("BIND", "LINK", "M-SEARCH", "MKCALENDAR", "REBIND", "SOURCE", "UNBIND", "UNLINK")
     ),
     *(
-        _http_row(m, "", (*_J, *_P), None, "key", 405, _JSON_UTF8, _ONLY_GET_POST, id=m)
+        http_row(m, "", (*_J, *_P), None, "key", 405, _JSON_UTF8, _ONLY_GET_POST, id=m)
         for m in (
             "ACL",
             "CHECKOUT",
@@ -5852,7 +5840,7 @@ _LINEAR_HTTP = [
     ),
     # `cors`, whatever the credential; Apollo Server's CSRF check and 405 without `Origin`.
     *(
-        _http_row(
+        http_row(
             "OPTIONS",
             "",
             _PREFLIGHT_ASKED,
@@ -5866,7 +5854,7 @@ _LINEAR_HTTP = [
         )
         for c in ("key", "none", "Bearer key")
     ),
-    _http_row(
+    http_row(
         "OPTIONS",
         "",
         _ORIGIN,
@@ -5878,7 +5866,7 @@ _LINEAR_HTTP = [
         id="Origin alone",
         answered=_LINEAR_PREFLIGHT,
     ),
-    _http_row(
+    http_row(
         "OPTIONS",
         "",
         (("Origin", "null"), ("Access-Control-Request-Method", "POST")),
@@ -5890,7 +5878,7 @@ _LINEAR_HTTP = [
         id="Origin null",
         answered={**_LINEAR_PREFLIGHT, "access-control-allow-origin": "null"},
     ),
-    _http_row(
+    http_row(
         "OPTIONS",
         "",
         (*_ORIGIN, ("Access-Control-Request-Method", "PUT")),
@@ -5903,7 +5891,7 @@ _LINEAR_HTTP = [
         answered=_LINEAR_PREFLIGHT,
     ),
     *(
-        _http_row(
+        http_row(
             "OPTIONS",
             "",
             (*_PREFLIGHT_ASKED, ("Access-Control-Request-Headers", asked)),
@@ -5921,11 +5909,11 @@ _LINEAR_HTTP = [
             ("a,,b", "a,,b"),
         )
     ),
-    _http_row("OPTIONS", "", (), None, "key", 400, _JSON_UTF8, _CSRF, id="OPTIONS"),
-    _http_row(
+    http_row("OPTIONS", "", (), None, "key", 400, _JSON_UTF8, _CSRF, id="OPTIONS"),
+    http_row(
         "OPTIONS", "", (), None, "Bearer key", 400, _JSON_UTF8, _CSRF, id="OPTIONS, Bearer key"
     ),
-    _http_row(
+    http_row(
         "OPTIONS",
         "",
         (("Access-Control-Request-Method", "POST"),),
@@ -5936,10 +5924,10 @@ _LINEAR_HTTP = [
         _CSRF,
         id="OPTIONS, no Origin",
     ),
-    _http_row("OPTIONS", "", _J, None, "key", 405, _JSON_UTF8, _ONLY_GET_POST, id="OPTIONS, JSON"),
-    # The API key under `Bearer` on any method but OPTIONS, ahead of `body-parser`.
+    http_row("OPTIONS", "", _J, None, "key", 405, _JSON_UTF8, _ONLY_GET_POST, id="OPTIONS, JSON"),
+    # `_api_key_as_bearer` ahead of `body-parser`.
     *(
-        _http_row(m, t, h, b, "Bearer key", 400, _JSON_UTF8, a, id=f"{m}, Bearer key")
+        http_row(m, t, h, b, "Bearer key", 400, _JSON_UTF8, a, id=f"{m}, Bearer key")
         for m, t, h, b, a in (
             ("GET", _Q, (), None, _API_KEY_AS_BEARER),
             ("PUT", "", _J, b"{", _API_KEY_AS_BEARER),
@@ -5947,18 +5935,18 @@ _LINEAR_HTTP = [
             ("PATCH", "", _J, None, _API_KEY_AS_BEARER),
         )
     ),
-    # `body-parser` on any method's JSON body, then Apollo Server's CSRF check, then its 405.
-    _http_row("PUT", "", (*_J, *_P), b"{", "key", 400, _JSON_UTF8, _EXPECTED_PROPERTY, id="PUT {"),
-    _http_row(
+    # `body-parser` on a JSON body (`_has_body`), then Apollo Server's CSRF check, then its 405.
+    http_row("PUT", "", (*_J, *_P), b"{", "key", 400, _JSON_UTF8, _EXPECTED_PROPERTY, id="PUT {"),
+    http_row(
         "OPTIONS", "", (*_J, *_P), b"{", "key", 400, _JSON_UTF8, _EXPECTED_PROPERTY, id="OPTIONS {"
     ),
-    _http_row(
+    http_row(
         "PUT", "", (*_J, *_P), _TYPENAME, "key", 405, _JSON_UTF8, _ONLY_GET_POST, id="PUT, a query"
     ),
-    _http_row(
+    http_row(
         "DELETE", "", _J, _TYPENAME, "none", 405, _JSON_UTF8, _ONLY_GET_POST, id="DELETE, a query"
     ),
-    _http_row(
+    http_row(
         "PUT",
         "",
         (("Content-Type", "text/plain"),),
@@ -5969,11 +5957,11 @@ _LINEAR_HTTP = [
         _CSRF,
         id="PUT, text/plain",
     ),
-    _http_row("DELETE", "", (), None, "nope", 400, _JSON_UTF8, _CSRF, id="DELETE"),
+    http_row("DELETE", "", (), None, "nope", 400, _JSON_UTF8, _CSRF, id="DELETE"),
     # A POST's content type: read as JSON, refused as a request a browser sends unpreflighted, or
     # passed with nothing read.
     *(
-        _http_row(
+        http_row(
             "POST",
             "",
             (("Content-Type", t), *h),
@@ -6002,15 +5990,15 @@ _LINEAR_HTTP = [
             ('application/json;x="a;b"', (), 200, _TYPENAME_DATA, ""),
         )
     ),
-    _http_row("POST", "", (), _TYPENAME, "key", 400, _JSON_UTF8, _CSRF, id="no type"),
-    _http_row("POST", "", _P, _TYPENAME, "key", 400, _JSON_UTF8, _NO_KEYS, id="no type, preflight"),
-    _http_row("POST", "", _J, b"", "key", 400, _JSON_UTF8, _NO_KEYS, id="JSON, empty"),
+    http_row("POST", "", (), _TYPENAME, "key", 400, _JSON_UTF8, _CSRF, id="no type"),
+    http_row("POST", "", _P, _TYPENAME, "key", 400, _JSON_UTF8, _NO_KEYS, id="no type, preflight"),
+    http_row("POST", "", _J, b"", "key", 400, _JSON_UTF8, _NO_KEYS, id="JSON, empty"),
     # A GET: its query string, Apollo Server's 405 for one that is not a query, ahead of the
     # credential.
-    _http_row("GET", _Q, _P, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id="GET"),
-    _http_row("GET", _Q, (), None, "key", 400, _JSON_UTF8, _CSRF, id="GET, unpreflighted"),
-    _http_row("GET", _Q, _J, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id="GET, JSON"),
-    _http_row(
+    http_row("GET", _Q, _P, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id="GET"),
+    http_row("GET", _Q, (), None, "key", 400, _JSON_UTF8, _CSRF, id="GET, unpreflighted"),
+    http_row("GET", _Q, _J, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id="GET, JSON"),
+    http_row(
         "GET",
         _Q,
         (("Content-Type", "text/plain"), *_P),
@@ -6021,7 +6009,7 @@ _LINEAR_HTTP = [
         _TYPENAME_DATA,
         id="GET, text/plain",
     ),
-    _http_row(
+    http_row(
         "GET",
         _Q,
         (("Content-Type", "foo"),),
@@ -6032,8 +6020,8 @@ _LINEAR_HTTP = [
         _TYPENAME_DATA,
         id="GET, foo",
     ),
-    _http_row("GET", _Q, _P, None, "none", 401, _JSON_UTF8, _UNAUTHENTICATED, id="GET, none"),
-    _http_row(
+    http_row("GET", _Q, _P, None, "none", 401, _JSON_UTF8, _UNAUTHENTICATED, id="GET, none"),
+    http_row(
         "GET",
         "?query=%7B+__typename+%7D",
         _P,
@@ -6044,12 +6032,12 @@ _LINEAR_HTTP = [
         _TYPENAME_DATA,
         id="GET, +",
     ),
-    _http_row("GET", "", _P, None, "key", 400, _JSON_UTF8, _NO_QUERY, id="GET, no query"),
-    _http_row(
+    http_row("GET", "", _P, None, "key", 400, _JSON_UTF8, _NO_QUERY, id="GET, no query"),
+    http_row(
         "GET", "?QUERY" + _Q[6:], _P, None, "key", 400, _JSON_UTF8, _NO_QUERY, id="GET, QUERY"
     ),
     *(
-        _http_row("GET", t, _P, None, "key", 400, _JSON_UTF8, _search_refusal(m), id=i)
+        http_row("GET", t, _P, None, "key", 400, _JSON_UTF8, _search_refusal(m), id=i)
         for t, m, i in (
             (
                 _Q + "&query=",
@@ -6109,7 +6097,7 @@ _LINEAR_HTTP = [
         )
     ),
     *(
-        _http_row(
+        http_row(
             "GET",
             "?query=mutation%20%7B%20__typename%20%7D",
             _P,
@@ -6123,7 +6111,7 @@ _LINEAR_HTTP = [
         )
         for c in ("key", "none")
     ),
-    _http_row(
+    http_row(
         "GET",
         "?query=query%20A%20%7B%20__typename%20%7D%20mutation%20B%20%7B%20__typename%20%7D"
         "&operationName=A",
@@ -6135,7 +6123,7 @@ _LINEAR_HTTP = [
         _TYPENAME_DATA,
         id="GET, a query beside a mutation",
     ),
-    _http_row(
+    http_row(
         "HEAD",
         _Q,
         _P,
@@ -6147,7 +6135,7 @@ _LINEAR_HTTP = [
         id="HEAD",
         answered={"allow": "GET, POST"},
     ),
-    _http_row(
+    http_row(
         "HEAD",
         _Q,
         (("Content-Type", "text/plain"),),
@@ -6158,10 +6146,9 @@ _LINEAR_HTTP = [
         b"",
         id="HEAD, text/plain",
     ),
-    # Accept: the media type of an answer, Apollo Server's 406 once its request pipeline has
-    # answered, and none for a refusal it throws before that.
+    # `apollo_http.response_type` and its 406, the 401 among the answers it replaces.
     *(
-        _http_row("POST", "", (*_J, ("Accept", a)), _TYPENAME, "key", s, t, b, id=f"Accept {a!r}")
+        http_row("POST", "", (*_J, ("Accept", a)), _TYPENAME, "key", s, t, b, id=f"Accept {a!r}")
         for a, s, t, b in (
             ("text/html", 406, _JSON_UTF8, _NOT_ACCEPTABLE),
             ("application/json;q=0", 406, _JSON_UTF8, _NOT_ACCEPTABLE),
@@ -6181,7 +6168,7 @@ _LINEAR_HTTP = [
         )
     ),
     *(
-        _http_row("POST", "", (*_J, ("Accept", a)), b, c, s, t, e, id=f"Accept {a!r}, {i}")
+        http_row("POST", "", (*_J, ("Accept", a)), b, c, s, t, e, id=f"Accept {a!r}, {i}")
         for a, b, c, s, t, e, i in (
             ("text/html", b"{}", "key", 400, _JSON_UTF8, _NO_KEYS, "{}"),
             (
@@ -6216,7 +6203,7 @@ _LINEAR_HTTP = [
             ("text/html", b"{", "key", 400, _JSON_UTF8, _EXPECTED_PROPERTY, "{"),
         )
     ),
-    _http_row(
+    http_row(
         "GET",
         _Q,
         (*_P, ("Accept", "text/html")),
@@ -6227,7 +6214,7 @@ _LINEAR_HTTP = [
         _NOT_ACCEPTABLE,
         id="GET, Accept text/html",
     ),
-    _http_row(
+    http_row(
         "GET",
         "?query=mutation%20%7B%20__typename%20%7D",
         (*_P, ("Accept", "text/html;level=1")),
@@ -6238,7 +6225,7 @@ _LINEAR_HTTP = [
         _NOT_ACCEPTABLE,
         id="GET mutation, Accept text/html;level=1",
     ),
-    _http_row(
+    http_row(
         "POST",
         "",
         (("Content-Type", "text/plain"), ("Accept", "application/graphql-response+json")),
@@ -6249,7 +6236,7 @@ _LINEAR_HTTP = [
         _CSRF,
         id="text/plain, Accept graphql-response",
     ),
-    _http_row(
+    http_row(
         "PUT",
         "",
         (*_J, ("Accept", "application/graphql-response+json")),
@@ -6260,7 +6247,7 @@ _LINEAR_HTTP = [
         _ONLY_GET_POST,
         id="PUT, Accept graphql-response",
     ),
-    _http_row(
+    http_row(
         "GET",
         _Q,
         (*_P, ("Accept", "text/html, application/graphql-response+json")),
@@ -6273,7 +6260,7 @@ _LINEAR_HTTP = [
     ),
     # `cors` lets any other method carrying `Origin` through; an API key under `Bearer` on DELETE.
     *(
-        _http_row(m, t, (*h, *_ORIGIN), b, "key", s, _JSON_UTF8, a, id=f"{m}, Origin")
+        http_row(m, t, (*h, *_ORIGIN), b, "key", s, _JSON_UTF8, a, id=f"{m}, Origin")
         for m, t, h, b, s, a in (
             ("POST", "", _J, _TYPENAME, 200, _TYPENAME_DATA),
             ("GET", _Q, _P, None, 200, _TYPENAME_DATA),
@@ -6283,7 +6270,7 @@ _LINEAR_HTTP = [
             ("DELETE", "", _J, _TYPENAME, 405, _ONLY_GET_POST),
         )
     ),
-    _http_row(
+    http_row(
         "DELETE",
         "",
         (),
@@ -6294,7 +6281,7 @@ _LINEAR_HTTP = [
         _API_KEY_AS_BEARER,
         id="DELETE, Bearer key",
     ),
-    _http_row(
+    http_row(
         "OPTIONS",
         "",
         (
@@ -6311,7 +6298,7 @@ _LINEAR_HTTP = [
         answered={**_LINEAR_PREFLIGHT, "access-control-allow-headers": "a,b"},
     ),
     *(
-        _http_row(
+        http_row(
             "OPTIONS",
             "",
             (*_PREFLIGHT_ASKED, ("Access-Control-Request-Headers", asked)),
@@ -6330,7 +6317,7 @@ _LINEAR_HTTP = [
             ("a b", "a b"),
         )
     ),
-    _http_row(
+    http_row(
         "OPTIONS",
         "",
         (("Origin", " https://example.com\xa0"), ("Access-Control-Request-Method", "POST")),
@@ -6342,10 +6329,10 @@ _LINEAR_HTTP = [
         id="Origin with spaces",
         answered={**_LINEAR_PREFLIGHT, "access-control-allow-origin": "https://example.com\xa0"},
     ),
-    # A header sent twice: `Accept` and the preflight header joined, `Content-Type` joined as
-    # Linear's front joins it (`backlot.graphql.body.joined_header`).
+    # Copies of a header: `Content-Type` as `backlot.graphql.body.joined_header` joins them, the
+    # rest as `apollo_http.headers_seen` reads them.
     *(
-        _http_row("POST", "", h, _TYPENAME, "key", s, _JSON_UTF8, a, id=i)
+        http_row("POST", "", h, _TYPENAME, "key", s, _JSON_UTF8, a, id=i)
         for h, s, a, i in (
             (
                 (*_J, ("Accept", "application/json"), ("Accept", "text/html")),
@@ -6373,15 +6360,15 @@ _LINEAR_HTTP = [
         )
     ),
     *(
-        _http_row("GET", _Q, h, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id=i)
+        http_row("GET", _Q, h, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id=i)
         for h, i in (
             ((("apollo-require-preflight", ""), *_P), "preflight empty, 1"),
             ((*_P, ("apollo-require-preflight", "")), "preflight 1, empty"),
         )
     ),
-    # A body under any method but GET and HEAD, as Linear's front gives one with no length.
+    # No body and no length under a JSON type, by method (`_has_body`).
     *(
-        _http_row(
+        http_row(
             m,
             t,
             (("Content-Type", "application/json; charset=latin1"), *h),
@@ -6403,34 +6390,34 @@ _LINEAR_HTTP = [
             ("HEAD", "", (), 405, b""),
         )
     ),
-    _http_row("POST", "", _J, None, "key", 400, _JSON_UTF8, _NO_KEYS, id="JSON, no body"),
-    _http_row("POST", "", (), None, "key", 400, _JSON_UTF8, _CSRF, id="no type, no body"),
-    _http_row(
+    http_row("POST", "", _J, None, "key", 400, _JSON_UTF8, _NO_KEYS, id="JSON, no body"),
+    http_row("POST", "", (), None, "key", 400, _JSON_UTF8, _CSRF, id="no type, no body"),
+    http_row(
         "POST", "", _P, None, "key", 400, _JSON_UTF8, _NO_KEYS, id="no type, no body, preflight"
     ),
-    _http_row(
+    http_row(
         "POST",
         "",
         _P,
-        _Chunked(_TYPENAME),
+        Chunked(_TYPENAME),
         "key",
         400,
         _JSON_UTF8,
         _NO_KEYS,
         id="no type, chunked, preflight",
     ),
-    _http_row(
+    http_row(
         "POST",
         "",
         _J,
-        _Chunked(_TYPENAME),
+        Chunked(_TYPENAME),
         "key",
         200,
         _JSON_UTF8,
         _TYPENAME_DATA,
         id="JSON, chunked",
     ),
-    _http_row(
+    http_row(
         "GET",
         "?query=%7B&query=%7B",
         (),
@@ -6441,7 +6428,7 @@ _LINEAR_HTTP = [
         _CSRF,
         id="GET, unpreflighted, query twice",
     ),
-    _http_row(
+    http_row(
         "GET",
         _Q + "&variables=%7B%7D&operationName=",
         _P,
@@ -6485,7 +6472,7 @@ def test_linear_answers_each_method_type_and_accept_as_linear_does(
     if _LINEAR_CREDENTIALS[credential] is not None:
         value = _LINEAR_CREDENTIALS[credential].format(t=tokens_yaml["admin_token"])
         sent += [("Authorization", value)] * (2 if credential == "twice" else 1)
-    content = body.chunks() if isinstance(body, _Chunked) else body
+    content = body.chunks() if isinstance(body, Chunked) else body
     r = sent_as(client, method, f"/linear/graphql{target}", sent, content=content, bare=True)
     assert r.status_code == status
     assert r.headers.get("content-type") == media_type

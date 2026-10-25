@@ -392,10 +392,9 @@ def test_cloudflare_refuses_a_repeated_authorization(
         assert r.content == page
 
 
-# Cloudflare's answer to each method it refuses in front of Linear and Fireflies, on each path
-# api.linear.app and api.fireflies.ai answered it on, and behind its 400 for `Authorization` sent
-# twice; `backlot.main.refuse_cloudflares_methods_on_linear_and_fireflies` records them. The last
-# row is the control: a path that only starts with the vendor's name is not the vendor's.
+# Each of `backlot.main._CLOUDFLARE_METHOD`'s answers on the paths other than `/graphql` it records,
+# and the 400 ahead of it for `Authorization` sent twice. The last row is the control: a path that
+# only starts with the vendor's name is not the vendor's.
 _PAGE = (
     b"<html>\r\n<head><title>%s</title></head>\r\n<body>\r\n<center><h1>%s</h1></center>\r\n"
     b"<hr><center>cloudflare</center>\r\n</body>\r\n</html>\r\n"

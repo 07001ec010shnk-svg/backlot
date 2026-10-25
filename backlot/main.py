@@ -1226,7 +1226,8 @@ async def warn_slack_post_charset(request: Request, call_next):
 
 #: Cloudflare's answer to each method it refuses in front of Linear and Fireflies, as
 #: api.linear.app and api.fireflies.ai answered each on `/graphql`, `/graphql/`, `/nosuch` and `/`
-#: on 2026-10-25 (UTC): a page with CRLF line ends, or a line of text, and the headers it puts on it.
+#: on 2026-10-25 (UTC): a page with CRLF line ends, or a line of text, and the headers it puts on
+#: it.
 _CLOUDFLARE_METHOD = {
     "TRACE": (
         405,

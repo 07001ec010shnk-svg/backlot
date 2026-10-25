@@ -1996,12 +1996,9 @@ def test_a_tool_carries_its_fields_description(tools):
     assert "Loose notes, newest first." in tools["notes"].description
 
 
-# --- Apollo Server's HTTP layer, and the Node libraries in front of it --------------------------
-# Each value and what the library the port reads off answers for it under Node 24.18.0, asked on
-# 2026-10-25: negotiator 1.0.0 (`apollo_http.response_type`, `apollo_http.prefers_html`),
-# whatwg-mimetype 4.0.0 (`apollo_http.mime_essence`), type-is 2.0.1 over content-type 1.0.5
-# (`body.express_reads_json`), Fastify 5.10.0's `ContentType` (`body.fastify_media_type`) and
-# fast-querystring 1.1.2 (`body.form_fields`).
+# --- the Node libraries `apollo_http` and `body` are read off -------------------------------------
+# Each value and what the library behind the port each test names answered for it under Node
+# 24.18.0, on 2026-10-25; the ports' docstrings name each library's release.
 _ACCEPTED = [
     ("*/*", apollo_http.JSON, False),
     ("application/*", apollo_http.JSON, False),

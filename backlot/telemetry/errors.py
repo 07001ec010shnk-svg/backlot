@@ -21,7 +21,7 @@ failure:
 | ``unsupported`` | Backlot does not do this yet: the baseline records the operation as ``missing`` or ``refused``, or the GraphQL engine refused a filter |
 | ``internal`` | of a Backlot bug: its own failure, or a 5xx other than a vendor's answer (below) |
 | ``rate_limit`` | the vendor's rate limit was reached: a 429, or a 403 with ``x-ratelimit-remaining: 0`` as GitHub sends |
-| ``auth`` | the credential was missing, wrong, or not allowed: a 401 or 403, Slack's auth errors, which it sends with a 200, or Fireflies' ``auth_failed``, which it sends with a 500 |
+| ``auth`` | the credential was missing, wrong, or not allowed: a 401 or 403, or one in ``_AUTH`` |
 | ``client`` | the request was wrong: any other failure |
 
 Backlot's own failure is an exception raised instead of an answer, or a field error the GraphQL
@@ -175,8 +175,8 @@ def error_code(source: str, status: int, body: bytes) -> str:
     return ""
 
 
-# The auth errors a vendor answers at a status other than 401 and 403: Slack's at 200, and Fireflies'
-# at 500 (`backlot.routers.fireflies._auth_failed`).
+# The auth errors a vendor answers at a status other than 401 and 403: Slack's at 200, and
+# Fireflies' at 500 (`backlot.routers.fireflies._auth_failed`).
 _AUTH = frozenset(
     {("slack", "account_inactive"), ("slack", "invalid_auth"), ("slack", "not_authed")}
     | {("fireflies", "auth_failed")}

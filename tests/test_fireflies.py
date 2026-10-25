@@ -19,10 +19,12 @@ from backlot import store
 from backlot.graphql import mcp_tools
 from tests._helpers import (
     SWEPT_BYTES,
+    Chunked,
     WithTheKey,
     client_for,
     corpus_client,
     gql,
+    http_row,
     padded_query,
     sent_as,
     served_id,
@@ -1324,7 +1326,7 @@ def _roster_emails(settings):
     return [u["email"] for u in data.get("users", [])]
 
 
-# --- the HTTP layer: methods, content types, Accept and CORS -------------------------------------
+# --- Fastify, @fastify/cors and Apollo Server in front of Fireflies' GraphQL ----------------------
 # The request, the credential (`_FIREFLIES_CREDENTIALS`) and the answer api.fireflies.ai gave it on
 # 2026-10-25 (UTC): its status, its media type and its body but for the newline Apollo Server ends
 # one with, `_TYPENAME_DATA` where it served the query, and none for a `HEAD`.
@@ -1358,18 +1360,13 @@ _FIREFLIES_PREFLIGHT = {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET,HEAD,POST",
     "vary": "Access-Control-Request-Headers",
+    # Sent no `Access-Control-Request-Headers`, a preflight is answered none.
+    "access-control-allow-headers": None,
 }
 _J = (("Content-Type", "application/json"),)
 _P = (("apollo-require-preflight", "1"),)
 _PREFLIGHT_ASKED = (("Origin", "https://example.com"), ("Access-Control-Request-Method", "POST"))
 _Q = "?query=%7B%20__typename%20%7D"
-
-
-class _Chunked(bytes):
-    """A body sent in chunks, with no `Content-Length`."""
-
-    async def chunks(self):
-        yield bytes(self)
 
 
 _PAST_THE_LIMIT = b"x" * (2**20 + 10)
@@ -1384,18 +1381,9 @@ def _not_found(method: str, target: str) -> bytes:
     )
 
 
-def _http_row(
-    method, target, sent, body, credential, status, media_type, answer, id, answered=None
-):
-    """A row: the request, the credential, and the answer, ``answered`` naming headers on it."""
-    return pytest.param(
-        method, target, sent, body, credential, status, media_type, answer, answered or {}, id=id
-    )
-
-
 _FIREFLIES_HTTP = [
     # Cloudflare, ahead of everything.
-    _http_row(
+    http_row(
         "TRACE",
         "",
         (),
@@ -1406,7 +1394,7 @@ _FIREFLIES_HTTP = [
         _CLOUDFLARE_PAGE % ((b"405 Not Allowed",) * 2),
         id="TRACE",
     ),
-    _http_row(
+    http_row(
         "CONNECT",
         "",
         (),
@@ -1417,7 +1405,7 @@ _FIREFLIES_HTTP = [
         b"error code: 1045\n",
         id="CONNECT",
     ),
-    _http_row(
+    http_row(
         "PURGE",
         "",
         (),
@@ -1428,7 +1416,7 @@ _FIREFLIES_HTTP = [
         _CLOUDFLARE_PAGE % ((b"400 Bad Request",) * 2),
         id="PURGE",
     ),
-    _http_row(
+    http_row(
         "TRACE",
         "",
         (),
@@ -1441,7 +1429,7 @@ _FIREFLIES_HTTP = [
     ),
     # `@fastify/cors`, whatever the credential and the body.
     *(
-        _http_row(
+        http_row(
             "OPTIONS",
             "",
             _PREFLIGHT_ASKED,
@@ -1455,7 +1443,7 @@ _FIREFLIES_HTTP = [
         )
         for c in ("key", "none", "Bearer nope")
     ),
-    _http_row(
+    http_row(
         "OPTIONS",
         "",
         (("Origin", "null"), ("Access-Control-Request-Method", "POST")),
@@ -1467,7 +1455,7 @@ _FIREFLIES_HTTP = [
         id="Origin null",
         answered=_FIREFLIES_PREFLIGHT,
     ),
-    _http_row(
+    http_row(
         "OPTIONS",
         "",
         (("Origin", "https://example.com"), ("Access-Control-Request-Method", "PUT")),
@@ -1480,7 +1468,7 @@ _FIREFLIES_HTTP = [
         answered=_FIREFLIES_PREFLIGHT,
     ),
     *(
-        _http_row(
+        http_row(
             "OPTIONS",
             "",
             (*_PREFLIGHT_ASKED, ("Access-Control-Request-Headers", asked)),
@@ -1499,7 +1487,7 @@ _FIREFLIES_HTTP = [
         )
     ),
     *(
-        _http_row(
+        http_row(
             "OPTIONS",
             "",
             h,
@@ -1519,8 +1507,8 @@ _FIREFLIES_HTTP = [
             ((*_J, *_P), b"{", "key", "{"),
         )
     ),
-    # Fastify's 404 for a method its route does not take, once it has read a body it reads.
-    _http_row(
+    # `_not_found`, after `_fastify_read`.
+    http_row(
         "ACL",
         "?_=271823726",
         (*_J, *_P),
@@ -1533,7 +1521,7 @@ _FIREFLIES_HTTP = [
         id="ACL",
     ),
     *(
-        _http_row(m, "?_=1", (*_J, *_P), None, "key", 404, _JSON_UTF8, _not_found(m, "?_=1"), id=m)
+        http_row(m, "?_=1", (*_J, *_P), None, "key", 404, _JSON_UTF8, _not_found(m, "?_=1"), id=m)
         for m in (
             "BIND",
             "CHECKOUT",
@@ -1561,7 +1549,7 @@ _FIREFLIES_HTTP = [
             "UNSUBSCRIBE",
         )  # fmt: skip
     ),
-    _http_row(
+    http_row(
         "PROPFIND",
         "?x=%7B%20y&z&a=b+c&_=1",
         _J,
@@ -1573,7 +1561,7 @@ _FIREFLIES_HTTP = [
         id="PROPFIND, a query string",
     ),
     *(
-        _http_row(m, "", h, b, c, s, _JSON_UTF8, a, id=f"{m} {i}")
+        http_row(m, "", h, b, c, s, _JSON_UTF8, a, id=f"{m} {i}")
         for m, h, b, c, s, a, i in (
             ("PUT", (*_J, *_P), _TYPENAME, "key", 404, _not_found("PUT", ""), "a query"),
             ("DELETE", _J, _TYPENAME, "none", 404, _not_found("DELETE", ""), "a query"),
@@ -1614,7 +1602,7 @@ _FIREFLIES_HTTP = [
     # A POST's content type: a 415 for one Fastify does not read; CSRF for one a browser sends
     # unpreflighted; the CSRF check ahead of the credential.
     *(
-        _http_row("POST", "", (("Content-Type", t), *h), b, c, s, _JSON_UTF8, a, id=f"{t!r}{i}")
+        http_row("POST", "", (("Content-Type", t), *h), b, c, s, _JSON_UTF8, a, id=f"{t!r}{i}")
         for t, h, b, c, s, a, i in (
             ("text/plain", (), _TYPENAME, "key", 400, _CSRF, ""),
             ("text/plain", (), _TYPENAME, "none", 400, _CSRF, ", none"),
@@ -1682,17 +1670,15 @@ _FIREFLIES_HTTP = [
             ("text/plain", _P, b"", "key", 400, _NO_KEYS, ", empty"),
         )
     ),
-    _http_row("POST", "", (), _TYPENAME, "key", 415, _JSON_UTF8, _UNSUPPORTED, id="no type"),
-    _http_row(
+    http_row("POST", "", (), _TYPENAME, "key", 415, _JSON_UTF8, _UNSUPPORTED, id="no type"),
+    http_row(
         "POST", "", _P, _TYPENAME, "key", 415, _JSON_UTF8, _UNSUPPORTED, id="no type, preflight"
     ),
-    _http_row("POST", "", (), b"", "key", 400, _JSON_UTF8, _CSRF, id="no type, empty"),
-    _http_row(
-        "POST", "", _P, b"", "key", 400, _JSON_UTF8, _NO_KEYS, id="no type, empty, preflight"
-    ),
+    http_row("POST", "", (), b"", "key", 400, _JSON_UTF8, _CSRF, id="no type, empty"),
+    http_row("POST", "", _P, b"", "key", 400, _JSON_UTF8, _NO_KEYS, id="no type, empty, preflight"),
     # Apollo Server's page for a browser, ahead of the CSRF check and the credential.
     *(
-        _http_row("GET", t, (*h, ("Accept", a)), None, c, s, ty, e, id=f"GET, Accept {a!r}{i}")
+        http_row("GET", t, (*h, ("Accept", a)), None, c, s, ty, e, id=f"GET, Accept {a!r}{i}")
         for t, h, a, c, s, ty, e, i in (
             ("", (), "text/html", "none", 200, "text/html", _LANDING_PAGE, ", none"),
             (_Q, _P, "text/html,application/json", "key", 200, "text/html", _LANDING_PAGE, ""),
@@ -1722,13 +1708,12 @@ _FIREFLIES_HTTP = [
             ),
         )
     ),
-    # A GET: the CSRF check, the credential, Apollo Server 5.5's 415 for a content type, then its
-    # query string.
-    _http_row("GET", _Q, _P, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id="GET"),
-    _http_row("GET", _Q, (), None, "key", 400, _JSON_UTF8, _CSRF, id="GET, unpreflighted"),
-    _http_row("GET", _Q, _J, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id="GET, JSON"),
+    # A GET, its content type and its query string read after the credential.
+    http_row("GET", _Q, _P, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id="GET"),
+    http_row("GET", _Q, (), None, "key", 400, _JSON_UTF8, _CSRF, id="GET, unpreflighted"),
+    http_row("GET", _Q, _J, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id="GET, JSON"),
     *(
-        _http_row(
+        http_row(
             "GET", _Q, (("Content-Type", t), *h), None, c, s, _JSON_UTF8, a, id=f"GET, {t!r}{i}"
         )
         for t, h, c, s, a, i in (
@@ -1740,7 +1725,7 @@ _FIREFLIES_HTTP = [
             ("application/json; charset=latin1", _P, "key", 200, _TYPENAME_DATA, ""),
         )
     ),
-    _http_row(
+    http_row(
         "GET",
         "?query=%7B&query=%7B",
         (("Content-Type", "text/plain"), *_P),
@@ -1752,7 +1737,7 @@ _FIREFLIES_HTTP = [
         id="GET, text/plain, query twice",
     ),
     *(
-        _http_row("GET", t, _P, None, "key", 400, _JSON_UTF8, _apollo(m), id=i)
+        http_row("GET", t, _P, None, "key", 400, _JSON_UTF8, _apollo(m), id=i)
         for t, m, i in (
             (
                 _Q + "&query=",
@@ -1787,7 +1772,7 @@ _FIREFLIES_HTTP = [
         )
     ),
     *(
-        _http_row(
+        http_row(
             "GET",
             f"?query={op}%20%7B%20__typename%20%7D",
             _P,
@@ -1823,7 +1808,7 @@ _FIREFLIES_HTTP = [
             ("mutation", "none", 500, _BAD_KEY, {}),
         )
     ),
-    _http_row(
+    http_row(
         "HEAD",
         _Q,
         _P,
@@ -1835,7 +1820,7 @@ _FIREFLIES_HTTP = [
         id="HEAD",
         answered={"allow": "GET, POST"},
     ),
-    _http_row(
+    http_row(
         "HEAD",
         _Q,
         (*_P, ("Accept", "text/html")),
@@ -1846,8 +1831,8 @@ _FIREFLIES_HTTP = [
         b"",
         id="HEAD, Accept text/html",
     ),
-    _http_row("HEAD", _Q, _P, None, "none", 500, _JSON_UTF8, b"", id="HEAD, none"),
-    _http_row(
+    http_row("HEAD", _Q, _P, None, "none", 500, _JSON_UTF8, b"", id="HEAD, none"),
+    http_row(
         "HEAD",
         _Q,
         (("Content-Type", "text/plain"),),
@@ -1858,10 +1843,9 @@ _FIREFLIES_HTTP = [
         b"",
         id="HEAD, text/plain",
     ),
-    # Accept: the media type of an answer, Apollo Server's 406 once its request pipeline has
-    # answered, and none for a refusal it throws before that, the credential's among them.
+    # `apollo_http.response_type` and its 406, the credential's 500 among the thrown refusals.
     *(
-        _http_row("POST", "", (*_J, ("Accept", a)), b, c, s, t, e, id=f"Accept {a!r}{i}")
+        http_row("POST", "", (*_J, ("Accept", a)), b, c, s, t, e, id=f"Accept {a!r}{i}")
         for a, b, c, s, t, e, i in (
             ("text/html", _TYPENAME, "key", 406, _JSON_UTF8, _NOT_ACCEPTABLE, ""),
             ("application/json;q=0", _TYPENAME, "key", 406, _JSON_UTF8, _NOT_ACCEPTABLE, ""),
@@ -1916,7 +1900,7 @@ _FIREFLIES_HTTP = [
             ("text/html", b"{", "key", 400, _JSON_UTF8, _NOT_JSON, ", {"),
         )
     ),
-    _http_row(
+    http_row(
         "POST",
         "",
         (("Content-Type", "text/plain"), ("Accept", "application/graphql-response+json")),
@@ -1927,7 +1911,7 @@ _FIREFLIES_HTTP = [
         _CSRF,
         id="text/plain, Accept graphql-response",
     ),
-    _http_row(
+    http_row(
         "PUT",
         "",
         (*_J, ("Accept", "application/graphql-response+json")),
@@ -1940,8 +1924,8 @@ _FIREFLIES_HTTP = [
     ),
     # Fastify reads the body of a DELETE before its 404, and leaves a type it has no parser for
     # unread there.
-    _http_row("DELETE", "", (*_J, *_P), b"{", "key", 400, _JSON_UTF8, _NOT_JSON, id="DELETE {"),
-    _http_row(
+    http_row("DELETE", "", (*_J, *_P), b"{", "key", 400, _JSON_UTF8, _NOT_JSON, id="DELETE {"),
+    http_row(
         "PUT",
         "",
         (("Content-Type", "application/graphql"), *_P),
@@ -1952,7 +1936,7 @@ _FIREFLIES_HTTP = [
         _not_found("PUT", ""),
         id="PUT application/graphql",
     ),
-    _http_row(
+    http_row(
         "OPTIONS",
         "",
         (
@@ -1969,7 +1953,7 @@ _FIREFLIES_HTTP = [
         answered={**_FIREFLIES_PREFLIGHT, "access-control-allow-headers": "a, b"},
     ),
     *(
-        _http_row(
+        http_row(
             "OPTIONS",
             "",
             (*_PREFLIGHT_ASKED, ("Access-Control-Request-Headers", asked)),
@@ -1994,9 +1978,9 @@ _FIREFLIES_HTTP = [
             ("A-B, c_d", "A-B, c_d"),
         )
     ),
-    # A header sent twice: `Accept` and the preflight header joined, `Content-Type` the first.
+    # Copies of a header, read as `apollo_http.headers_seen` reads them.
     *(
-        _http_row("POST", "", h, _TYPENAME, "key", s, _JSON_UTF8, a, id=i)
+        http_row("POST", "", h, _TYPENAME, "key", s, _JSON_UTF8, a, id=i)
         for h, s, a, i in (
             (
                 (*_J, ("Accept", "application/json"), ("Accept", "text/html")),
@@ -2029,15 +2013,15 @@ _FIREFLIES_HTTP = [
         )
     ),
     *(
-        _http_row("GET", _Q, h, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id=i)
+        http_row("GET", _Q, h, None, "key", 200, _JSON_UTF8, _TYPENAME_DATA, id=i)
         for h, i in (
             ((("apollo-require-preflight", ""), *_P), "preflight empty, 1"),
             ((*_P, ("apollo-require-preflight", "")), "preflight 1, empty"),
         )
     ),
-    # A JSON type with no body and no length is read as empty by each method Fastify reads one for.
+    # No body and no length under a JSON type, by method.
     *(
-        _http_row(
+        http_row(
             m,
             t,
             (("Content-Type", "application/json; charset=latin1"),),
@@ -2067,33 +2051,33 @@ _FIREFLIES_HTTP = [
             ("HEAD", "", 405, _JSON_UTF8, b""),
         )
     ),
-    _http_row("POST", "", (), None, "key", 400, _JSON_UTF8, _CSRF, id="no type, no body"),
-    _http_row(
+    http_row("POST", "", (), None, "key", 400, _JSON_UTF8, _CSRF, id="no type, no body"),
+    http_row(
         "POST", "", _P, None, "key", 400, _JSON_UTF8, _NO_KEYS, id="no type, no body, preflight"
     ),
-    _http_row(
+    http_row(
         "POST",
         "",
         _P,
-        _Chunked(_TYPENAME),
+        Chunked(_TYPENAME),
         "key",
         415,
         _JSON_UTF8,
         _UNSUPPORTED,
         id="no type, chunked, preflight",
     ),
-    _http_row(
+    http_row(
         "POST",
         "",
         _J,
-        _Chunked(_TYPENAME),
+        Chunked(_TYPENAME),
         "key",
         200,
         _JSON_UTF8,
         _TYPENAME_DATA,
         id="JSON, chunked",
     ),
-    _http_row(
+    http_row(
         "GET",
         "?query=%7B&query=%7B",
         (),
@@ -2104,7 +2088,7 @@ _FIREFLIES_HTTP = [
         _CSRF,
         id="GET, unpreflighted, query twice",
     ),
-    _http_row(
+    http_row(
         "GET",
         _Q + "&variables=%7B%7D&operationName=",
         _P,
@@ -2116,7 +2100,7 @@ _FIREFLIES_HTTP = [
         id="GET, variables {}, operationName empty",
     ),
     *(
-        _http_row(
+        http_row(
             m,
             t,
             (*h, ("Origin", "https://example.com")),
@@ -2165,7 +2149,7 @@ def test_fireflies_answers_each_method_type_and_accept_as_fireflies_does(
     if _FIREFLIES_CREDENTIALS[credential] is not None:
         value = _FIREFLIES_CREDENTIALS[credential].format(t=tokens_yaml["admin_token"])
         sent += [("Authorization", value)] * (2 if credential == "twice" else 1)
-    content = body.chunks() if isinstance(body, _Chunked) else body
+    content = body.chunks() if isinstance(body, Chunked) else body
     r = sent_as(client, method, f"/fireflies/graphql{target}", sent, content=content, bare=True)
     assert r.status_code == status
     assert r.headers.get("content-type") == media_type

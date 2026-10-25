@@ -199,10 +199,11 @@ def fastify_media_type(content_type: str) -> str | None:
     is the whole value, and splits at its first ``/`` into two tokens, white space allowed before
     the first and after the second. An empty value and ``undefined`` are invalid.
 
-    Fastify 5.7.4 to 5.10.0 answered alike each of 2,138 content types sent to them on
-    2026-10-25 (UTC), and api.fireflies.ai answered as they do each sent to it, where 5.5.0 refuses
-    ``application/json\\t;``, 5.7.0 serves ``application/json ,`` and 5.11.0 reads the body of a
-    ``QUERY``, which Fireflies answered as it answers a ``PUT`` with none."""
+    Fastify 5.7.4 to 5.10.0 answered alike each of 661 content types sent to them on 2026-10-25
+    (UTC), and as api.fireflies.ai did each of its requests replayed to them but Cloudflare's four
+    and a persisted query's, where 5.5.0 refuses ``application/json\\t;``, 5.7.0 serves
+    ``application/json ,`` and 5.11.3 reads the body of a ``QUERY``, which Fireflies answered with
+    its 404 without reading ``{``."""
     if content_type in ("", "undefined"):
         return None
     index = content_type.find(";")
@@ -249,7 +250,7 @@ def _fast_decode(text: str) -> str | None:
 def form_fields(text: str) -> dict[str, str | list[str]]:
     """A form body as ``@fastify/formbody`` 8 reads it with ``fast-querystring`` 1.1.2: the pairs
     between each ``&``, a name alone given ``""``, each ``+`` a space and each name and value
-    percent-decoded, left as sent where it cannot be (:func:`_fast_decode`), and a name sent more
+    percent-decoded, kept as sent where it cannot be (:func:`_fast_decode`), and a name sent more
     than once given the list of its values. api.fireflies.ai served ``query=%7B%20__typename%20%7D``
     with the preflight header on 2026-10-25 (UTC)."""
     fields: dict[str, str | list[str]] = {}

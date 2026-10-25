@@ -321,6 +321,21 @@ def sent_as(client, method: str, path: str, headers, content=None, bare: bool = 
     return asyncio.run(send())
 
 
+class Chunked(bytes):
+    """A body :func:`sent_as` sends in chunks, with no `Content-Length`."""
+
+    async def chunks(self):
+        yield bytes(self)
+
+
+def http_row(method, target, sent, body, credential, status, media_type, answer, id, answered=None):
+    """A row of an HTTP layer's table: the request, the credential, and the answer, ``answered``
+    naming headers on it."""
+    return pytest.param(
+        method, target, sent, body, credential, status, media_type, answer, answered or {}, id=id
+    )
+
+
 def selected_fields(document: str, *path: str) -> set[str]:
     """The field names ``document`` selects at ``path`` — for asserting on a generated selection
     set (``backlot.graphql.mcp_tools``) by shape rather than by substring."""

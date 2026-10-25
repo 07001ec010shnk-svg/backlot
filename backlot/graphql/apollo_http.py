@@ -9,7 +9,8 @@ GET carrying a content type, :func:`response_type` its choice of media type from
 :func:`landing_page` its page for a browser. Each refusal is thrown before the request pipeline, so
 it takes whichever media type ``Accept`` allows and ``application/json`` where it allows none: a
 :class:`~backlot.graphql.engine.Refusal` that is ``thrown``. A refusal the pipeline makes, from a
-persisted query's to a variable's, is refused for the ``Accept`` in turn, with :data:`NOT_ACCEPTABLE`.
+persisted query's to a variable's, is refused for the ``Accept`` in turn, with
+:data:`NOT_ACCEPTABLE`.
 
 The code is read off Apollo Server 5.5.1's ``runHttpQuery.ts``, ``preventCsrf.ts`` and
 ``ApolloServer.ts``, and the libraries they call: ``whatwg-mimetype`` 4.0.0 (:func:`mime_essence`)
@@ -213,8 +214,8 @@ _HTTP_SPACE = " \t\n\r"
 
 
 def mime_essence(value: str) -> str | None:
-    """``whatwg-mimetype``'s ``MIMEType.parse(value).essence``: the type and subtype in lower case,
-    or ``None`` where it parses none. The parameters cannot make it ``None``."""
+    """``whatwg-mimetype`` 4.0.0's ``MIMEType.parse(value).essence``: the type and subtype in lower
+    case, or ``None`` where it parses none. The parameters cannot make it ``None``."""
     value = value.strip(_HTTP_SPACE)
     type_, _, rest = value.partition("/")
     if not _TOKEN.fullmatch(type_):
