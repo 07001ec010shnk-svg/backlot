@@ -6,15 +6,14 @@ with :mod:`backlot.graphql.body` and hands it to :meth:`Engine.execute_payload`,
 context dict (connection, caller, ``visible_ids``) that every resolver receives as
 ``info.context``.
 
-Both vendors serve GraphQL through Apollo Server 4 over graphql-js, so the engine answers as that
-pair does: Apollo Server's checks of the body and of a persisted query come first, then
-graphql-js's parse, validation and choice of operation (:meth:`Engine.resolve_payload`), then the
-coercion of variables and the run itself (:meth:`Engine.run`), each refusal a :class:`Refusal`
-carrying Apollo Server's ``code`` and the message in graphql-js's words
-(:mod:`backlot.graphql.js_words`). A router that reads the credential between the two stages calls
-them apart. A refusal made before execution carries no ``data`` entry; an error made as the
-operation runs comes back beside ``data``, at 200. Each router turns the refusals into its
-vendor's envelope.
+Both vendors serve GraphQL through Apollo Server over graphql-js, so the engine answers as that pair
+does: Apollo Server's checks of the body and of a persisted query come first, then graphql-js's
+parse, validation and choice of operation (:meth:`Engine.resolve_payload`), then the coercion of
+variables and the run itself (:meth:`Engine.run`), each refusal a :class:`Refusal` carrying Apollo
+Server's ``code`` and the message in graphql-js's words (:mod:`backlot.graphql.js_words`). A router
+that reads the credential between the two stages calls them apart. A refusal made before execution
+carries no ``data`` entry; an error made as the operation runs comes back beside ``data``, at 200.
+Each router turns the refusals into its vendor's envelope.
 """
 
 from __future__ import annotations
