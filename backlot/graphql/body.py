@@ -175,11 +175,11 @@ def express_reads_json(content_type: str) -> bool:
     and reaches Apollo Server as none. api.linear.app answered as these two packages do 66 content
     types on 2026-10-25 (UTC), where ``content-type`` 2.1.0, which ``type-is`` 2.1.0 asks, reads
     ``application/json;``, ``application/json; foo`` and six more as JSON that Linear did not."""
-    type_, semicolon, _ = content_type.partition(";")
+    type_ = content_type.partition(";")[0]
     if type_.strip(JS_SPACE).lower() != "application/json":
         return False
     index = len(type_)
-    while semicolon and (parameter := PARAMETER.match(content_type, index)) is not None:
+    while (parameter := PARAMETER.match(content_type, index)) is not None:
         index = parameter.end()
     return index == len(content_type)
 
@@ -201,9 +201,9 @@ def fastify_media_type(content_type: str) -> str | None:
     and a persisted query's, where 5.5.0 refuses ``application/json\\t;``, 5.7.0 serves
     ``application/json ,`` and 5.11.3 reads the body of a ``QUERY``, which Fireflies answered with
     its 404 without reading ``{``."""
-    type_, slash, subtype = content_type.partition(";")[0].lower().partition("/")
+    type_, _, subtype = content_type.partition(";")[0].lower().partition("/")
     type_, subtype = type_.lstrip(JS_SPACE), subtype.rstrip(JS_SPACE)
-    if not (slash and _FASTIFY_TOKEN.fullmatch(type_) and _FASTIFY_TOKEN.fullmatch(subtype)):
+    if not (_FASTIFY_TOKEN.fullmatch(type_) and _FASTIFY_TOKEN.fullmatch(subtype)):
         return None
     return f"{type_}/{subtype}"
 
