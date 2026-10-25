@@ -710,14 +710,39 @@ def test_linear_unauthenticated_is_401(client):
 
 # --- the body, and where the credential is read against it ---------------------------------------
 # The headers a body was sent with beyond `Content-Type: application/json`, the body, and the bytes
-# Linear refused it with, at the status their `code` names (400 where there is none), or None where
-# Linear served the query, as `backlot.graphql.body` and `backlot.graphql.v8_json` read them.
-# `_GRAPHQL_JS_NOT_JSON` marks the rows `backlot.routers.linear._read` answers in graphql-js's
-# words for the key, no credential and `nope` alike: a body with no text. `_REQUEST_ERROR` marks a
-# JSON array, the 400 with the key; Linear answers it with `Operation batching disabled.` with or
-# without one.
-_GRAPHQL_JS_NOT_JSON = b'{"errors":[{"message":"POST body sent invalid JSON."}]}'
-_REQUEST_ERROR = object()
+# Linear refused it with for the key, no credential and `nope` alike, at the status their `code` or
+# `extensions.http.status` names (`_status`), or None where Linear served the query with the key and
+# answered 401 without one, as `backlot.graphql.body` and `backlot.graphql.v8_json` read them. A
+# `_WithTheKey` row is answered past the credential. Apollo Server's envelopes are as api.linear.app
+# answered them on 2026-10-25 (UTC), less the newline it ends each with.
+class _WithTheKey(bytes):
+    """Linear's answer with the key, at ``status``, to a document it refuses or runs once the
+    credential is read: without one, the 401."""
+
+    def __new__(cls, answer: bytes, status: int = 400):
+        self = super().__new__(cls, answer)
+        self.status = status
+        return self
+
+
+def _apollo(message: bytes) -> bytes:
+    """Apollo Server's refusal of a body as Linear writes it around ``message``, already
+    JSON-escaped."""
+    return (
+        b'{"errors":[{"message":"%s","extensions":{"http":{"status":400,"headers":{}},'
+        b'"code":"BAD_REQUEST","type":"graphql error","userError":true}}]}' % message
+    )
+
+
+def _status(answer: bytes) -> int:
+    envelope = json.loads(answer)
+    if "code" in envelope:
+        return envelope["code"]
+    return envelope["errors"][0]["extensions"]["http"]["status"]
+
+
+_NO_KEYS = _apollo(b"POST body missing, invalid Content-Type, or JSON object has no keys.")
+_BATCHING = _apollo(b"Operation batching disabled.")
 _LINEAR_BODIES = [
     pytest.param(
         b"{",
@@ -1471,10 +1496,165 @@ _LINEAR_BODIES = [
         b'{"error":"Unexpected token \'}\', \\"{\\r\\n\\"query\\":\\r\\n}\\" is not valid JSON","details":{},"code":400}',
         id="CRLF then bad",
     ),
-    pytest.param(b"", _GRAPHQL_JS_NOT_JSON, id="empty"),
-    pytest.param(b"\xef\xbb\xbf", _GRAPHQL_JS_NOT_JSON, id="a byte-order mark alone"),
-    pytest.param(b"[]", _REQUEST_ERROR, id="an array"),
-    pytest.param(b'[{"query":"{ __typename }"}]', _REQUEST_ERROR, id="a batch of one query"),
+    pytest.param(b"", _NO_KEYS, id="empty"),
+    pytest.param(b"\xef\xbb\xbf", _NO_KEYS, id="a byte-order mark alone"),
+    pytest.param(b"{}", _NO_KEYS, id="an empty object"),
+    pytest.param(b"[]", _BATCHING, id="an array"),
+    pytest.param(b'[{"query":"{ __typename }"}]', _BATCHING, id="a batch of one query"),
+    pytest.param(b'{"query":5}', _apollo(b"GraphQL queries must be strings."), id="a query of 5"),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":"x"}',
+        _apollo(
+            b"`variables` in a POST body should be provided as an object, not a recursively "
+            b"JSON-encoded string."
+        ),
+        id="a string of variables",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","extensions":5}',
+        _apollo(b"`extensions` in a POST body must be an object if provided."),
+        id="extensions of 5",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","operationName":5}',
+        _apollo(b"`operationName` in a POST body must be a string if provided."),
+        id="an operationName of 5",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","extensions":{"persistedQuery":{"version":1,"sha256Hash":"'
+        + b"0" * 64
+        + b'"}}}',
+        b'{"errors":[{"message":"Internal server error","extensions":{"http":{"status":400,'
+        b'"headers":{}},"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}]}',
+        id="a persisted query's hash that does not match",
+    ),
+    pytest.param(
+        b'{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"' + b"1" * 64 + b'"}}}',
+        b'{"errors":[{"message":"PersistedQueryNotFound","extensions":{"http":{"status":200,'
+        b'"headers":{}},"code":"PERSISTED_QUERY_NOT_FOUND","type":"graphql error",'
+        b'"userError":true}}]}',
+        id="a persisted query's hash alone",
+    ),
+    pytest.param(
+        b'{"query":null}',
+        b'{"errors":[{"message":"GraphQL operations must contain a non-empty `query` or a '
+        b'`persistedQuery` extension.","extensions":{"http":{"status":400,"headers":{}},'
+        b'"code":"INVALID_INPUT","type":"invalid input","userError":true}}]}',
+        id="a query of null",
+    ),
+    pytest.param(
+        b'{"query":"{"}',
+        b'{"errors":[{"message":"Syntax Error: Expected Name, found <EOF>.","locations":[{"line":1,'
+        b'"column":2}],"extensions":{"http":{"status":400,"headers":{}},'
+        b'"code":"GRAPHQL_PARSE_FAILED","type":"graphql error","userError":true}}]}',
+        id="a document that does not parse",
+    ),
+    pytest.param(
+        b'{"query":"{ nosuch }"}',
+        b'{"errors":[{"message":"Cannot query field \\"nosuch\\" on type \\"Query\\".",'
+        b'"locations":[{"line":1,"column":3}],"extensions":{"http":{"status":400,"headers":{}},'
+        b'"code":"GRAPHQL_VALIDATION_FAILED","type":"graphql error","userError":true}}]}',
+        id="a document that does not validate",
+    ),
+    pytest.param(
+        b'{"query":"query A { __typename } query B { __typename }"}',
+        b'{"errors":[{"message":"operation does not exist","extensions":{"type":"invalid input",'
+        b'"code":"INPUT_ERROR","statusCode":400,"userError":true,"userPresentableMessage":"The '
+        b'operation does not exist on the query.","http":{"status":400}}}]}',
+        id="two operations and no operationName",
+    ),
+    pytest.param(
+        b'{"query":"query($b: Boolean!) { __typename @include(if: $b) }"}',
+        _WithTheKey(
+            b'{"errors":[{"message":"Variable \\"$b\\" of required type \\"Boolean!\\" was not '
+            b'provided.","locations":[{"line":1,"column":7}],"extensions":{"code":"BAD_USER_INPUT",'
+            b'"type":"graphql error","userError":true}}]}'
+        ),
+        id="a variable not provided",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","operationName":"Z"}',
+        b'{"errors":[{"message":"operation does not exist","extensions":{"type":"invalid input","code":"INPUT_ERROR","statusCode":400,"userError":true,"userPresentableMessage":"The operation \'Z\' does not exist on the query.","http":{"status":400}}}]}',
+        id="an operationName no operation has",
+    ),
+    pytest.param(
+        b'{"query":"query A { __typename }","operationName":""}',
+        b'{"errors":[{"message":"operation does not exist","extensions":{"type":"invalid input","code":"INPUT_ERROR","statusCode":400,"userError":true,"userPresentableMessage":"The operation does not exist on the query.","http":{"status":400}}}]}',
+        id="an empty operationName",
+    ),
+    pytest.param(
+        b'{"query":{"kind":"Document"}}',
+        b'{"errors":[{"message":"GraphQL queries must be strings. It looks like you\'re sending the internal graphql-js representation of a parsed query in your request instead of a request in the GraphQL query language. You can convert an AST to a string using the `print` function from `graphql`, or use a client like `apollo-client` which converts the internal representation to a string for you.","extensions":{"http":{"status":400,"headers":{}},"code":"BAD_REQUEST","type":"graphql error","userError":true}}]}',
+        id="a parsed document",
+    ),
+    pytest.param(
+        b'{"query":false}',
+        b'{"errors":[{"message":"GraphQL operations must contain a non-empty `query` or a `persistedQuery` extension.","extensions":{"http":{"status":400,"headers":{}},"code":"INVALID_INPUT","type":"invalid input","userError":true}}]}',
+        id="a query of false",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":"[1]"}',
+        b'{"errors":[{"message":"`variables` in a POST body must be an object if provided.","extensions":{"http":{"status":400,"headers":{}},"code":"BAD_REQUEST","type":"graphql error","userError":true}}]}',
+        id="variables of '[1]'",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":"null"}',
+        None,
+        id="variables of 'null'",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":" {} "}',
+        None,
+        id="variables of ' {} '",
+    ),
+    pytest.param(
+        b'{"query":"query($b: Boolean!) { __typename @include(if: $b) }","variables":"{\\"b\\":5}"}',
+        _WithTheKey(
+            b'{"errors":[{"message":"Variable \\"$b\\" got invalid value 5; Boolean cannot represent a non boolean value: 5","locations":[{"line":1,"column":7}],"extensions":{"code":"BAD_USER_INPUT","type":"graphql error","userError":true}}]}'
+        ),
+        id="variables of a string its operation refuses",
+    ),
+    pytest.param(
+        b'{"query":"query($b: Boolean!) { __typename @include(if: $b) }","variables":"{\\"b\\":true}"}',
+        None,
+        id="variables of a string its operation takes",
+    ),
+    pytest.param(
+        b'{"query":"mutation { __typename }"}',
+        _WithTheKey(b'{"data":{"__typename":"Mutation"}}', 200),
+        id="a mutation of __typename",
+    ),
+    pytest.param(
+        b'{"query":"subscription S { __typename }"}',
+        b'{"errors":[{"message":"Subscription \\"S\\" must not select an introspection top level field.","locations":[{"line":1,"column":18}],"extensions":{"http":{"status":400,"headers":{}},"code":"GRAPHQL_VALIDATION_FAILED","type":"graphql error","userError":true}}]}',
+        id="a subscription of __typename",
+    ),
+    pytest.param(
+        b'{"query":"query($x: String = \\"a\\") { issue(id: $x) { id } }","variables":{"x":null}}',
+        _WithTheKey(
+            b'{"errors":[{"message":"Internal server error","path":["issue"],"locations":[{"line":1,"column":37}],"extensions":{"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}],"data":null}',
+            200,
+        ),
+        id="null for a non-null argument",
+    ),
+    pytest.param(
+        b'{"query":"query($v: Boolean = true) { __typename @include(if: $v) }","variables":{"v":null}}',
+        _WithTheKey(
+            b'{"errors":[{"message":"Internal server error","locations":[{"line":1,"column":53}],"extensions":{"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}],"data":null}',
+            200,
+        ),
+        id="null for a directive's argument at the root",
+    ),
+    pytest.param(
+        b'{"query":"{ ...F }"}',
+        b'{"errors":[{"message":"Unknown fragment \\"F\\".","locations":[{"line":1,"column":6}],"extensions":{"http":{"status":400,"headers":{}},"code":"GRAPHQL_VALIDATION_FAILED","type":"graphql error","userError":true}}]}',
+        id="a fragment not defined",
+    ),
+    pytest.param(
+        b'{"query":"fragment F on Query { ...F } { ...F }"}',
+        b'{"errors":[{"message":"Cannot spread fragment \\"F\\" within itself.","locations":[{"line":1,"column":23}],"extensions":{"http":{"status":400,"headers":{}},"code":"GRAPHQL_VALIDATION_FAILED","type":"graphql error","userError":true}}]}',
+        id="a fragment that spreads itself",
+    ),
 ]
 
 
@@ -1644,7 +1824,7 @@ _LINEAR_READS = [
     pytest.param(_GZIP, gzip.compress(_TYPENAME) + b"xx", _HEADER_CHECK, id="gzip then xx"),
     pytest.param(_GZIP, gzip.compress(_TYPENAME)[:-5], _CUT_SHORT, id="gzip cut short"),
     pytest.param(_GZIP, b"", _CUT_SHORT, id="gzip over no bytes"),
-    pytest.param(_GZIP, gzip.compress(b""), _GRAPHQL_JS_NOT_JSON, id="gzip of no bytes"),
+    pytest.param(_GZIP, gzip.compress(b""), _NO_KEYS, id="gzip of no bytes"),
     pytest.param(_GZIP, gzip.compress(b"{"), _EXPECTED_PROPERTY, id="gzip of {"),
     pytest.param(
         (("Content-Encoding", "deflate"),),
@@ -1703,7 +1883,7 @@ _LINEAR_READS = [
     pytest.param(
         _charset("utf-16le"), "{".encode("utf-16-le"), _EXPECTED_PROPERTY, id="utf-16le {"
     ),
-    pytest.param(_charset("utf-16le"), b"", _GRAPHQL_JS_NOT_JSON, id="utf-16le, no bytes"),
+    pytest.param(_charset("utf-16le"), b"", _NO_KEYS, id="utf-16le, no bytes"),
     pytest.param(_charset("utf-8; foo=bar"), _TYPENAME, None, id="another parameter"),
     pytest.param(_charset('"utf\\-8"'), _TYPENAME, None, id="a quoted pair"),
     pytest.param(_charset('"lat\\in1"'), _TYPENAME, _LATIN1, id="a quoted pair, latin1"),
@@ -1822,9 +2002,8 @@ _KEY_SHAPED = "Bearer lin_api_" + "0" * 40
 def test_linear_orders_the_body_and_the_credential(
     client, tokens_yaml, credential, headers, body, answer
 ):
-    """Each row answers as the comment over `_LINEAR_BODIES` says, and every refusal but a
-    `_REQUEST_ERROR` row's is the same for the key, no credential and `nope`; an API key under
-    `Bearer`, and `_KEY_SHAPED`, are `_API_KEY_AS_BEARER` ahead of every body."""
+    """Each row answers as the comment over `_LINEAR_BODIES` says; an API key under `Bearer`, and
+    `_KEY_SHAPED`, are `_API_KEY_AS_BEARER` ahead of every body."""
     admin = tokens_yaml["admin_token"]
     if not any(name == "Content-Type" for name, _ in headers):
         headers = (("Content-Type", "application/json"), *headers)
@@ -1836,16 +2015,14 @@ def test_linear_orders_the_body_and_the_credential(
     r = sent_as(client, "POST", "/linear/graphql", headers, content=body)
     if credential.startswith("Bearer"):
         assert (r.status_code, r.content) == (400, _API_KEY_AS_BEARER)
-    elif answer is _REQUEST_ERROR:
-        if credential == "key":
-            assert r.content == _GRAPHQL_JS_NOT_JSON
-        assert r.status_code == (400 if credential == "key" else 401)
-    elif answer is not None:
-        assert (r.status_code, r.content) == (json.loads(answer).get("code", 400), answer)
-    elif credential == "key":
-        assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
-    else:
+    elif credential != "key" and (answer is None or isinstance(answer, _WithTheKey)):
         assert r.status_code == 401
+    elif answer is None:
+        assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
+    elif isinstance(answer, _WithTheKey):
+        assert (r.status_code, r.content) == (answer.status, answer)
+    else:
+        assert (r.status_code, r.content) == (_status(answer), answer)
 
 
 def test_linear_parent_resolves_and_is_acl_scoped(client, admin_h, tokens_yaml):
@@ -2108,7 +2285,7 @@ def test_linear_attachments_take_no_url_argument_and_filter_by_url_instead(clien
     )
     assert r.status_code == 400 and "data" not in r.json()
     assert r.json()["errors"][0]["message"] == (
-        "Unknown argument 'url' on field 'Issue.attachments'."
+        'Unknown argument "url" on field "Issue.attachments".'
     )
     one = gql(
         client,
@@ -2428,9 +2605,10 @@ def test_a_malformed_date_is_the_validation_error_linear_answers(fclient, litera
     assert r.status_code == 400
     body = r.json()
     assert "data" not in body
-    message = body["errors"][0]["message"]
-    assert message.startswith("Expected value of type 'DateTimeOrDuration', found ")
-    assert message.endswith("into a valid date")
+    assert body["errors"][0]["message"] == (
+        f'Expected value of type "DateTimeOrDuration", found {literal}; '
+        f"Unable to parse value '{literal[1:-1]}' into a valid date"
+    )
 
 
 def test_a_date_operand_must_be_a_string(fclient):
@@ -2442,11 +2620,11 @@ def test_a_date_operand_must_be_a_string(fclient):
     q = "query($d: DateTimeOrDuration) { issues(filter: {createdAt: {gt: $d}}) { nodes { id } } }"
     r = post(fclient, q, {"d": 1700000000})
     assert r.status_code == 400
-    assert r.json()["errors"][0]["message"].startswith("Variable '$d' got invalid value 1700000000")
+    assert r.json()["errors"][0]["message"].startswith('Variable "$d" got invalid value 1700000000')
     assert "supports only string values" in r.json()["errors"][0]["message"]
     r = post(fclient, q, {"d": "not-a-date"})
     assert r.status_code == 400
-    assert "Expected type 'DateTimeOrDuration'" in r.json()["errors"][0]["message"]
+    assert 'Expected type "DateTimeOrDuration"' in r.json()["errors"][0]["message"]
 
 
 @pytest.mark.parametrize(
@@ -2480,9 +2658,10 @@ def test_forms_outside_the_measured_grammar_are_refused(fclient, literal):
         fclient, "{ issues(filter: {createdAt: {gt: %s}}) { nodes { identifier } } }" % literal
     )
     assert r.status_code == 400
-    message = r.json()["errors"][0]["message"]
-    assert message.startswith("Expected value of type 'DateTimeOrDuration', found ")
-    assert message.endswith("into a valid date"), message
+    assert r.json()["errors"][0]["message"] == (
+        f'Expected value of type "DateTimeOrDuration", found {literal}; '
+        f"Unable to parse value '{literal[1:-1]}' into a valid date"
+    )
     # The other scalar names itself `TimelessDate` and quotes the value (measured).
     r = post(fclient, "{ issues(filter: {dueDate: {eq: 1}}) { nodes { identifier } } }")
     assert r.status_code == 400
@@ -2603,7 +2782,7 @@ def test_an_unsupported_filter_field_is_an_error_not_a_dropped_filter(fclient):
         "/linear/graphql", json={"query": q}, headers={"Authorization": fclient.__dict__["_admin"]}
     )
     assert r.status_code == 400
-    assert "not defined by type 'IssueFilter'" in r.json()["errors"][0]["message"]
+    assert r.json()["errors"][0]["message"] == 'Field "nope" is not defined by type "IssueFilter".'
 
 
 def test_an_unsupported_comparator_is_an_error(fclient):
@@ -4244,19 +4423,19 @@ def test_release_stage_and_pipeline_are_non_null_and_stable(fclient):
     [
         (
             '{ issues(filter: {branchName: {eq: "x"}}) { nodes { id } } }',
-            "Field 'branchName' is not defined by type 'IssueFilter'.",
+            'Field "branchName" is not defined by type "IssueFilter".',
         ),
         (
             '{ issue(id: "ENG-2") { releases(filter: {slugId: {eq: "x"}}) { nodes { id } } } }',
-            "Field 'slugId' is not defined by type 'ReleaseFilter'.",
+            'Field "slugId" is not defined by type "ReleaseFilter".',
         ),
         (
             "{ users(sort: [{createdAt: {order: Descending}}]) { nodes { id } } }",
-            "Field 'createdAt' is not defined by type 'UserSortInput'.",
+            'Field "createdAt" is not defined by type "UserSortInput".',
         ),
         (
             "{ users(sort: [{updatedAt: {order: Descending}}]) { nodes { id } } }",
-            "Field 'updatedAt' is not defined by type 'UserSortInput'.",
+            'Field "updatedAt" is not defined by type "UserSortInput".',
         ),
     ],
     ids=[
@@ -4360,7 +4539,7 @@ def test_due_date_is_compared_as_a_timeless_date(fclient, now_is_2026_03_01_noon
     r = post(fclient, '{ issues(filter: {dueDate: {eq: "nope"}}) { nodes { id } } }')
     assert r.status_code == 400
     assert r.json()["errors"][0]["message"].startswith(
-        "Expected value of type 'TimelessDateOrDuration', found "
+        'Expected value of type "TimelessDateOrDuration", found "nope"; '
     )
 
 

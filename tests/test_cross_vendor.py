@@ -420,7 +420,7 @@ def test_a_graphql_vendor_reads_the_body_in_a_worker_thread(
     assert where == ["a worker thread"]
 
 
-# Half a surrogate pair where graphql-core quotes the client's text without escaping it: the `\u`
+# Half a surrogate pair where a message quotes the client's text without escaping it: the `\u`
 # escape sent, the text the message names, and the bytes that text is on the wire. A pair is the
 # control, the one character it makes.
 _ISSUE_FILTER = "query($f: IssueFilter) { issues(filter: $f) { nodes { id } } }"
@@ -479,10 +479,13 @@ def test_a_graphql_vendor_writes_a_lone_surrogate_as_an_escape(
     admin = tokens_yaml["admin_token"]
     if where == "key":
         body = '{"query":"%s","variables":{"f":{"%s":1}}}' % (_ISSUE_FILTER, sent)
-        quoted = f"'{named}' is not defined by type"
+        quoted, member = f'"{named}" is not defined by type', "message"
+    elif vendor == "linear":
+        body = '{"query":"%s","operationName":"%s"}' % (_TWO_OPERATIONS, sent)
+        quoted, member = f"The operation '{named}' does not", "userPresentableMessage"
     else:
         body = '{"query":"%s","operationName":"%s"}' % (_TWO_OPERATIONS, sent)
-        quoted = f"operation named '{named}'"
+        quoted, member = f'operation named "{named}"', "message"
     credential = admin if vendor == "linear" else f"Bearer {admin}"
     r = client.post(
         f"/{vendor}/graphql",
@@ -490,7 +493,8 @@ def test_a_graphql_vendor_writes_a_lone_surrogate_as_an_escape(
         headers={"Authorization": credential, "Content-Type": "application/json"},
     )
     assert r.status_code == 400
-    assert quoted in r.json()["errors"][0]["message"]
+    error = r.json()["errors"][0]
+    assert quoted in error.get("extensions", {}).get(member, error.get(member))
     assert wire in r.content
 
 

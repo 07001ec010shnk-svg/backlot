@@ -26,10 +26,17 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
+from graphql import (
+    DocumentNode,
+    FragmentDefinitionNode,
+    FragmentSpreadNode,
+    OperationDefinitionNode,
+)
 
 from backlot import auth
 from backlot.config import get_settings
 from backlot.graphql import body as request_body
+from backlot.graphql import engine
 from backlot.graphql.fireflies_resolvers import build_engine
 
 router = APIRouter(prefix="/fireflies", tags=["fireflies"])
@@ -131,26 +138,93 @@ async def graphql(request: Request):
         # scale measured) and almost none of them have a Fireflies account. See resolve_users.
         "roster": frozenset(state.acl.email_to_token()) if getattr(state, "acl", None) else None,
     }
-    result = ENGINE.execute_payload(payload, context=context)
+    result = ENGINE.execute_payload(payload, context=context, on_document=_fragments_unreached)
     request.state.graphql_raised = result.raised
-    # Fireflies' invalid_arguments and INTERNAL_SERVER_ERROR errors carry two more members than a
-    # field error, in this order (api.fireflies.ai: the refusal on 2026-10-21, the
-    # INTERNAL_SERVER_ERROR on 2026-10-22).
-    errors = result.payload.get("errors", [])
-    for i, error in enumerate(errors):
-        code = error.get("extensions", {}).get("code")
-        if code in _FRIENDLY:
-            errors[i] = {
-                "friendly": _FRIENDLY[code],
-                **{key: value for key, value in error.items() if key != "extensions"},
-                "code": code,
-                "extensions": error["extensions"],
-            }
     return Response(
-        request_body.node_json(result.payload),
-        status_code=400 if result.request_error else 200,
+        request_body.node_json(_envelope(result)),
+        status_code=result.status,
         media_type="application/json",
     )
+
+
+def _entry(error: dict, code: str, friendly: bool, extensions: dict) -> dict:
+    """``error`` in Fireflies' members, in this order: ``friendly`` first, its own members, then
+    ``code`` and ``extensions``."""
+    return {
+        "friendly": friendly,
+        **{key: value for key, value in error.items() if key != "extensions"},
+        "code": code,
+        "extensions": extensions,
+    }
+
+
+def _envelope(result: engine.Result) -> dict:
+    """``result`` as Fireflies writes it, as api.fireflies.ai answered on 2026-10-25 (UTC): each
+    request error, and each error graphql-js made as the operation ran, with ``friendly: false``,
+    Apollo Server's code beside the message and ``extensions`` empty. Its ``invalid_arguments`` and
+    ``INTERNAL_SERVER_ERROR`` field errors carry the extensions their resolver gave, the refusal as
+    real answered it on 2026-10-21 and the INTERNAL_SERVER_ERROR on 2026-10-22."""
+    if result.refusals:
+        errors = []
+        for refusal in result.refusals:
+            error: dict = {"message": refusal.message}
+            if refusal.locations:
+                error["locations"] = list(refusal.locations)
+            errors.append(_entry(error, refusal.code, False, {}))
+        return {"errors": errors}
+    errors = result.payload.get("errors")
+    if not errors:
+        return result.payload
+    shaped = []
+    for i, error in enumerate(errors):
+        code = error.get("extensions", {}).get("code")
+        if i in result.assigned:
+            shaped.append(_entry(error, code, False, {}))
+        elif code in _FRIENDLY:
+            shaped.append(_entry(error, code, _FRIENDLY[code], error["extensions"]))
+        else:
+            shaped.append(error)
+    return {**result.payload, "errors": shaped}
+
+
+def _fragments_unreached(doc: DocumentNode) -> engine.Result | None:
+    """Fireflies' 500 for a document whose operations reach a fragment it does not define, or a
+    fragment that reaches itself, ahead of validation: api.fireflies.ai answered ``{ ...F }``, a
+    spread of an undefined fragment inside an inline fragment, inside a fragment an operation uses
+    and inside an operation ``operationName`` did not choose, and ``fragment F on Query { ...F }
+    { ...F }``, with it on 2026-10-25 (UTC), beside another validation error too. The same spread
+    in a fragment no operation uses was the validation's ``Unknown fragment`` and the same cycle
+    its ``Cannot spread fragment``."""
+    fragments = {d.name.value: d for d in doc.definitions if isinstance(d, FragmentDefinitionNode)}
+    done: set[str] = set()
+
+    def reaches_a_fault(selections, path: tuple[str, ...]) -> bool:
+        for selection in selections:
+            if isinstance(selection, FragmentSpreadNode):
+                name = selection.name.value
+                if name not in fragments or name in path:
+                    return True
+                if name not in done:
+                    if reaches_a_fault(fragments[name].selection_set.selections, (*path, name)):
+                        return True
+                    done.add(name)
+            elif selection.selection_set is not None:
+                if reaches_a_fault(selection.selection_set.selections, path):
+                    return True
+        return False
+
+    for definition in doc.definitions:
+        if isinstance(definition, OperationDefinitionNode):
+            if reaches_a_fault(definition.selection_set.selections, ()):
+                return engine.Result(
+                    payload={},
+                    refusals=(
+                        engine.Refusal(
+                            "Internal server error", engine.INTERNAL_SERVER_ERROR, status=500
+                        ),
+                    ),
+                )
+    return None
 
 
 def _read(raw: bytes) -> Any:

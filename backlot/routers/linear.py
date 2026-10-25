@@ -18,12 +18,17 @@ Express's ``body-parser``, in front of the GraphQL server, reads the body before
 looked at, for any credential but an API key under ``Bearer``: with no credential, a body that is
 not JSON drew its 400 from api.linear.app on 2026-10-18, not the 401. :func:`_express` is that 400,
 and each refusal ``body-parser`` makes before it has the text
-(:func:`backlot.graphql.body.body_parser_text`); :func:`_read` names the bodies answered in
-graphql-js's words instead. An API key under ``Bearer`` is refused ahead of the body: with
-``Bearer <key>``, ``{``, an empty body and a body holding ``NaN`` drew :func:`_api_key_as_bearer`'s
-400 the same day, and ``charset=latin1``, ``Content-Encoding: bogus`` and a body past the size
-limit did on 2026-10-19, when a key in an API key's shape that Linear never issued drew it under
-``Bearer`` with ``{``, ``NaN``, ``5``, ``charset=latin1`` and an empty body.
+(:func:`backlot.graphql.body.body_parser_text`). Apollo Server's checks come ahead of the credential
+too, up to the choice of operation (:meth:`backlot.graphql.engine.Engine.resolve_payload`): with no
+credential and with ``nope``, an empty body, ``{}``, an array, a ``query`` of ``5`` or ``null``, a
+string ``variables``, an ``extensions`` or ``operationName`` of ``5``, a persisted query's hash
+alone or one that does not match, a document that does not parse or validate and one of two
+operations with no ``operationName`` drew what the key drew on 2026-10-25 (UTC), and a document
+missing a variable the 401. An API key under ``Bearer`` is refused ahead of the body: with
+``Bearer <key>``, ``{``, an empty body and a body holding ``NaN`` drew
+:func:`_api_key_as_bearer`'s 400 on 2026-10-18, and ``charset=latin1``, ``Content-Encoding: bogus``
+and a body past the size limit did on 2026-10-19, when a key in an API key's shape that Linear never
+issued drew it under ``Bearer`` with ``{``, ``NaN``, ``5``, ``charset=latin1`` and an empty body.
 """
 
 from __future__ import annotations
@@ -41,6 +46,9 @@ from backlot.graphql import engine, v8_json
 from backlot.graphql.linear_resolvers import build_engine
 
 router = APIRouter(prefix="/linear", tags=["linear"])
+
+# Linear's code for a body with no query, where Apollo Server's is `BAD_REQUEST`.
+_INVALID_INPUT = "INVALID_INPUT"
 
 # Built once at import: the SDL is parsed and validated and the resolver map bound, so a broken
 # schema fails at startup instead of on the first request.
@@ -112,6 +120,9 @@ async def graphql(request: Request):
         return payload
     # The telemetry middleware names the call by this document (backlot.telemetry.naming).
     request.state.graphql_payload = payload
+    resolved = ENGINE.resolve_payload(_variables_read(payload))
+    if isinstance(resolved, engine.Result):
+        return _answer(request, resolved, payload)
     caller = auth.resolve_api_key(request)
     if caller is None:
         # Real Linear answers a bad credential with a GraphQL error envelope and a 401, not a
@@ -144,21 +155,130 @@ async def graphql(request: Request):
         # entities with no table of their own through `linear_entities`
         # (store.linear_entity_by_id, called by the resolvers' own `_by_id`).
     }
-    result = ENGINE.execute_payload(payload, context=context)
+    return _answer(request, ENGINE.run(resolved, context=context), payload)
+
+
+def _answer(request: Request, result: engine.Result, payload: Any) -> Response:
     request.state.graphql_raised = result.raised
     return Response(
-        request_body.node_json(result.payload),
-        status_code=400 if result.request_error else 200,
+        request_body.node_json(_envelope(result, payload)),
+        status_code=result.status,
         media_type="application/json",
     )
+
+
+def _variables_read(payload: Any) -> Any:
+    """``payload`` with a string ``variables`` read as JSON where ``JSON.parse`` reads it: Linear
+    served ``{"variables": "{}"}``, ``" {} "``, ``"null"`` and a string holding an object its
+    operation used on 2026-10-25 (UTC), and answered one ``JSON.parse`` refuses (``"{"``,
+    ``""``, ``"NaN"``) or reads as a string with Apollo Server's refusal of a string, and one it
+    reads as an array or a number with the refusal of a value that is not an object."""
+    if isinstance(payload, dict) and isinstance(payload.get("variables"), str):
+        try:
+            return {**payload, "variables": request_body.parse(payload["variables"])}
+        except request_body.NotJson:
+            pass
+    return payload
+
+
+# What Linear's errors carry beside `code`, by code, as api.linear.app answered on 2026-10-25 (UTC):
+# Apollo Server's `http` member on each request error but a variable's refusal, `type` and
+# `userError`.
+_TYPE = {engine.INTERNAL_SERVER_ERROR: "internal error", _INVALID_INPUT: "invalid input"}
+
+
+def _apollo(message: str, code: str, status: int, locations: Any = ()) -> dict:
+    entry: dict = {"message": message}
+    if locations:
+        entry["locations"] = list(locations)
+    extensions: dict = (
+        {} if code == engine.BAD_USER_INPUT else {"http": {"status": status, "headers": {}}}
+    )
+    extensions["code"] = code
+    extensions["type"] = _TYPE.get(code, "graphql error")
+    extensions["userError"] = code != engine.INTERNAL_SERVER_ERROR
+    entry["extensions"] = extensions
+    return entry
+
+
+def _internal(error: dict) -> dict:
+    """Linear's ``Internal server error`` in place of an error graphql-js made as the operation
+    ran, at the error's ``path`` and ``locations``, as api.linear.app answered a ``null`` variable
+    a non-null argument refused on 2026-10-21 (UTC)."""
+    entry: dict = {"message": "Internal server error"}
+    for key in ("path", "locations"):
+        if key in error:
+            entry[key] = error[key]
+    entry["extensions"] = {
+        "code": engine.INTERNAL_SERVER_ERROR,
+        "type": "internal error",
+        "userError": False,
+    }
+    return entry
+
+
+def _operation_missing(name: Any) -> dict:
+    """Linear's own refusal of a document whose operation cannot be chosen: two operations and no
+    ``operationName``, or a name no operation has, as api.linear.app answered on 2026-10-25 (UTC);
+    an empty name is answered as no name."""
+    presentable = (
+        f"The operation '{name}' does not exist on the query."
+        if name
+        else "The operation does not exist on the query."
+    )
+    return {
+        "message": "operation does not exist",
+        "extensions": {
+            "type": "invalid input",
+            "code": "INPUT_ERROR",
+            "statusCode": 400,
+            "userError": True,
+            "userPresentableMessage": presentable,
+            "http": {"status": 400},
+        },
+    }
+
+
+def _envelope(result: engine.Result, payload: Any) -> dict:
+    """``result`` as Linear writes it. A request error is Apollo Server's in Linear's members
+    (:func:`_apollo`): a body with no query carries Linear's ``INVALID_INPUT``, a refused persisted
+    query Linear's ``Internal server error``, and an operation that cannot be chosen Linear's own
+    refusal (:func:`_operation_missing`). An error graphql-js made as the operation ran is
+    :func:`_internal`."""
+    if result.refusals:
+        errors = []
+        for refusal in result.refusals:
+            if refusal.code == engine.OPERATION_RESOLUTION_FAILURE:
+                errors.append(_operation_missing(payload.get("operationName")))
+            elif refusal.message in (
+                engine.PERSISTED_QUERY_VERSION,
+                engine.PERSISTED_QUERY_MISMATCH,
+            ):
+                errors.append(
+                    _apollo("Internal server error", engine.INTERNAL_SERVER_ERROR, refusal.status)
+                )
+            elif refusal.message == engine.NO_QUERY:
+                errors.append(_apollo(refusal.message, _INVALID_INPUT, refusal.status))
+            else:
+                errors.append(
+                    _apollo(refusal.message, refusal.code, refusal.status, refusal.locations)
+                )
+        return {"errors": errors}
+    if not result.assigned:
+        return result.payload
+    errors = [
+        _internal(error) if i in result.assigned else error
+        for i, error in enumerate(result.payload["errors"])
+    ]
+    return {**result.payload, "errors": errors}
 
 
 def _read(raw: bytes, content_type: str | None, content_encoding: str) -> Any:
     """The payload Linear reads from the body ``raw``, or the response this router refuses it with.
 
-    A body with no text once read keeps graphql-js's words here, after the ``Bearer`` check and
-    before the key is resolved, as Linear's refusal comes: Linear answers it with Apollo Server's
-    ``POST body missing, invalid Content-Type, or JSON object has no keys.``"""
+    A body with no text once read is read as an empty object, which Apollo Server refuses as it
+    refuses one sent: Linear answered both with ``POST body missing, invalid Content-Type, or JSON
+    object has no keys.`` on 2026-10-25 (UTC)."""
     try:
         text = request_body.body_parser_text(raw, content_type, content_encoding)
     except request_body.Unread as unread:
@@ -166,9 +286,9 @@ def _read(raw: bytes, content_type: str | None, content_encoding: str) -> Any:
     violation = request_body.strict_violation(text) if text else None
     if violation is not None:
         return _express(violation)
+    if not text:
+        return {}
     try:
         return request_body.parse(text)
     except request_body.NotJson:
-        if not text:
-            return JSONResponse(engine.not_json().payload, status_code=400)
         return _express(v8_json.error(text))

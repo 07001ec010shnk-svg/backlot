@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import json
 import math
 import random
@@ -180,10 +181,9 @@ def test_unknown_field_returns_a_validation_error(gql):
     r = gql.execute('{ widget(id: "w1") { nope } }')
     assert r.request_error is True
     assert "data" not in r.payload
-    # graphql-core quotes identifiers with '' where graphql-js uses ""; assert the substance,
-    # which is the part a client acts on.
-    msg = r.payload["errors"][0]["message"]
-    assert msg.startswith("Cannot query field") and "nope" in msg and "Widget" in msg
+    assert r.payload["errors"][0]["message"] == (
+        'Cannot query field "nope" on type "Widget". Did you mean "name"?'
+    )
 
 
 def test_resolver_error_nulls_the_field_and_reports_its_path(gql):
@@ -381,9 +381,10 @@ _ECHO_FIELDS = {
             {
                 "errors": [
                     {
-                        "message": "Variable '$x' got invalid value 1.5; "
+                        "message": 'Variable "$x" got invalid value 1.5; '
                         "ID cannot represent value: 1.5",
                         "locations": [{"line": 1, "column": 7}],
+                        "extensions": {"code": "BAD_USER_INPUT"},
                     }
                 ]
             },
@@ -405,9 +406,10 @@ _ECHO_FIELDS = {
             {
                 "errors": [
                     {
-                        "message": "Variable '$x' got invalid value {'nope': 1e+21}; "
-                        "Field 'nope' is not defined by type 'F'.",
+                        "message": 'Variable "$x" got invalid value { nope: 1e+21 }; '
+                        'Field "nope" is not defined by type "F".',
                         "locations": [{"line": 1, "column": 7}],
+                        "extensions": {"code": "BAD_USER_INPUT"},
                     }
                 ]
             },
@@ -419,9 +421,10 @@ _ECHO_FIELDS = {
             {
                 "errors": [
                     {
-                        "message": "Variable '$x' got invalid value 5; "
-                        "Expected type 'F' to be a mapping.",
+                        "message": 'Variable "$x" got invalid value 5; '
+                        'Expected type "F" to be an object.',
                         "locations": [{"line": 1, "column": 7}],
+                        "extensions": {"code": "BAD_USER_INPUT"},
                     }
                 ]
             },
@@ -801,16 +804,181 @@ def test_a_body_with_no_byte_order_mark_is_read_in_the_order_iconv_lite_picks(
     assert request_body._byte_order(bytes.fromhex(hex_bytes), width) == order
 
 
-def test_execute_payload_requires_a_query_string(gql):
-    r = gql.execute_payload({"variables": {}})
-    assert r.request_error is True
-    assert r.payload["errors"][0]["message"] == "Must provide query string."
+_TYPENAME = "{ __typename }"
+_HASH = hashlib.sha256(_TYPENAME.encode()).hexdigest()
 
 
-def test_execute_payload_rejects_non_object_variables(gql):
-    r = gql.execute_payload({"query": "{ widgets { id } }", "variables": "nope"})
-    assert r.request_error is True
-    assert r.payload["errors"][0]["message"] == "Variables are invalid JSON."
+def _persisted(version=1, sha256=_HASH, **payload) -> dict:
+    return {**payload, "extensions": {"persistedQuery": {"version": version, "sha256Hash": sha256}}}
+
+
+def _refused(message, code="BAD_REQUEST", status=400, locations=()) -> tuple:
+    """Apollo Server's refusal ``message``: its status and body, each location (line, column)."""
+    error: dict = {"message": message}
+    if locations:
+        error["locations"] = [{"line": line, "column": column} for line, column in locations]
+    error["extensions"] = {"code": code}
+    return status, {"errors": [error]}
+
+
+_SERVED = (200, {"data": {"__typename": "Query"}})
+_NOT_A_STRING = _refused("GraphQL queries must be strings.")
+_NO_KEYS = _refused(engine.NO_KEYS)
+_NO_QUERY = _refused(engine.NO_QUERY)
+_MISMATCH = _refused("provided sha does not match query", "INTERNAL_SERVER_ERROR")
+_VERSION = _refused("Unsupported persisted query version", "INTERNAL_SERVER_ERROR")
+_NOT_FOUND = _refused("PersistedQueryNotFound", "PERSISTED_QUERY_NOT_FOUND", 200)
+
+
+# A body, and Apollo Server's answer to it in Apollo Server's own envelope: a refusal with the
+# message, code, locations and status api.fireflies.ai answered it with on 2026-10-25 (UTC), or
+# `_SERVED` where it ran the query. Where two checks apply, the row's answer is the one that came
+# first.
+_APOLLO_CHECKS = [
+    pytest.param([{"query": _TYPENAME}], _refused("Operation batching disabled."), id="a batch"),
+    pytest.param({}, _NO_KEYS, id="an empty object"),
+    pytest.param(None, _NO_KEYS, id="null"),
+    pytest.param(5, _NO_KEYS, id="a number"),
+    pytest.param({"query": 5, "variables": [1]}, _NOT_A_STRING, id="query 5, variables [1]"),
+    pytest.param({"query": 5, "extensions": 5}, _NOT_A_STRING, id="query 5, extensions 5"),
+    pytest.param({"query": 5, "variables": "{"}, _NOT_A_STRING, id="query 5, variables '{'"),
+    pytest.param(
+        {"query": {"kind": "Document"}},
+        _refused(
+            "GraphQL queries must be strings. It looks like you're sending the internal graphql-js representation "
+            "of a parsed query in your request instead of a request in the GraphQL query language. "
+            "You can convert an AST to a string using the `print` function from `graphql`, or use "
+            "a client like `apollo-client` which converts the internal representation to a string "
+            "for you."
+        ),
+        id="a parsed document",
+    ),
+    pytest.param(
+        {"query": _TYPENAME, "variables": "x", "extensions": 5},
+        _refused(engine.RECURSIVELY_ENCODED.format("variables")),
+        id="variables 'x', extensions 5",
+    ),
+    pytest.param(
+        {"query": _TYPENAME, "extensions": "x"},
+        _refused(engine.RECURSIVELY_ENCODED.format("extensions")),
+        id="extensions 'x'",
+    ),
+    pytest.param(
+        {"query": _TYPENAME, "extensions": 5, "variables": [1]},
+        _refused("`extensions` in a POST body must be an object if provided."),
+        id="extensions 5, variables [1]",
+    ),
+    pytest.param(
+        {"query": _TYPENAME, "variables": [1], "operationName": 1},
+        _refused("`variables` in a POST body must be an object if provided."),
+        id="variables [1], operationName 1",
+    ),
+    pytest.param(
+        {"query": None, "operationName": 1},
+        _refused("`operationName` in a POST body must be a string if provided."),
+        id="query null, operationName 1",
+    ),
+    pytest.param({"variables": {}}, _NO_QUERY, id="no query"),
+    pytest.param({"query": ""}, _NO_QUERY, id="an empty query"),
+    pytest.param({"extensions": {"persistedQuery": False}}, _NO_QUERY, id="pq false"),
+    pytest.param(
+        {"query": "   "},
+        _refused("Syntax Error: Unexpected <EOF>.", "GRAPHQL_PARSE_FAILED", locations=[(1, 4)]),
+        id="a query of spaces",
+    ),
+    pytest.param(_persisted(2, query=5), _NOT_A_STRING, id="pq version 2, query 5"),
+    pytest.param(_persisted(2, query="{"), _VERSION, id="pq version 2, a query that cannot parse"),
+    pytest.param(
+        _persisted(sha256="0" * 64, query="{"),
+        _MISMATCH,
+        id="pq mismatch, a query that cannot parse",
+    ),
+    pytest.param({"extensions": {"persistedQuery": 5}}, _VERSION, id="pq 5"),
+    pytest.param(_persisted("1", query=_TYPENAME), _VERSION, id="pq version '1'"),
+    pytest.param(
+        {"extensions": {"persistedQuery": {"version": 1}}},
+        _NOT_FOUND,
+        id="pq with no hash",
+    ),
+    pytest.param(
+        {"query": _TYPENAME, "extensions": {"persistedQuery": {"version": 1}}},
+        _MISMATCH,
+        id="pq with no hash, a query",
+    ),
+    pytest.param(_persisted(sha256=_HASH.upper(), query=_TYPENAME), _MISMATCH, id="pq upper hash"),
+    pytest.param(_persisted(sha256=5, query=_TYPENAME), _MISMATCH, id="pq hash 5"),
+    pytest.param(_persisted(query=""), _MISMATCH, id="pq, an empty query"),
+    pytest.param(
+        _persisted(query=None),
+        _NOT_FOUND,
+        id="pq, query null",
+    ),
+    pytest.param(_persisted(query=_TYPENAME), _SERVED, id="pq matching its query"),
+    pytest.param(
+        _persisted(
+            sha256=hashlib.sha256(b"{ __typename } # \xef\xbf\xbd").hexdigest(),
+            query="{ __typename } # \ud800",
+        ),
+        _refused(
+            "Syntax Error: Invalid character: U+D800.", "GRAPHQL_PARSE_FAILED", locations=[(1, 18)]
+        ),
+        id="pq hashed with U+FFFD for a lone surrogate",
+    ),
+    pytest.param(
+        _persisted(
+            sha256=hashlib.sha256(b"{ __typename } # \xed\xa0\x80").hexdigest(),
+            query="{ __typename } # \ud800",
+        ),
+        _MISMATCH,
+        id="pq hashed with a lone surrogate's own bytes",
+    ),
+    pytest.param(
+        {"query": _TYPENAME, "extensions": {"persistedQuery": None}}, _SERVED, id="pq null"
+    ),
+    pytest.param(
+        {"query": "{", "operationName": "Z"},
+        _refused(
+            "Syntax Error: Expected Name, found <EOF>.", "GRAPHQL_PARSE_FAILED", locations=[(1, 2)]
+        ),
+        id="a query that cannot parse, operationName Z",
+    ),
+    pytest.param(
+        {"query": "query A { nosuch }", "operationName": "Z"},
+        _refused(
+            'Cannot query field "nosuch" on type "Query".',
+            "GRAPHQL_VALIDATION_FAILED",
+            locations=[(1, 11)],
+        ),
+        id="a query that does not validate, operationName Z",
+    ),
+    pytest.param(
+        {"query": "query A($b: Boolean!) { __typename @include(if: $b) } query B { __typename }"},
+        _refused(
+            "Must provide operation name if query contains multiple operations.",
+            engine.OPERATION_RESOLUTION_FAILURE,
+        ),
+        id="two operations, a variable not provided",
+    ),
+    pytest.param(
+        {"query": "query A($b: Boolean!) { __typename @include(if: $b) }", "operationName": "Z"},
+        _refused('Unknown operation named "Z".', engine.OPERATION_RESOLUTION_FAILURE),
+        id="a variable not provided, operationName Z",
+    ),
+    pytest.param(
+        {"query": "query A { __typename }", "operationName": ""},
+        _refused('Unknown operation named "".', engine.OPERATION_RESOLUTION_FAILURE),
+        id="operationName ''",
+    ),
+    pytest.param({"query": _TYPENAME, "variables": None}, _SERVED, id="variables null"),
+    pytest.param({"query": _TYPENAME, "operationName": None}, _SERVED, id="operationName null"),
+    pytest.param({"query": _TYPENAME, "extensions": None}, _SERVED, id="extensions null"),
+]
+
+
+@pytest.mark.parametrize("payload, answer", _APOLLO_CHECKS)
+def test_apollo_server_reads_a_body_in_its_order(gql, payload, answer):
+    r = gql.execute_payload(payload)
+    assert (r.status, r.payload) == answer
 
 
 # --- resolver binding -----------------------------------------------------------
@@ -881,13 +1049,9 @@ def acme_client(db, acl):
                 {"errors": [{"message": "Authentication required"}]}, status_code=401
             )
         context = {"conn": auth.conn(request), "visible_ids": auth.visible_ids(request, caller)}
-        try:
-            payload = request_body.parse(request_body.decode(await request.body()))
-        except request_body.NotJson:
-            result = engine.not_json()
-        else:
-            result = ACME.execute_payload(payload, context=context)
-        return JSONResponse(result.payload, status_code=400 if result.request_error else 200)
+        payload = request_body.parse(request_body.decode(await request.body()))
+        result = ACME.execute_payload(payload, context=context)
+        return JSONResponse(result.payload, status_code=result.status)
 
     app.include_router(router)
     return TestClient(app)
@@ -930,18 +1094,6 @@ def test_mounted_endpoint_returns_a_graphql_envelope_for_a_malformed_document(
     assert "detail" not in body
     assert "data" not in body
     assert "Syntax Error" in body["errors"][0]["message"]
-
-
-def test_mounted_endpoint_returns_a_graphql_envelope_for_a_non_json_body(
-    acme_client, sample_settings
-):
-    r = acme_client.post(
-        "/acme/graphql",
-        content=b"not json",
-        headers={"Authorization": sample_settings.admin_token, "Content-Type": "application/json"},
-    )
-    assert r.status_code == 400
-    assert r.json()["errors"][0]["message"] == "POST body sent invalid JSON."
 
 
 def test_acl_filters_results_through_the_resolver_context(acme_client, tokens):

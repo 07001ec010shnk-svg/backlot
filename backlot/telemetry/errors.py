@@ -2,13 +2,12 @@
 
 An error code is the vendor's own identifier where its envelope has one: Slack's ``error``, S3's
 ``<Code>``, Google's ``reason`` or else its ``status``, Notion's ``code``, HubSpot's ``category``,
-Microsoft Graph's ``error.code``, a GraphQL ``extensions.code``. GitHub, Jira, Confluence, the
-GraphQL engine and Graph's OData validator answer with a message only; those messages are Backlot's
-own text, so each maps to a fixed slug here and the message itself, which can carry a key, a sha or
-a field name from the request, is never sent. A message this table does not know is
-``unrecognized``, except at 400 from Linear or Fireflies: the GraphQL engine answers 400 only for a
-request it refuses before any resolver runs, and the refusals no row names are graphql-core's
-validation of the document and its variables, so they are ``graphql_validation``.
+Microsoft Graph's ``error.code``, a GraphQL error's ``extensions.code``, or the ``code`` Fireflies
+writes beside the message. GitHub, Jira, Confluence, Graph's OData validator, Linear's 401 and the
+Linear resolvers' refusals that carry no code answer with a message only; those messages are
+Backlot's own text, so each maps to a fixed slug here and the message itself, which can carry a
+key, a sha or a field name from the request, is never sent. A message this table does not know is
+``unrecognized``.
 
 The HTTP layer in front of Linear's and Fireflies' GraphQL refuses a body in an envelope of its own,
 with no ``errors``. Fireflies' HTTP layer names its code in ``code``. Linear's is Express, which
@@ -21,7 +20,7 @@ failure:
 | Class | The call failed because |
 |---|---|
 | ``unsupported`` | Backlot does not do this yet: the baseline records the operation as ``missing`` or ``refused``, or the GraphQL engine refused a filter |
-| ``internal`` | of a Backlot bug: Backlot's own failure (see below), or a 5xx other than 501 |
+| ``internal`` | of a Backlot bug: its own failure, or a 5xx other than a vendor's answer (below) |
 | ``rate_limit`` | the vendor's rate limit was reached: a 429, or a 403 with ``x-ratelimit-remaining: 0`` as GitHub sends |
 | ``auth`` | the credential was missing, wrong, or not allowed: a 401 or 403, or Slack's auth errors, which it sends with a 200 |
 | ``client`` | the request was wrong: any other failure |
@@ -31,7 +30,7 @@ engine answers at 200 and marks (``backlot.graphql.engine.Result.raised``). The 
 the failure is Backlot's own, the status, the baseline's support state, the error code and the
 ``x-ratelimit-remaining`` header, so a code no rule names is classed by its status. A 501 from an
 operation Backlot serves is the vendor's own answer (Google's ``notImplemented``), so it is
-``client``.
+``client``, and so is each 5xx in ``_ANSWERED_5XX``, a vendor's answer to a wrong request.
 """
 
 from __future__ import annotations
@@ -93,20 +92,9 @@ _CONFLUENCE = [
     (r"Cannot find custom content type", "content_type_not_found"),
 ]
 _GRAPHQL = [
-    (r"^Syntax Error", "graphql_parse"),
     (r"^Entity not found", "entity_not_found"),
     (r"^unsupported ", "unsupported_filter"),
     (r"^Authentication required", "authentication_required"),
-    (
-        r"^(Must provide |Variables are invalid JSON|POST body sent invalid JSON|Unknown operation named )",
-        "graphql_request",
-    ),
-    (
-        r"^(Cannot query field|Unknown argument|Unknown type|Unknown fragment|Unknown directive|Field "
-        r"|Variable |Argument |Schema is not configured|There can be only one operation|Expected value"
-        r"|String cannot represent)",
-        "graphql_validation",
-    ),
 ]
 # Graph's OData validator answers with an empty `error.code`; its message names the option.
 _MSGRAPH = [(r"^The query specified in the URI is not valid\.", "invalid_query_option")]
@@ -152,10 +140,11 @@ def error_code(source: str, status: int, body: bytes) -> str:
             return ""
         extensions = errors[0].get("extensions")
         code = extensions.get("code") if isinstance(extensions, dict) else None
+        if not code:
+            code = errors[0].get("code")
         if isinstance(code, str) and code:
             return code
-        slug = _slug(errors[0].get("message"), _GRAPHQL)
-        return "graphql_validation" if slug == "unrecognized" and status == 400 else slug
+        return _slug(errors[0].get("message"), _GRAPHQL)
     if status < 400:
         return ""
     if source == "github":
@@ -193,6 +182,10 @@ def error_code(source: str, status: int, body: bytes) -> str:
 
 # Slack sends its auth errors with a 200.
 _SLACK_AUTH = frozenset({"account_inactive", "invalid_auth", "not_authed"})
+# Each 5xx a vendor answers a wrong request with, by source and error code, and Backlot answers too:
+# Fireflies' 500 for a document that reaches a fragment it does not define
+# (`backlot.routers.fireflies._fragments_unreached`).
+_ANSWERED_5XX = frozenset({("fireflies", "INTERNAL_SERVER_ERROR")})
 
 
 def error_class(
@@ -208,6 +201,6 @@ def error_class(
         return "rate_limit"
     if status in (401, 403) or (source == "slack" and code in _SLACK_AUTH):
         return "auth"
-    if status >= 500 and status != 501:
+    if status >= 500 and status != 501 and (source, code) not in _ANSWERED_5XX:
         return "internal"
     return "client"

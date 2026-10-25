@@ -709,11 +709,16 @@ RESOLVERS = {
 }
 
 
+# The root type api.fireflies.ai's introspection names beside `Query` (2026-10-25, UTC), none of
+# whose fields Backlot serves; it names no subscription type.
+ROOTS = ("Mutation",)
+
+
 def build_engine():
     """The Fireflies engine, over the SDL beside this module."""
     from backlot.graphql import engine
 
-    return engine.from_sdl(__file__, "fireflies", RESOLVERS)
+    return engine.from_sdl(__file__, "fireflies", RESOLVERS, roots=ROOTS)
 
 
 __all__ = [

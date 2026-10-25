@@ -2015,13 +2015,18 @@ RESOLVERS = {
 RESOLVERS["IssueSearchResult"] = RESOLVERS["Issue"]
 
 
+# The root types api.linear.app's introspection names beside `Query` (2026-10-25, UTC), none of
+# whose fields Backlot serves.
+ROOTS = ("Mutation", "Subscription")
+
+
 def build_engine():
     """The Linear engine, over the SDL beside this module. ``SCALARS`` binds Linear's date-operand
     grammar onto ``DateTimeOrDuration`` / ``TimelessDateOrDuration``, so a malformed filter value is
     a validation error (a 400) exactly where the real API makes it one."""
     from backlot.graphql import engine
 
-    return engine.from_sdl(__file__, "linear", RESOLVERS, SCALARS)
+    return engine.from_sdl(__file__, "linear", RESOLVERS, SCALARS, ROOTS)
 
 
 __all__ = ["RESOLVERS", "build_engine", "PAGE_DEFAULT", "PAGE_MAX"]

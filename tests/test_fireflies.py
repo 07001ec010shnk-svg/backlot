@@ -118,10 +118,31 @@ def test_fireflies_reads_a_credential_as_fireflies_does(client, tokens_yaml, val
 # The headers a body was sent with beyond `Content-Type: application/json`, the body, and Fireflies'
 # answer to it with the key: `_EMPTY`, `_NOT_JSON` or `_TOO_LARGE`, its HTTP layer's refusals
 # `backlot.routers.fireflies._body_refusal` sends at the status their `statusCode` names, or None
-# where it served the query. `_REQUEST_ERROR` is a row of JSON that is not an object: past that
-# layer it reaches the credential, one of `_auth_failed`'s 500s without the key, and with the key
-# it is a 400, in Apollo Server's words on real and graphql-js's here.
-_REQUEST_ERROR = object()
+# where it served the query. A `_WithTheKey` row is a body that layer passes, answered past the
+# credential: one of `_auth_failed`'s 500s without the key. Those rows are as api.fireflies.ai
+# answered them on 2026-10-25 (UTC), less the newline it ends each with.
+class _WithTheKey(bytes):
+    """Fireflies' answer with the key, at ``status``, to a body Apollo Server refuses or runs."""
+
+    def __new__(cls, answer: bytes, status: int = 400):
+        self = super().__new__(cls, answer)
+        self.status = status
+        return self
+
+
+def _apollo(
+    message: bytes, code: bytes = b"BAD_REQUEST", locations: bytes = b"", status: int = 400
+) -> _WithTheKey:
+    """Apollo Server's refusal as Fireflies writes it around ``message``, already JSON-escaped."""
+    return _WithTheKey(
+        b'{"errors":[{"friendly":false,"message":"%s",%s"code":"%s","extensions":{}}]}'
+        % (message, locations, code),
+        status,
+    )
+
+
+_NO_KEYS = _apollo(b"POST body missing, invalid Content-Type, or JSON object has no keys.")
+_BATCHING = _apollo(b"Operation batching disabled.")
 _EMPTY = (
     b'{"statusCode":400,"status":false,"code":"http","message":"Body cannot be empty when'
     b' content-type is set to \'application/json\'","errorMessage":"Body cannot be empty when'
@@ -300,11 +321,173 @@ _FIREFLIES_BODIES = [
     pytest.param(b"\xef\xbb\xbf", _NOT_JSON, id="BOM only"),
     pytest.param(b'{"x":Infinity,"query":"{ __typename }"}', _NOT_JSON, id="Infinity"),
     pytest.param(b'{"x":-Infinity,"query":"{ __typename }"}', _NOT_JSON, id="-Infinity"),
-    pytest.param(b"[]", _REQUEST_ERROR, id="an array"),
-    pytest.param(b"null", _REQUEST_ERROR, id="null"),
-    pytest.param(b'"x"', _REQUEST_ERROR, id="a string"),
-    pytest.param(b"5", _REQUEST_ERROR, id="a number"),
-    pytest.param(b'[{"query":"{ __typename }"}]', _REQUEST_ERROR, id="a batch of one query"),
+    pytest.param(b"[]", _BATCHING, id="an array"),
+    pytest.param(b"null", _NO_KEYS, id="null"),
+    pytest.param(b'"x"', _NO_KEYS, id="a string"),
+    pytest.param(b"5", _NO_KEYS, id="a number"),
+    pytest.param(b"true", _NO_KEYS, id="true"),
+    pytest.param(b"{}", _NO_KEYS, id="an empty object"),
+    pytest.param(b'[{"query":"{ __typename }"}]', _BATCHING, id="a batch of one query"),
+    pytest.param(b'{"query":5}', _apollo(b"GraphQL queries must be strings."), id="a query of 5"),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":"x"}',
+        _apollo(
+            b"`variables` in a POST body should be provided as an object, not a recursively "
+            b"JSON-encoded string."
+        ),
+        id="a string of variables",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","extensions":5}',
+        _apollo(b"`extensions` in a POST body must be an object if provided."),
+        id="extensions of 5",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","operationName":5}',
+        _apollo(b"`operationName` in a POST body must be a string if provided."),
+        id="an operationName of 5",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","extensions":{"persistedQuery":{"version":1,"sha256Hash":"'
+        + b"0" * 64
+        + b'"}}}',
+        _apollo(b"provided sha does not match query", b"INTERNAL_SERVER_ERROR"),
+        id="a persisted query's hash that does not match",
+    ),
+    pytest.param(
+        b'{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"' + b"1" * 64 + b'"}}}',
+        _apollo(b"PersistedQueryNotFound", b"PERSISTED_QUERY_NOT_FOUND", status=200),
+        id="a persisted query's hash alone",
+    ),
+    pytest.param(
+        b'{"query":null}',
+        _apollo(
+            b"GraphQL operations must contain a non-empty `query` or a `persistedQuery` extension."
+        ),
+        id="a query of null",
+    ),
+    pytest.param(
+        b'{"query":"{"}',
+        _apollo(
+            b"Syntax Error: Expected Name, found <EOF>.",
+            b"GRAPHQL_PARSE_FAILED",
+            b'"locations":[{"line":1,"column":2}],',
+        ),
+        id="a document that does not parse",
+    ),
+    pytest.param(
+        b'{"query":"{ nosuch }"}',
+        _apollo(
+            b'Cannot query field \\"nosuch\\" on type \\"Query\\".',
+            b"GRAPHQL_VALIDATION_FAILED",
+            b'"locations":[{"line":1,"column":3}],',
+        ),
+        id="a document that does not validate",
+    ),
+    pytest.param(
+        b'{"query":"query A { __typename } query B { __typename }"}',
+        _apollo(
+            b"Must provide operation name if query contains multiple operations.",
+            b"OPERATION_RESOLUTION_FAILURE",
+        ),
+        id="two operations and no operationName",
+    ),
+    pytest.param(
+        b'{"query":"query($b: Boolean!) { __typename @include(if: $b) }"}',
+        _apollo(
+            b'Variable \\"$b\\" of required type \\"Boolean!\\" was not provided.',
+            b"BAD_USER_INPUT",
+            b'"locations":[{"line":1,"column":7}],',
+        ),
+        id="a variable not provided",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","operationName":"Z"}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"Unknown operation named \\"Z\\".","code":"OPERATION_RESOLUTION_FAILURE","extensions":{}}]}'
+        ),
+        id="an operationName no operation has",
+    ),
+    pytest.param(
+        b'{"query":"query A { __typename }","operationName":""}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"Unknown operation named \\"\\".","code":"OPERATION_RESOLUTION_FAILURE","extensions":{}}]}'
+        ),
+        id="an empty operationName",
+    ),
+    pytest.param(
+        b'{"query":{"kind":"Document"}}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"GraphQL queries must be strings. It looks like you\'re sending the internal graphql-js representation of a parsed query in your request instead of a request in the GraphQL query language. You can convert an AST to a string using the `print` function from `graphql`, or use a client like `apollo-client` which converts the internal representation to a string for you.","code":"BAD_REQUEST","extensions":{}}]}'
+        ),
+        id="a parsed document",
+    ),
+    pytest.param(
+        b'{"query":false}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"GraphQL operations must contain a non-empty `query` or a `persistedQuery` extension.","code":"BAD_REQUEST","extensions":{}}]}'
+        ),
+        id="a query of false",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename }","variables":"null"}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"`variables` in a POST body should be provided as an object, not a recursively JSON-encoded string.","code":"BAD_REQUEST","extensions":{}}]}'
+        ),
+        id="variables of 'null'",
+    ),
+    pytest.param(
+        b'{"query":"query($b: Boolean!) { __typename @include(if: $b) }","variables":"{\\"b\\":true}"}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"`variables` in a POST body should be provided as an object, not a recursively JSON-encoded string.","code":"BAD_REQUEST","extensions":{}}]}'
+        ),
+        id="variables of a string its operation takes",
+    ),
+    pytest.param(
+        b'{"query":"mutation { __typename }"}',
+        _WithTheKey(b'{"data":{"__typename":"Mutation"}}', 200),
+        id="a mutation of __typename",
+    ),
+    pytest.param(
+        b'{"query":"subscription S { __typename }"}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"Schema is not configured to execute subscription operation.","locations":[{"line":1,"column":1}],"code":"INTERNAL_SERVER_ERROR","extensions":{}}],"data":null}',
+            200,
+        ),
+        id="a subscription of __typename",
+    ),
+    pytest.param(
+        b'{"query":"query($x: String = \\"a\\") { transcript(id: $x) { id } }","variables":{"x":null}}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"Argument \\"id\\" of non-null type \\"String!\\" must not be null.","locations":[{"line":1,"column":42}],"path":["transcript"],"code":"INTERNAL_SERVER_ERROR","extensions":{}}],"data":{"transcript":null}}',
+            200,
+        ),
+        id="null for a non-null argument",
+    ),
+    pytest.param(
+        b'{"query":"query($v: Boolean = true) { __typename @include(if: $v) }","variables":{"v":null}}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"Argument \\"if\\" of non-null type \\"Boolean!\\" must not be null.","locations":[{"line":1,"column":53}],"code":"INTERNAL_SERVER_ERROR","extensions":{}}],"data":null}',
+            200,
+        ),
+        id="null for a directive's argument at the root",
+    ),
+    pytest.param(
+        b'{"query":"{ ...F }"}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"Internal server error","code":"INTERNAL_SERVER_ERROR","extensions":{}}]}',
+            500,
+        ),
+        id="a fragment not defined",
+    ),
+    pytest.param(
+        b'{"query":"fragment F on Query { ...F } { ...F }"}',
+        _WithTheKey(
+            b'{"errors":[{"friendly":false,"message":"Internal server error","code":"INTERNAL_SERVER_ERROR","extensions":{}}]}',
+            500,
+        ),
+        id="a fragment that spreads itself",
+    ),
 ]
 
 
@@ -328,13 +511,12 @@ def test_fireflies_reads_the_body_before_the_credential(
         key = admin_h["Authorization"] if credential == "key" else credential
         headers = (*headers, ("Authorization", key))
     r = client.post("/fireflies/graphql", content=body, headers=list(headers))
-    if answer is not None and answer is not _REQUEST_ERROR:
+    if answer is not None and not isinstance(answer, _WithTheKey):
         assert (r.status_code, r.content) == (json.loads(answer)["statusCode"], answer)
     elif credential != "key":
         assert (r.status_code, r.content) == (500, _BODY_CREDENTIALS[credential])
-    elif answer is _REQUEST_ERROR:
-        assert r.json() == {"errors": [{"message": "POST body sent invalid JSON."}]}
-        assert r.status_code == 400
+    elif answer is not None:
+        assert (r.status_code, r.content) == (answer.status, answer)
     else:
         assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
 
