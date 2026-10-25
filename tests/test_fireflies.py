@@ -1379,7 +1379,7 @@ _LANDING_PAGE = object()  # Apollo Server's page for a browser, `landing_page`'s
 
 
 def _not_found(method: str, target: str) -> bytes:
-    """Fastify's 404, quoting ``target`` as the test sends it."""
+    """Fastify's 404, quoting ``target`` as the test sends it (:func:`tests._helpers.http_row`)."""
     path = target if target.startswith("/") else f"/graphql{target}"
     message = b"Cannot %s %s" % (method.encode(), path.encode())
     return (
@@ -2277,7 +2277,6 @@ def test_fireflies_answers_each_method_path_type_and_accept_as_fireflies_does(
         value = _FIREFLIES_CREDENTIALS[credential].format(t=tokens_yaml["admin_token"])
         sent += [("Authorization", value)] * (2 if credential == "twice" else 1)
     content = body.chunks() if isinstance(body, Chunked) else body
-    # A target that starts with a slash is a path; any other follows `/graphql`.
     path = target if target.startswith("/") else f"/graphql{target}"
     r = sent_as(client, method, f"/fireflies{path}", sent, content=content, bare=True)
     assert r.status_code == status

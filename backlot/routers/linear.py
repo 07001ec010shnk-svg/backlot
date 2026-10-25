@@ -224,8 +224,8 @@ _BARE = frozenset('"<>^`{|}')
 def express_path(path: str) -> str:
     """``path``, as a client sent it (:func:`backlot.routers.sent_path`), as Express reads it behind
     Linear's front: a backslash is a slash, an escape of a character RFC 3986 leaves unreserved is
-    that character, a run of slashes is one, each of ``"<>^`{|}`` sent bare is escaped in upper
-    case, and any other escape is kept as sent. Express's 404 quoted `/%6Eosuch` as `/nosuch`,
+    that character, a run of slashes is one, each character of :data:`_BARE` sent bare is escaped in
+    upper case, and any other escape is kept as sent. Express's 404 quoted `/%6Eosuch` as `/nosuch`,
     `//nosuch` and `/nosuch//x` as `/nosuch` and `/nosuch/x`, `/a\\b` as `/a/b`, `/a%2fb` and
     `/a%3cb` as sent, and each other printable ASCII character but `%`, `?` and `#` as sent, on
     2026-10-25 (UTC)."""
@@ -254,12 +254,11 @@ _HTML = "text/html; charset=utf-8"
 @router.api_route("/", methods=list(apollo_http.METHODS), include_in_schema=False)
 async def express(request: Request):
     """Linear's answer at a path Express does not hand Apollo Server (:func:`routes_to_apollo`),
-    each of which ``backlot.main`` routes here:
-    after the layers of :func:`_front`, Express's own, as api.linear.app answered on 2026-10-25
-    (UTC). At `/` that is :data:`_GREETING` to a `GET` and a `HEAD`, and the methods `/` takes, as
-    `text/plain`, to an `OPTIONS`; at any other path, and to any other method, it is ``finalhandler``'s
-    404 page (:func:`_not_found`). The body is not read: `{` under `application/json` drew the
-    404."""
+    each of which ``backlot.main`` routes here: after the layers of :func:`_front`, Express's own,
+    as api.linear.app answered on 2026-10-25 (UTC). At `/` that is :data:`_GREETING` to a `GET` and
+    a `HEAD`, and the methods `/` takes, as `text/plain`, to an `OPTIONS`; at any other path, and to
+    any other method, it is ``finalhandler``'s 404 page (:func:`_not_found`). The body is not read:
+    `{` under `application/json` drew the 404."""
     front = _front(request)
     if front is not None:
         return front

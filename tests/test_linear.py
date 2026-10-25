@@ -6615,7 +6615,6 @@ def test_linear_answers_each_method_path_type_and_accept_as_linear_does(
         value = _LINEAR_CREDENTIALS[credential].format(t=tokens_yaml["admin_token"])
         sent += [("Authorization", value)] * (2 if credential == "twice" else 1)
     content = body.chunks() if isinstance(body, Chunked) else body
-    # A target that starts with a slash is a path; any other follows `/graphql`.
     path = target if target.startswith("/") else f"/graphql{target}"
     r = sent_as(client, method, f"/linear{path}", sent, content=content, bare=True)
     assert r.status_code == status
@@ -6626,8 +6625,9 @@ def test_linear_answers_each_method_path_type_and_accept_as_linear_does(
 
 @pytest.mark.parametrize("char", '"<>`{}')
 def test_linears_front_escapes_a_character_httpx_escapes_first(char):
-    """The characters :func:`backlot.routers.linear.express_path` escapes that httpx escapes before
-    it sends a path, so `_LINEAR_HTTP` cannot send them bare; it sends the other two, `|` and `^`."""
+    """The characters :func:`backlot.routers.linear.express_path` escapes that httpx escapes
+    before it sends a path, so `_LINEAR_HTTP` cannot send them bare; it sends the other two, `|`
+    and `^`."""
     from backlot.routers import linear
 
     assert linear.express_path(f"/nosucha{char}b") == f"/nosucha%{ord(char):02X}b"

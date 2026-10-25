@@ -194,7 +194,8 @@ class Namer:
             return Named("other", "unmatched", UNKNOWN)
         source, strip = placed
         if source in self._graphql:
-            # Any other path under a GraphQL source's mount is one its endpoint is not served at.
+            # Any other path under a GraphQL source's mount was answered off its endpoint, as
+            # `backlot.main` routes each path the endpoint is served at to the endpoint's own.
             if path not in self._graphql_paths:
                 return Named(source, "unmatched", UNKNOWN)
             return self._graphql_call(source, graphql_payload)

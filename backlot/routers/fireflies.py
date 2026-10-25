@@ -125,10 +125,10 @@ _BODIED = ("DELETE", "PATCH", "POST", "PUT")
 @router.api_route("/graphql", methods=list(apollo_http.METHODS), include_in_schema=False)
 async def graphql(request: Request):
     """Fireflies' endpoint, the one path Fastify routes, in front of which Fireflies runs nginx
-    (:func:`nginx_passes`), Fastify and ``@fastify/cors``. Not in the OpenAPI document on purpose: this is a GraphQL service, and
-    describing one POST route that accepts an arbitrary query would tell an OpenAPI→MCP bridge
-    nothing useful (hence no ``SOURCE_PREFIXES`` entry either — see ``backlot/openapi.py``).
-    Introspection is the schema description for this endpoint.
+    (:func:`nginx_passes`), Fastify and ``@fastify/cors``. Not in the OpenAPI document on purpose:
+    this is a GraphQL service, and describing one POST route that accepts an arbitrary query would
+    tell an OpenAPI→MCP bridge nothing useful (hence no ``SOURCE_PREFIXES`` entry either — see
+    ``backlot/openapi.py``). Introspection is the schema description for this endpoint.
 
     The layers answer in this order, each measured against api.fireflies.ai on 2026-10-25 (UTC)
     with the one after it wrong too: ``@fastify/cors`` (:func:`_preflight`), Fastify
@@ -237,9 +237,9 @@ def _not_found(request: Request) -> Response:
     api.fireflies.ai answered so each of the 28 methods of :data:`apollo_http.METHODS` but GET,
     HEAD, POST, OPTIONS and Cloudflare's three at `/graphql` on 2026-10-25 (UTC), `PUT`, `DELETE`
     and `PATCH` once Fastify had read their body (:func:`_fastify_read`), and quoted
-    `/graphql?x=%7B%20y&z&a=b+c` as sent; and each method at each path nginx passes on
-    (:func:`nginx_passes`) but `/graphql`, quoting `//graphql`, `/graph%71l`'s `PUT` and
-    `/graphql%0A` as sent."""
+    `/graphql?x=%7B%20y&z&a=b+c` as sent; and `POST`, `GET`, `HEAD`, `PUT`, `PROPFIND` and `BIND`
+    at `/GRAPHQL`, `/graphql/x`, `//graphql` and `/graphql%2F`, `POST` at `/%2Fgraphql` and
+    `/graphql%0A`, and `PUT` at `/graph%71l`, quoting each path as sent."""
     query = request.scope["query_string"].decode("latin-1")
     message = f"Cannot {request.method} {sent_path(request.scope)}{'?' if query else ''}{query}"
     return _body_refusal(message, 404, "not_found")
@@ -267,12 +267,10 @@ def nginx_passes(path: str) -> bool:
 @router.api_route("/", methods=list(apollo_http.METHODS), include_in_schema=False)
 async def unrouted(request: Request):
     """Fireflies' answer at a path Fastify has no route for, each of which ``backlot.main`` routes
-    here: :data:`_NGINX_404` where nginx keeps
-    the request (:func:`nginx_passes`), and Fastify's where it passes it on, ``@fastify/cors``'s to
-    an `OPTIONS` (:func:`_preflight`) and its not-found handler's 404 (:func:`_not_found`) to any
-    other method, once it has read a body (:data:`_BODIED`). api.fireflies.ai answered `{`, an
-    empty body and `a/b/c` at `/graphql/` with Fastify's 400 and 415 and plain text and
-    `application/graphql` with its 404, on 2026-10-25 (UTC)."""
+    here: :data:`_NGINX_404` where nginx keeps the request (:func:`nginx_passes`), and Fastify's
+    where it passes it on, :func:`_preflight` to an `OPTIONS` and its not-found handler's 404
+    (:func:`_not_found`) to any other method, after reading the body of one of :data:`_BODIED`
+    (:func:`_fastify_read`)."""
     if not nginx_passes(sent_path(request.scope)):
         return Response(_NGINX_404, status_code=404, headers={"content-type": "text/html"})
     if request.method == "OPTIONS":
@@ -300,7 +298,9 @@ async def _fastify_read(request: Request, routed: bool) -> Any:
     api.fireflies.ai answered so each body sent on 2026-10-25 (UTC) to `POST`, `PUT`, `DELETE`
     and `PATCH`: no type with a body was the 415 by `POST` and the 404 by `PUT`, `a/b/c` and an
     empty type the 415 by both, `application/graphql` the 415 by `POST`, past the limit too, and
-    the 404 by `PUT`, and a form or plain text past the limit the 413 by both."""
+    the 404 by `PUT`, and a form or plain text past the limit the 413 by both. A `POST` to
+    `/graphql/`, which no route takes, was read as a `PUT` to `/graphql` is: `{` and an empty body
+    drew the 400s, `a/b/c` the 415, and plain text, `application/graphql` and no type the 404."""
     content_type = request.headers.get("content-type")
     if content_type is None:
         length = request.headers.get("content-length")

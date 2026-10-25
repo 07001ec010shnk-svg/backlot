@@ -334,7 +334,8 @@ class Chunked(bytes):
 
 def http_row(method, target, sent, body, credential, status, media_type, answer, id, answered=None):
     """A row of an HTTP layer's table: the request, the credential, and the answer, ``answered``
-    naming headers on it."""
+    naming headers on it. ``target`` is a path after the vendor's prefix where it starts with a
+    slash, and what follows the endpoint's path where it does not."""
     return pytest.param(
         method, target, sent, body, credential, status, media_type, answer, answered or {}, id=id
     )
