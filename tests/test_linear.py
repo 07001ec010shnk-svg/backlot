@@ -22,6 +22,7 @@ from graphql import GraphQLError, build_client_schema, is_enum_type, parse, vali
 from backlot import synth
 from backlot.fidelity.graphql_diff import backlot_schema
 from backlot.graphql import linear_filters, mcp_tools
+from backlot.graphql.body import node_json
 from tests._helpers import (
     SWEPT_BYTES,
     WithTheKey,
@@ -178,19 +179,6 @@ def test_linear_comment_url_is_the_issue_url_with_the_ids_first_eight(client, ad
     same = [c for c in data["comments"]["nodes"] if c["id"] == from_comment["id"]]
     assert same, "the issue's comment must also answer from the comments root"
     assert same[0]["url"] == from_comment["url"]
-
-
-def test_linear_missing_issue_is_a_field_error_not_a_400(client, admin_h):
-    """Linear declares `issue` non-null, so a miss nulls `data` and reports an error — but the
-    request itself was fine, so the status stays 200."""
-    r = gql(client, '{ issue(id: "NOPE-1") { identifier } }', admin_h)
-    assert r.status_code == 200
-    assert r.content.startswith(b'{"errors":[')
-    assert r.json()["data"] is None
-    assert "Entity not found" in r.json()["errors"][0]["message"]
-    # control: an issue that exists still opens with "data"
-    ok = gql(client, '{ issue(id: "ENG-101") { identifier } }', admin_h)
-    assert ok.content.startswith(b'{"data":')
 
 
 def test_linear_team_resolves_by_key_and_uuid(client, admin_h, ro_conn):
@@ -593,6 +581,113 @@ def test_linear_by_id_relation_roots_answer(client, admin_h):
     assert label["groupType"] is None
 
 
+# Each by-id root, an id it holds nothing for, and the message and presentable text of Linear's
+# error for it (`linear_resolvers._not_found`, `linear_resolvers._ATTACHMENT`).
+_UNKNOWN_IDS = [
+    pytest.param(
+        "issue",
+        "00000000-0000-0000-0000-000000000000",
+        "Entity not found: Issue",
+        "Could not find referenced Issue.",
+        id="issue 00000000",
+    ),
+    pytest.param(
+        "issue",
+        "NOPE-1",
+        "Entity not found: Issue",
+        "Could not find referenced Issue.",
+        id="issue NOPE-1",
+    ),
+    pytest.param(
+        "team", "nope", "Entity not found: Team", "Could not find referenced Team.", id="team nope"
+    ),
+    pytest.param(
+        "user",
+        "00000000-0000-0000-0000-000000000000",
+        "Entity not found: User",
+        "Could not find referenced User.",
+        id="user 00000000",
+    ),
+    pytest.param(
+        "workflowState",
+        "nope",
+        "Entity not found: WorkflowState",
+        "Could not find referenced WorkflowState.",
+        id="workflowState nope",
+    ),
+    pytest.param(
+        "project",
+        "00000000-0000-0000-0000-000000000000",
+        "Entity not found: Project",
+        "Could not find referenced Project.",
+        id="project 00000000",
+    ),
+    pytest.param(
+        "issueLabel",
+        "nope",
+        "Entity not found: IssueLabel",
+        "Could not find referenced IssueLabel.",
+        id="issueLabel nope",
+    ),
+    pytest.param(
+        "cycle",
+        "00000000-0000-0000-0000-000000000000",
+        "Entity not found: Cycle",
+        "Could not find referenced Cycle.",
+        id="cycle 00000000",
+    ),
+    pytest.param(
+        "release",
+        "nope",
+        "Entity not found: Release",
+        "Could not find referenced Release.",
+        id="release nope",
+    ),
+    pytest.param(
+        "issueRelation",
+        "nope",
+        "Entity not found: IssueRelation",
+        "Could not find referenced IssueRelation.",
+        id="issueRelation nope",
+    ),
+    pytest.param(
+        "teamMembership",
+        "00000000-0000-0000-0000-000000000000",
+        "Entity not found: TeamMembership",
+        "Could not find referenced TeamMembership.",
+        id="teamMembership 00000000",
+    ),
+    pytest.param(
+        "attachment",
+        "00000000-0000-0000-0000-000000000000",
+        "Entity not found: Attachment: could not find by url.",
+        "Could not find referenced attachment with this url.",
+        id="attachment 00000000",
+    ),
+]
+
+
+@pytest.mark.parametrize("root, id_, message, presentable", _UNKNOWN_IDS)
+def test_linear_answers_an_id_it_does_not_hold_as_linear_does(
+    client, admin_h, root, id_, message, presentable
+):
+    body = {"query": "query($x: String!) { %s(id: $x) { id } }" % root, "variables": {"x": id_}}
+    r = client.post("/linear/graphql", json=body, headers=admin_h)
+    error = {
+        "message": message,
+        "path": [root],
+        "locations": [{"line": 1, "column": 22}],
+        "extensions": {
+            "type": "invalid input",
+            "code": "INPUT_ERROR",
+            "statusCode": 400,
+            "userError": True,
+            "userPresentableMessage": presentable,
+        },
+    }
+    assert (r.status_code, r.content) == (200, node_json({"errors": [error], "data": None}))
+
+
 def test_linear_workflow_states_are_per_team(client, admin_h):
     """Two teams' identically-named states are different objects in Linear, so their ids differ.
     The corpus has no shared state name, so assert the construction directly instead."""
@@ -703,15 +798,9 @@ def test_linear_malformed_document_is_a_400_with_a_graphql_envelope(client, admi
     assert "Syntax Error" in body["errors"][0]["message"]
 
 
-def test_linear_unauthenticated_is_401(client):
-    r = client.post("/linear/graphql", json={"query": "{ viewer { email } }"})
-    assert r.status_code == 401
-    assert r.json()["errors"][0]["message"] == "Authentication required"
-
-
 # --- the body, and where the credential is read against it ---------------------------------------
 # The headers a body was sent with beyond `Content-Type: application/json`, the body, and the bytes
-# Linear refused it with for the key, no credential and `nope` alike, at the status their `code` or
+# Linear answered it with for the key, no credential and `nope` alike, at the status their `code` or
 # `extensions.http.status` names (`_status`), or None where Linear served the query with the key and
 # answered 401 without one, as `backlot.graphql.body` and `backlot.graphql.v8_json` read them. A
 # `WithTheKey` row draws the 401 without the key. Apollo Server's envelopes are api.linear.app's,
@@ -729,7 +818,9 @@ def _status(answer: bytes) -> int:
     envelope = json.loads(answer)
     if "code" in envelope:
         return envelope["code"]
-    return envelope["errors"][0]["extensions"]["http"]["status"]
+    if "errors" not in envelope:
+        return 200
+    return envelope["errors"][0]["extensions"].get("http", {}).get("status", 400)
 
 
 _NO_KEYS = _apollo(b"POST body missing, invalid Content-Type, or JSON object has no keys.")
@@ -1676,6 +1767,97 @@ _LINEAR_BODIES = [
         id="null for a non-null argument after U+2028 in a comment",
     ),
     pytest.param(
+        b'{"query":"{ __schema { queryType { name } } }"}',
+        b'{"data":{"__schema":{"queryType":{"name":"Query"}}}}',
+        id="introspection",
+    ),
+    pytest.param(
+        b'{"query":"{ __type(name: \\"Query\\") { name } }"}',
+        b'{"data":{"__type":{"name":"Query"}}}',
+        id="__type",
+    ),
+    pytest.param(
+        b'{"query":"{ s: __schema { queryType { name } } }"}',
+        b'{"data":{"s":{"queryType":{"name":"Query"}}}}',
+        id="an alias of __schema",
+    ),
+    pytest.param(
+        b'{"query":"{ __schema { queryType { name } } __type(name: \\"Issue\\") { name } }"}',
+        b'{"data":{"__schema":{"queryType":{"name":"Query"}},"__type":{"name":"Issue"}}}',
+        id="__schema and __type",
+    ),
+    pytest.param(
+        b'{"query":"{ ...F } fragment F on Query { __schema { queryType { name } } }"}',
+        b'{"data":{"__schema":{"queryType":{"name":"Query"}}}}',
+        id="__schema in a fragment",
+    ),
+    pytest.param(
+        b'{"query":"{ ... on Query { __schema { queryType { name } } } }"}',
+        b'{"data":{"__schema":{"queryType":{"name":"Query"}}}}',
+        id="__schema in an inline fragment",
+    ),
+    pytest.param(
+        b'{"query":"{ __schema @skip(if: false) { queryType { name } } }"}',
+        b'{"data":{"__schema":{"queryType":{"name":"Query"}}}}',
+        id="__schema under @skip(if: false)",
+    ),
+    pytest.param(
+        b'{"query":"query Q { __schema { queryType { name } } }"}',
+        b'{"data":{"__schema":{"queryType":{"name":"Query"}}}}',
+        id="a named query of __schema",
+    ),
+    pytest.param(
+        b'{"query":"query A { __schema { queryType { name } } } query B { viewer { id } }","operationName":"A"}',
+        b'{"data":{"__schema":{"queryType":{"name":"Query"}}}}',
+        id="the introspection operationName chose",
+    ),
+    pytest.param(
+        b'{"query":"query($b: Boolean!) { __schema @include(if: $b) { queryType { name } } }"}',
+        b'{"errors":[{"message":"Variable \\"$b\\" of required type \\"Boolean!\\" was not provided.","locations":[{"line":1,"column":7}],"extensions":{"code":"BAD_USER_INPUT","type":"graphql error","userError":true}}]}',
+        id="introspection with a variable not provided",
+    ),
+    pytest.param(
+        b'{"query":"{ __typename __schema { queryType { name } } }"}',
+        WithTheKey(
+            b'{"data":{"__typename":"Query","__schema":{"queryType":{"name":"Query"}}}}', 200
+        ),
+        id="__typename beside __schema",
+    ),
+    pytest.param(
+        b'{"query":"{ __schema { queryType { name } } viewer @skip(if: true) { id } }"}',
+        WithTheKey(b'{"data":{"__schema":{"queryType":{"name":"Query"}}}}', 200),
+        id="__schema beside a skipped field",
+    ),
+    pytest.param(
+        b'{"query":"{ viewer @skip(if: true) { id } }"}',
+        WithTheKey(b'{"data":{}}', 200),
+        id="a skipped field alone",
+    ),
+    pytest.param(
+        b'{"query":"{ ...F } fragment F on Query { __typename }"}',
+        None,
+        id="__typename in a fragment",
+    ),
+    pytest.param(
+        b'{"query":"{ ... on Query { __typename } }"}',
+        None,
+        id="__typename in an inline fragment",
+    ),
+    pytest.param(
+        b'{"query":"{ __schema { queryType { name } } ...F } fragment F on Query { __typename }"}',
+        WithTheKey(
+            b'{"data":{"__schema":{"queryType":{"name":"Query"}},"__typename":"Query"}}', 200
+        ),
+        id="__schema and __typename in a fragment",
+    ),
+    pytest.param(
+        b'{"query":"{ ... on Query { __schema { queryType { name } } } ...F } fragment F on Query { __typename }"}',
+        WithTheKey(
+            b'{"data":{"__schema":{"queryType":{"name":"Query"}},"__typename":"Query"}}', 200
+        ),
+        id="__typename in a fragment beside an inline __schema",
+    ),
+    pytest.param(
         b'{"query":"{ ...F }"}',
         b'{"errors":[{"message":"Unknown fragment \\"F\\".","locations":[{"line":1,"column":6}],"extensions":{"http":{"status":400,"headers":{}},"code":"GRAPHQL_VALIDATION_FAILED","type":"graphql error","userError":true}}]}',
         id="a fragment not defined",
@@ -2046,7 +2228,7 @@ def test_linear_orders_the_body_and_the_credential(
     if credential.startswith("Bearer"):
         assert (r.status_code, r.content) == (400, _API_KEY_AS_BEARER)
     elif credential != "key" and (answer is None or isinstance(answer, WithTheKey)):
-        assert r.status_code == 401
+        assert (r.status_code, r.content) == (401, _UNAUTHENTICATED)
     elif answer is None:
         assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
     elif isinstance(answer, WithTheKey):
@@ -4968,8 +5150,13 @@ _API_KEY_AS_BEARER = (
     b' Remove the Bearer prefix from the Authorization header.","extensions":{"type":"invalid'
     b' input","code":"INPUT_ERROR","statusCode":400,"userError":true}}]}'
 )
+_UNAUTHENTICATED = (
+    b'{"errors":[{"message":"Authentication required, not authenticated","extensions":{"type":"a'
+    b'uthentication error","code":"AUTHENTICATION_ERROR","statusCode":401,"userError":true,"user'
+    b'PresentableMessage":"You need to authenticate to access this operation.","meta":{},"http":{"status":401}}}]}'
+)
 # `Authorization` values, `{t}` for an API key that resolves, and the status Linear gave each: 200
-# serving the query and 400 being `_API_KEY_AS_BEARER`. Backlot's 401 keeps its own body.
+# serving the query, 400 being `_API_KEY_AS_BEARER` and 401 `_UNAUTHENTICATED`.
 _LINEAR_SPELLINGS = [
     pytest.param("{t}", 200, id="bare"),
     pytest.param(" {t}", 200, id="a space before"),
@@ -5008,6 +5195,9 @@ _LINEAR_SPELLINGS = [
     pytest.param("Bearer nope", 401, id="Bearer nope"),
     pytest.param("bearer nope", 401, id="bearer nope"),
     pytest.param("Token {t}", 401, id="Token"),
+    pytest.param("nope", 401, id="nope"),
+    pytest.param("Bearer", 401, id="Bearer alone"),
+    pytest.param("Basic Zm9vOmJhcg==", 401, id="Basic"),
 ]
 
 
@@ -5057,6 +5247,8 @@ def test_linear_reads_a_credential_as_linear_does(client, tokens_yaml, value, st
         assert r.json()["data"]["viewer"]["id"]
     elif status == 400:
         assert r.content == _API_KEY_AS_BEARER
+    else:
+        assert r.content == _UNAUTHENTICATED
 
 
 def test_linear_issue_asserts_rather_than_re_derive_a_missing_identifier():
