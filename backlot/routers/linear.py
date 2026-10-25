@@ -11,9 +11,6 @@ travels as the **bare** header value (``Authorization: lin_api_…``, no scheme)
 access token travels, and what Linear takes for an API key there
 (:func:`backlot.auth.linear_api_key_under_bearer`) is :func:`_api_key_as_bearer`'s 400.
 
-Status codes follow the GraphQL-over-HTTP split :class:`backlot.graphql.engine.Result` marks; real
-Linear draws the line in the same place, and generated clients branch on it.
-
 Express's ``body-parser``, in front of the GraphQL server, reads the body before the credential is
 looked at, for any credential but an API key under ``Bearer``: with no credential, a body that is
 not JSON drew its 400 from api.linear.app on 2026-10-18, not the 401. :func:`_express` is that 400,
@@ -181,9 +178,8 @@ def _variables_read(payload: Any) -> Any:
     return payload
 
 
-# What Linear's errors carry beside `code`, by code, as api.linear.app answered on 2026-10-25 (UTC):
-# Apollo Server's `http` member on each request error but a variable's refusal, `type` and
-# `userError`.
+# The `type` beside each code in Linear's errors of 2026-10-25 (UTC), which also carry Apollo
+# Server's `http` member on each request error but a variable's refusal, and `userError`.
 _TYPE = {engine.INTERNAL_SERVER_ERROR: "internal error", _INVALID_INPUT: "invalid input"}
 
 
@@ -202,9 +198,9 @@ def _apollo(message: str, code: str, status: int, locations: Any = ()) -> dict:
 
 
 def _internal(error: dict) -> dict:
-    """Linear's ``Internal server error`` in place of an error graphql-js made as the operation
-    ran, at the error's ``path`` and ``locations``, as api.linear.app answered a ``null`` variable
-    a non-null argument refused on 2026-10-21 (UTC)."""
+    """Linear's ``Internal server error`` in place of ``error``, at its ``path`` and ``locations``:
+    api.linear.app's answer to a ``null`` variable a non-null argument refused, on 2026-10-21
+    (UTC)."""
     entry: dict = {"message": "Internal server error"}
     for key in ("path", "locations"):
         if key in error:
@@ -218,9 +214,9 @@ def _internal(error: dict) -> dict:
 
 
 def _operation_missing(name: Any) -> dict:
-    """Linear's own refusal of a document whose operation cannot be chosen: two operations and no
-    ``operationName``, or a name no operation has, as api.linear.app answered on 2026-10-25 (UTC);
-    an empty name is answered as no name."""
+    """Linear's own refusal of a document whose operation cannot be chosen, two operations and no
+    ``operationName`` or a name no operation has, in the words api.linear.app used on 2026-10-25
+    (UTC): an empty name in those for no name."""
     presentable = (
         f"The operation '{name}' does not exist on the query."
         if name
@@ -240,11 +236,10 @@ def _operation_missing(name: Any) -> dict:
 
 
 def _envelope(result: engine.Result, payload: Any) -> dict:
-    """``result`` as Linear writes it. A request error is Apollo Server's in Linear's members
-    (:func:`_apollo`): a body with no query carries Linear's ``INVALID_INPUT``, a refused persisted
-    query Linear's ``Internal server error``, and an operation that cannot be chosen Linear's own
-    refusal (:func:`_operation_missing`). An error graphql-js made as the operation ran is
-    :func:`_internal`."""
+    """``result`` as Linear writes it: a request error in Linear's members (:func:`_apollo`), but a
+    body with no query under Linear's ``INVALID_INPUT``, a refused persisted query as Linear's
+    ``Internal server error`` and an operation that cannot be chosen as :func:`_operation_missing`;
+    and each error in ``result.assigned`` as :func:`_internal`."""
     if result.refusals:
         errors = []
         for refusal in result.refusals:
@@ -283,11 +278,11 @@ def _read(raw: bytes, content_type: str | None, content_encoding: str) -> Any:
         text = request_body.body_parser_text(raw, content_type, content_encoding)
     except request_body.Unread as unread:
         return _express(unread.message, unread.status, unread.length)
-    violation = request_body.strict_violation(text) if text else None
-    if violation is not None:
-        return _express(violation)
     if not text:
         return {}
+    violation = request_body.strict_violation(text)
+    if violation is not None:
+        return _express(violation)
     try:
         return request_body.parse(text)
     except request_body.NotJson:

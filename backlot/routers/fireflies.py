@@ -10,8 +10,6 @@ quickstart shows for all four of its raw-HTTP examples, read by
 :func:`backlot.auth.fireflies_bearer_token`. A credential Fireflies does not take is
 :func:`_auth_failed`'s 500, which comes after the body is read.
 
-Status codes follow the GraphQL-over-HTTP split :class:`backlot.graphql.engine.Result` marks.
-
 A body Fireflies cannot read is refused ahead of anything about the credential: with no
 credential, and with ``Authorization: nope``, an empty body and a body that is not JSON drew
 :func:`_body_refusal`'s 400 from api.fireflies.ai on 2026-10-18. ``Content-Encoding`` and the
@@ -160,10 +158,11 @@ def _entry(error: dict, code: str, friendly: bool, extensions: dict) -> dict:
 
 def _envelope(result: engine.Result) -> dict:
     """``result`` as Fireflies writes it, as api.fireflies.ai answered on 2026-10-25 (UTC): each
-    request error, and each error graphql-js made as the operation ran, with ``friendly: false``,
-    Apollo Server's code beside the message and ``extensions`` empty. Its ``invalid_arguments`` and
-    ``INTERNAL_SERVER_ERROR`` field errors carry the extensions their resolver gave, the refusal as
-    real answered it on 2026-10-21 and the INTERNAL_SERVER_ERROR on 2026-10-22."""
+    request error, and each error in ``result.assigned``, with ``friendly: false``, Apollo Server's
+    code beside the message and ``extensions`` empty. The ``invalid_arguments`` and
+    ``INTERNAL_SERVER_ERROR`` errors a resolver raises keep the extensions it gave them,
+    ``friendly`` as ``_FRIENDLY`` has it, as api.fireflies.ai answered the refusal on 2026-10-21
+    and the INTERNAL_SERVER_ERROR on 2026-10-22."""
     if result.refusals:
         errors = []
         for refusal in result.refusals:
@@ -196,6 +195,8 @@ def _fragments_unreached(doc: DocumentNode) -> engine.Result | None:
     in a fragment no operation uses was the validation's ``Unknown fragment`` and the same cycle
     its ``Cannot spread fragment``."""
     fragments = {d.name.value: d for d in doc.definitions if isinstance(d, FragmentDefinitionNode)}
+
+    # Each fragment found to reach no fault, so that a fragment many spreads reach is read once.
     done: set[str] = set()
 
     def reaches_a_fault(selections, path: tuple[str, ...]) -> bool:
@@ -208,22 +209,17 @@ def _fragments_unreached(doc: DocumentNode) -> engine.Result | None:
                     if reaches_a_fault(fragments[name].selection_set.selections, (*path, name)):
                         return True
                     done.add(name)
-            elif selection.selection_set is not None:
-                if reaches_a_fault(selection.selection_set.selections, path):
-                    return True
+            elif selection.selection_set is not None and reaches_a_fault(
+                selection.selection_set.selections, path
+            ):
+                return True
         return False
 
-    for definition in doc.definitions:
-        if isinstance(definition, OperationDefinitionNode):
-            if reaches_a_fault(definition.selection_set.selections, ()):
-                return engine.Result(
-                    payload={},
-                    refusals=(
-                        engine.Refusal(
-                            "Internal server error", engine.INTERNAL_SERVER_ERROR, status=500
-                        ),
-                    ),
-                )
+    operations = [d for d in doc.definitions if isinstance(d, OperationDefinitionNode)]
+    if any(reaches_a_fault(operation.selection_set.selections, ()) for operation in operations):
+        return engine.refused(
+            engine.Refusal("Internal server error", engine.INTERNAL_SERVER_ERROR, status=500)
+        )
     return None
 
 

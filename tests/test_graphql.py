@@ -216,26 +216,36 @@ def _crashed(_root, _info):
 
 
 @pytest.mark.parametrize(
-    "query, variables, raised",
+    "query, variables, raised, assigned",
     [
-        ("{ placed }", None, False),
-        ("{ crashed }", None, True),
-        ("{ boom crashed }", None, True),
+        ("{ placed }", None, False, []),
+        ("{ crashed }", None, True, []),
+        ("{ boom crashed }", None, True, []),
         # graphql-core completing a value the schema refuses
-        ("{ blank }", None, True),
-        ("{ count }", None, True),
-        ("{ many }", None, True),
-        ("{ either { ... on Widget { id } } }", None, True),
+        ("{ blank }", None, True, []),
+        ("{ count }", None, True, [0]),
+        ("{ many }", None, True, [0]),
+        ("{ either { ... on Widget { id } } }", None, True, [0]),
         # graphql-core refusing, as it runs the field, an argument the request sent
-        ('query W($id: ID = "w1") { widget(id: $id) { name } }', {"id": None}, False),
+        ('query W($id: ID = "w1") { widget(id: $id) { name } }', {"id": None}, False, [0]),
         (
             'query W($show: Boolean = true) { widget(id: "w1") { name @include(if: $show) } }',
             {"show": None},
             False,
+            [0],
+        ),
+        (
+            'query W($id: ID = "w1") { boom widget(id: $id) { name } }',
+            {"id": None},
+            False,
+            [1],
         ),
     ],
 )
-def test_a_field_error_is_marked_raised_unless_it_refuses_the_request(query, variables, raised):
+def test_a_field_error_is_marked_by_who_made_it(query, variables, raised, assigned):
+    """``raised`` marks Backlot's own failure, and ``assigned`` each error graphql-core raised as a
+    ``GraphQLError`` (:func:`backlot.graphql.engine._made_by_graphql`), which alone carries
+    ``INTERNAL_SERVER_ERROR``."""
     gql = engine.Engine(
         SDL.replace(
             "boom: String",
@@ -257,6 +267,12 @@ def test_a_field_error_is_marked_raised_unless_it_refuses_the_request(query, var
     )
     r = gql.execute(query, variables=variables)
     assert (r.request_error, "errors" in r.payload, r.raised) == (False, True, raised)
+    assert sorted(r.assigned) == assigned
+    assert [
+        i
+        for i, error in enumerate(r.payload["errors"])
+        if error.get("extensions", {}).get("code") == engine.INTERNAL_SERVER_ERROR
+    ] == assigned
 
 
 # --- operation selection --------------------------------------------------------
@@ -434,7 +450,9 @@ _ECHO_FIELDS = {
     ],
 )
 def test_a_variable_is_read_as_graphql_js_reads_it(type_, value, answer):
-    """Each value is read by :func:`backlot.graphql.engine._ids_as_graphql_js_reads_them`."""
+    """Each value is read as graphql-js reads it: an ``ID`` by
+    :func:`backlot.graphql.engine._ids_as_graphql_js_reads_them`, a refusal by
+    :func:`backlot.graphql.js_words.coerce_variable_values`."""
     query = "query($x: %s) { %s }" % (type_, _ECHO_FIELDS[type_])
     body = '{"query": "%s", "variables": {"x": %s}}' % (query, value)
     assert _ECHO.execute_payload(request_body.parse(body)).payload == answer
@@ -831,9 +849,8 @@ _NOT_FOUND = _refused("PersistedQueryNotFound", "PERSISTED_QUERY_NOT_FOUND", 200
 
 
 # A body, and Apollo Server's answer to it in Apollo Server's own envelope: a refusal with the
-# message, code, locations and status api.fireflies.ai answered it with on 2026-10-25 (UTC), or
-# `_SERVED` where it ran the query. Where two checks apply, the row's answer is the one that came
-# first.
+# message, code, locations and status api.fireflies.ai answered it with, or `_SERVED` where it ran
+# the query. Where two checks apply, the row's answer is the one that came first.
 _APOLLO_CHECKS = [
     pytest.param([{"query": _TYPENAME}], _refused("Operation batching disabled."), id="a batch"),
     pytest.param({}, _NO_KEYS, id="an empty object"),
@@ -841,6 +858,8 @@ _APOLLO_CHECKS = [
     pytest.param(5, _NO_KEYS, id="a number"),
     pytest.param({"query": 5, "variables": [1]}, _NOT_A_STRING, id="query 5, variables [1]"),
     pytest.param({"query": 5, "extensions": 5}, _NOT_A_STRING, id="query 5, extensions 5"),
+    pytest.param({"query": {}}, _NOT_A_STRING, id="a query of an empty object"),
+    pytest.param({"query": 0}, _NO_QUERY, id="a query of 0"),
     pytest.param({"query": 5, "variables": "{"}, _NOT_A_STRING, id="query 5, variables '{'"),
     pytest.param(
         {"query": {"kind": "Document"}},
@@ -857,6 +876,16 @@ _APOLLO_CHECKS = [
         {"query": _TYPENAME, "variables": "x", "extensions": 5},
         _refused(engine.RECURSIVELY_ENCODED.format("variables")),
         id="variables 'x', extensions 5",
+    ),
+    pytest.param(
+        {"query": _TYPENAME, "variables": "x", "extensions": "x"},
+        _refused(engine.RECURSIVELY_ENCODED.format("variables")),
+        id="variables 'x', extensions 'x'",
+    ),
+    pytest.param(
+        {"query": _TYPENAME, "extensions": "x", "variables": [1]},
+        _refused(engine.RECURSIVELY_ENCODED.format("extensions")),
+        id="extensions 'x', variables [1]",
     ),
     pytest.param(
         {"query": _TYPENAME, "extensions": "x"},
@@ -895,6 +924,8 @@ _APOLLO_CHECKS = [
     ),
     pytest.param({"extensions": {"persistedQuery": 5}}, _VERSION, id="pq 5"),
     pytest.param(_persisted("1", query=_TYPENAME), _VERSION, id="pq version '1'"),
+    pytest.param(_persisted(True, query=_TYPENAME), _VERSION, id="pq version true"),
+    pytest.param(_persisted(1.0, query=_TYPENAME), _SERVED, id="pq version 1.0"),
     pytest.param(
         {"extensions": {"persistedQuery": {"version": 1}}},
         _NOT_FOUND,
@@ -979,6 +1010,472 @@ _APOLLO_CHECKS = [
 def test_apollo_server_reads_a_body_in_its_order(gql, payload, answer):
     r = gql.execute_payload(payload)
     assert (r.status, r.payload) == answer
+
+
+_TOO_MANY = "Too many errors processing variables, error limit reached. Execution aborted."
+_WORDS = engine.Engine(
+    """
+    enum Color {
+      RED
+      GREEN
+      BLUE
+      BLACK
+    }
+
+    enum Size {
+      S
+      M
+      L
+      XL
+    }
+
+    input Box {
+      a: Int
+      b: Int
+      c: Int
+      d: Int! = 1
+    }
+
+    input Point {
+      x: Int!
+      y: Int = 0
+      label: String
+      tags: [String!]
+      next: Point
+    }
+
+    type Query {
+      int(v: Int): Int
+      float(v: Float): Float
+      string(v: String): String
+      boolean(v: Boolean): Boolean
+      id(v: ID): ID
+      color(v: Color): Color
+      point(v: Point): Int
+      ints(v: [Int!]): Int
+      nested(v: [[Int]]): Int
+      required(v: Int!): Int
+      pair(a: Int, b: String): Int
+      size(v: Size): Size
+      box(v: Box): Int
+    }
+    """
+)
+_STAGES = {
+    "parse": engine.PARSE_FAILED,
+    "validate": engine.VALIDATION_FAILED,
+    "variables": engine.BAD_USER_INPUT,
+}
+
+
+# A document over `_WORDS`, its variables as the body sent them, and graphql-js 16.14.2's answer
+# under Node: the stage that refused it and each error's message and locations, or "ok" where it
+# coerced every variable.
+_GRAPHQL_JS_WORDS = [
+    pytest.param(
+        "# a\r{ nosuch }",
+        None,
+        "validate",
+        [('Cannot query field "nosuch" on type "Query".', [(2, 3)])],
+        id="a carriage return",
+    ),
+    pytest.param(
+        "# a\r\n{ nosuch }",
+        None,
+        "validate",
+        [('Cannot query field "nosuch" on type "Query".', [(2, 3)])],
+        id="a carriage return and a line feed",
+    ),
+    pytest.param(
+        "# a\x0c{ nosuch }",
+        None,
+        "parse",
+        [("Syntax Error: Unexpected <EOF>.", [(1, 15)])],
+        id="a form feed in a comment",
+    ),
+    pytest.param(
+        "# a\u2028{ nosuch }",
+        None,
+        "parse",
+        [("Syntax Error: Unexpected <EOF>.", [(1, 15)])],
+        id="a line separator in a comment",
+    ),
+    pytest.param(
+        '{ int(v: 1.") }',
+        None,
+        "parse",
+        [("Syntax Error: Invalid number, expected digit but got: '\"'.", [(1, 12)])],
+        id="a quote where a digit was expected",
+    ),
+    pytest.param(
+        "{ int(v: 1.a) }",
+        None,
+        "parse",
+        [('Syntax Error: Invalid number, expected digit but got: "a".', [(1, 12)])],
+        id="a letter where a digit was expected",
+    ),
+    pytest.param(
+        "{",
+        None,
+        "parse",
+        [("Syntax Error: Expected Name, found <EOF>.", [(1, 2)])],
+        id="a document cut short",
+    ),
+    pytest.param(
+        "query($v: Int) # c\nd\n{ int(v: $v) }",
+        '{"v": "x"}',
+        "parse",
+        [('Syntax Error: Expected "{", found Name "d".', [(2, 1)])],
+        id="a comment's line break",
+    ),
+    pytest.param(
+        "query($v: Int! = null) { required(v: $v) }",
+        "{}",
+        "validate",
+        [('Expected value of type "Int!", found null.', [(1, 18)])],
+        id="a null default for a non-null variable",
+    ),
+    pytest.param(
+        '{ int(v: "a\x0bb") }',
+        None,
+        "validate",
+        [('Int cannot represent non-integer value: "a\\u000Bb"', [(1, 10)])],
+        id="a vertical tab in a string",
+    ),
+    pytest.param(
+        "query @include(if: true) { int }",
+        None,
+        "validate",
+        [('Directive "@include" may not be used on QUERY.', [(1, 7)])],
+        id="a directive where it may not be used",
+    ),
+    pytest.param(
+        "query($v: Size) { size(v: $v) }",
+        '{"v": ""}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value ""; Value "" does not exist in "Size" enum. Did you mean the enum value "L", "M", or "S"?',
+                [(1, 7)],
+            )
+        ],
+        id="an empty enum value, three suggestions and more",
+    ),
+    pytest.param(
+        "query($v: Size) { size(v: $v) }",
+        '{"v": false}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value false; Enum "Size" cannot represent non-string value: false.',
+                [(1, 7)],
+            )
+        ],
+        id="false for an enum",
+    ),
+    pytest.param(
+        "query($v: Size) { size(v: $v) }",
+        '{"v": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ... 1 more item]; Enum "Size" cannot represent non-string value: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ... 1 more item].',
+                [(1, 7)],
+            )
+        ],
+        id="eleven items",
+    ),
+    pytest.param(
+        "query($v: Size) { size(v: $v) }",
+        '{"v": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ... 2 more items]; Enum "Size" cannot represent non-string value: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ... 2 more items].',
+                [(1, 7)],
+            )
+        ],
+        id="twelve items",
+    ),
+    pytest.param(
+        "query($v: Size) { size(v: $v) }",
+        '{"v": {"x": 1, "tags": ["a", 1, null]}}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value { x: 1, tags: ["a", 1, null] }; Enum "Size" cannot represent non-string value: { x: 1, tags: ["a", 1, null] }.',
+                [(1, 7)],
+            )
+        ],
+        id="an object for an enum",
+    ),
+    pytest.param(
+        "query($v: Box) { box(v: $v) }",
+        '{"v": [[[1]]]}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value [[[Array]]]; Expected type "Box" to be an object.',
+                [(1, 7)],
+            )
+        ],
+        id="an array three deep for an input object",
+    ),
+    pytest.param(
+        "query($v: Box) { box(v: $v) }",
+        '{"v": {"b": 1, "1": 2, "0": 3, "01": 4, "²": 5, "4294967294": 6, "4294967295": 7, "a b": 8}}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value { 0: 3, 1: 2, 4294967294: 6, b: 1, 01: 4, ²: 5, 4294967295: 7, a b: 8 }; Field "0" is not defined by type "Box". Did you mean "a", "b", "c", or "d"?',
+                [(1, 7)],
+            ),
+            (
+                'Variable "$v" got invalid value { 0: 3, 1: 2, 4294967294: 6, b: 1, 01: 4, ²: 5, 4294967295: 7, a b: 8 }; Field "1" is not defined by type "Box". Did you mean "a", "b", "c", or "d"?',
+                [(1, 7)],
+            ),
+            (
+                'Variable "$v" got invalid value { 0: 3, 1: 2, 4294967294: 6, b: 1, 01: 4, ²: 5, 4294967295: 7, a b: 8 }; Field "4294967294" is not defined by type "Box".',
+                [(1, 7)],
+            ),
+            (
+                'Variable "$v" got invalid value { 0: 3, 1: 2, 4294967294: 6, b: 1, 01: 4, ²: 5, 4294967295: 7, a b: 8 }; Field "01" is not defined by type "Box".',
+                [(1, 7)],
+            ),
+            (
+                'Variable "$v" got invalid value { 0: 3, 1: 2, 4294967294: 6, b: 1, 01: 4, ²: 5, 4294967295: 7, a b: 8 }; Field "²" is not defined by type "Box". Did you mean "a", "b", "c", or "d"?',
+                [(1, 7)],
+            ),
+            (
+                'Variable "$v" got invalid value { 0: 3, 1: 2, 4294967294: 6, b: 1, 01: 4, ²: 5, 4294967295: 7, a b: 8 }; Field "4294967295" is not defined by type "Box".',
+                [(1, 7)],
+            ),
+            (
+                'Variable "$v" got invalid value { 0: 3, 1: 2, 4294967294: 6, b: 1, 01: 4, ²: 5, 4294967295: 7, a b: 8 }; Field "a b" is not defined by type "Box". Did you mean "a" or "b"?',
+                [(1, 7)],
+            ),
+        ],
+        id="the keys an object prints in JavaScript's order",
+    ),
+    pytest.param(
+        "query($v: Box) { box(v: $v) }",
+        '{"v": {"aa": 1, "b": "x"}}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value "x" at "v.b"; Int cannot represent non-integer value: "x"',
+                [(1, 7)],
+            ),
+            (
+                'Variable "$v" got invalid value { aa: 1, b: "x" }; Field "aa" is not defined by type "Box". Did you mean "a"?',
+                [(1, 7)],
+            ),
+        ],
+        id="a field's refusal, then an unknown field",
+    ),
+    pytest.param(
+        "query($v: Float) { float(v: $v) }",
+        '{"v": 1e400}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value Infinity; Float cannot represent non numeric value: Infinity',
+                [(1, 7)],
+            )
+        ],
+        id="Infinity for a Float",
+    ),
+    pytest.param(
+        "query($v: Float) { float(v: $v) }",
+        '{"v": true}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value true; Float cannot represent non numeric value: true',
+                [(1, 7)],
+            )
+        ],
+        id="true for a Float",
+    ),
+    pytest.param(
+        "query($v: String) { string(v: $v) }",
+        '{"v": {"a": {"b": {"c": {}}}}}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value { a: { b: [Object] } }; String cannot represent a non string value: { a: { b: [Object] } }',
+                [(1, 7)],
+            )
+        ],
+        id="an object four deep",
+    ),
+    pytest.param(
+        "query($v: Boolean) { boolean(v: $v) }",
+        '{"v": [[[]]]}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value [[[]]]; Boolean cannot represent a non boolean value: [[[]]]',
+                [(1, 7)],
+            )
+        ],
+        id="an empty array three deep",
+    ),
+    pytest.param(
+        "query($v: ID) { id(v: $v) }",
+        '{"v": {"a": {"b": {}}}}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value { a: { b: {} } }; ID cannot represent value: { a: { b: {} } }',
+                [(1, 7)],
+            )
+        ],
+        id="an empty object three deep",
+    ),
+    pytest.param(
+        "query($v: Point) { point(v: $v) }",
+        '{"v": {}}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value {}; Field "x" of required type "Int!" was not provided.',
+                [(1, 7)],
+            )
+        ],
+        id="a required field not provided",
+    ),
+    pytest.param(
+        "query($v: Point) { point(v: $v) }",
+        '{"v": {"x": 1, "tags": ["a", 1, null]}}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value 1 at "v.tags[1]"; String cannot represent a non string value: 1',
+                [(1, 7)],
+            ),
+            (
+                'Variable "$v" got invalid value null at "v.tags[2]"; Expected non-nullable type "String!" not to be null.',
+                [(1, 7)],
+            ),
+        ],
+        id="a list item refused, and null for a non-null item",
+    ),
+    pytest.param(
+        "query($v: [Int!]) { ints(v: $v) }",
+        '{"v": 1.5}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value 1.5; Int cannot represent non-integer value: 1.5',
+                [(1, 7)],
+            )
+        ],
+        id="1.5 for a list of Int",
+    ),
+    pytest.param(
+        "query($v: Int!) { required(v: $v) }",
+        '{"v": null}',
+        "variables",
+        [('Variable "$v" of non-null type "Int!" must not be null.', [(1, 7)])],
+        id="null for a non-null variable",
+    ),
+    pytest.param(
+        "query($v: Int!) { required(v: $v) }",
+        '{"v": 2147483648}',
+        "variables",
+        [
+            (
+                'Variable "$v" got invalid value 2147483648; Int cannot represent non 32-bit signed integer value: 2147483648',
+                [(1, 7)],
+            )
+        ],
+        id="an Int past 32 bits",
+    ),
+    pytest.param(
+        "query($v: [Int!]) { ints(v: $v) }",
+        json.dumps({"v": ["a"] * 60}),
+        "variables",
+        [
+            (
+                f'Variable "$v" got invalid value "a" at "v[{n}]"; Int cannot represent non-integer value: "a"',
+                [(1, 7)],
+            )
+            for n in range(50)
+        ]
+        + [(_TOO_MANY, [])],
+        id="the fifty-first refusal",
+    ),
+    pytest.param(
+        "query($a: Int!, $b: String) { pair(a: $a, b: $b) }",
+        "{}",
+        "variables",
+        [('Variable "$a" of required type "Int!" was not provided.', [(1, 7)])],
+        id="a non-null variable not provided",
+    ),
+    pytest.param(
+        "query($v: Float) { float(v: $v) }",
+        '{"v": 0}',
+        "ok",
+        [],
+        id="0 for a Float",
+    ),
+    pytest.param(
+        "query($v: Boolean) { boolean(v: $v) }",
+        '{"v": true}',
+        "ok",
+        [],
+        id="true for a Boolean",
+    ),
+    pytest.param(
+        "query($v: ID) { id(v: $v) }",
+        '{"v": 0}',
+        "ok",
+        [],
+        id="0 for an ID",
+    ),
+    pytest.param(
+        "query($v: ID) { id(v: $v) }",
+        '{"v": ""}',
+        "ok",
+        [],
+        id="an empty string for an ID",
+    ),
+    pytest.param(
+        "query($v: Color) { color(v: $v) }",
+        '{"v": "RED"}',
+        "ok",
+        [],
+        id="an enum value",
+    ),
+    pytest.param(
+        "query($v: [Int!]) { ints(v: $v) }",
+        '{"v": null}',
+        "ok",
+        [],
+        id="null for a list",
+    ),
+    pytest.param(
+        "query($v: Int! = 1) { required(v: $v) }",
+        "{}",
+        "ok",
+        [],
+        id="a non-null variable's default",
+    ),
+]
+
+
+@pytest.mark.parametrize("document, variables, stage, errors", _GRAPHQL_JS_WORDS)
+def test_a_refusal_is_in_graphql_js_words(document, variables, stage, errors):
+    r = _WORDS.execute(
+        document, variables=None if variables is None else request_body.parse(variables)
+    )
+    got = [
+        (refusal.message, [(at["line"], at["column"]) for at in refusal.locations])
+        for refusal in r.refusals
+    ]
+    assert got == errors
+    assert {refusal.code for refusal in r.refusals} == ({_STAGES[stage]} if errors else set())
 
 
 # --- resolver binding -----------------------------------------------------------

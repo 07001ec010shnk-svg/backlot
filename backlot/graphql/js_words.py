@@ -1,21 +1,22 @@
 """graphql-js's words for the errors graphql-core makes with its own.
 
 Linear and Fireflies run graphql-js under Apollo Server, and graphql-core is a port of graphql-js
-that writes the same messages with two differences: it quotes a name, a type, a token or a
-character with ``'`` where graphql-js quotes it with ``"``, and it prints a variable's value with
-Python's ``repr`` where graphql-js prints it with its own ``inspect``. Both vendors answered a
+whose messages differ from it: graphql-core quotes a name, a type, a token or a character with
+``'`` where graphql-js quotes it with ``"``, names a directive's location by its value (``query``)
+where graphql-js names it ``QUERY``, prints a variable's value with Python's ``repr`` where
+graphql-js prints it with its own ``inspect``, words a variable's refusals its own way (``to be a
+mapping``), and counts a line at characters graphql-js does not break at. Both vendors answered a
 validation error, a syntax error and a variable's refusal in graphql-js's words on 2026-10-25
 (UTC), quotes and values as graphql-js 16.14.2 writes them: Linear also refused an array sent for
 an input object as graphql-js 16.14.2 does, where 16.9.0 reads the array's indices as field names.
 
-:func:`requote` turns a syntax or validation message graphql-core wrote into graphql-js's, and
-:func:`coerce_variable_values` makes a variable's refusals as graphql-js does, from the value as
-the request sent it, so that no value passes through ``repr``.
+Here are :func:`requote` for a message, :func:`locations` for where it points, and
+:func:`coerce_variable_values` for a variable's refusals, which it makes from the value as the
+request sent it, so that no value passes through ``repr``.
 """
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from typing import Any, Callable
@@ -26,10 +27,7 @@ from graphql import (
     GraphQLInputObjectType,
     GraphQLList,
     GraphQLNonNull,
-    GraphQLScalarType,
     GraphQLSchema,
-    is_input_type,
-    print_ast,
     type_from_ast,
 )
 from graphql.language import DirectiveLocation, VariableDefinitionNode
@@ -42,19 +40,18 @@ _MAX_ARRAY_LENGTH = 10
 _MAX_RECURSIVE_DEPTH = 2
 # graphql-js stops coercing variables at the fiftieth error, as `execute` asks it to.
 _MAX_ERRORS = 50
-LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 def stringify(text: str) -> str:
-    """``text`` as ``JSON.stringify`` writes a string: in double quotes, a lone surrogate as a
-    lower-case ``\\u`` escape."""
-    return LONE_SURROGATE.sub(
-        lambda m: f"\\u{ord(m.group()):04x}", json.dumps(text, ensure_ascii=False)
-    )
+    """``text`` as ``JSON.stringify`` writes a string (:func:`backlot.graphql.body.node_json`)."""
+    return request_body.node_json(text).decode("utf-8")
+
+
+_INDEX = re.compile(r"0|[1-9][0-9]*")
 
 
 def _is_array_index(key: str) -> bool:
-    return key.isascii() and key.isdigit() and str(int(key)) == key and int(key) < 2**32 - 1
+    return _INDEX.fullmatch(key) is not None and int(key) < 2**32 - 1
 
 
 def js_keys(obj: dict) -> list[str]:
@@ -66,15 +63,17 @@ def js_keys(obj: dict) -> list[str]:
 
 def number(value: int | float) -> str:
     """A JSON number as JavaScript's ``String`` prints it."""
-    return repr(request_body.Double(value)) if isinstance(value, float) else str(value)
+    return repr(request_body.Double(value))
 
 
 def inspect(value: Any) -> str:
     """``value``, a value ``JSON.parse`` could have made, as graphql-js's ``inspect`` prints it."""
-    return _format(value, [])
+    return _format(value, 0)
 
 
-def _format(value: Any, seen: list) -> str:
+def _format(value: Any, depth: int) -> str:
+    """``value`` nested ``depth`` arrays or objects deep. graphql-js's ``inspect`` also prints
+    ``[Circular]`` for a value that holds itself, which no value ``JSON.parse`` makes does."""
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -83,15 +82,13 @@ def _format(value: Any, seen: list) -> str:
         return number(value)
     if isinstance(value, str):
         return stringify(value)
-    if any(value is item for item in seen):
-        return "[Circular]"
-    seen = [*seen, value]
+    depth += 1
     if isinstance(value, list):
         if not value:
             return "[]"
-        if len(seen) > _MAX_RECURSIVE_DEPTH:
+        if depth > _MAX_RECURSIVE_DEPTH:
             return "[Array]"
-        items = [_format(item, seen) for item in value[:_MAX_ARRAY_LENGTH]]
+        items = [_format(item, depth) for item in value[:_MAX_ARRAY_LENGTH]]
         remaining = len(value) - _MAX_ARRAY_LENGTH
         if remaining == 1:
             items.append("... 1 more item")
@@ -100,9 +97,9 @@ def _format(value: Any, seen: list) -> str:
         return "[" + ", ".join(items) + "]"
     if not value:
         return "{}"
-    if len(seen) > _MAX_RECURSIVE_DEPTH:
+    if depth > _MAX_RECURSIVE_DEPTH:
         return "[Object]"
-    return "{ " + ", ".join(f"{key}: {_format(value[key], seen)}" for key in js_keys(value)) + " }"
+    return "{ " + ", ".join(f"{key}: {_format(value[key], depth)}" for key in js_keys(value)) + " }"
 
 
 # graphql-js breaks a line at `\r\n`, `\n` or `\r` and nowhere else.
@@ -114,7 +111,7 @@ def locations(error: GraphQLError) -> tuple:
     lines as graphql-js's ``getLocation`` does, where graphql-core's count misses a line that
     starts at the position and adds one at each character Python's ``splitlines`` reads as a
     break."""
-    if error.source is None or not error.positions:
+    if not error.positions:
         return ()
     body = error.source.body
     out = []
@@ -150,20 +147,20 @@ _SYNTAX_TAIL = re.compile(
     r"Invalid (?:Unicode|character) escape sequence: )'(.*)'\.$",
     re.S,
 )
-# A character graphql-core quotes, at the end: graphql-js quotes it the same way but for `"`,
-# which both quote as '"'.
+# A character graphql-core quotes with `'` at the end, where graphql-js uses `"`; both write the
+# character `"` itself as '"'.
 _SYNTAX_CHAR = re.compile(r": '(.)'\.$", re.S)
 _PUNCTUATOR = re.compile(r"'(\.\.\.|[!$&(){}\[\]:=@|])'")
 # A keyword the parser expected, such as `on`.
 _KEYWORD = re.compile(r"Expected '([_A-Za-z][_0-9A-Za-z]*)'")
-# graphql-core names a directive's location by its value, `query` or `fragment definition`, where
-# graphql-js names it by its name, `QUERY` or `FRAGMENT_DEFINITION`.
+# The location a directive may not be used on, `fragment definition` here and `FRAGMENT_DEFINITION`
+# in graphql-js.
 _DIRECTIVE_PLACE = re.compile(r"(may not be used on )(.+)(\.)$")
 _PLACE_NAMES = {place.value: place.name for place in DirectiveLocation}
 # What a validation or execution message quotes: a name, `$name`, `@name`, `Type.field`, a type
 # such as `[Int!]!`, or the `name { ... }` a leaf-selection error suggests.
 _QUOTED = re.compile(
-    r"'([$@]?[_A-Za-z][_0-9A-Za-z]*(?:\.[_A-Za-z][_0-9A-Za-z]*)?"
+    r"'([$@]?[_A-Za-z][_0-9A-Za-z]*(?:[.][_A-Za-z][_0-9A-Za-z]*)?"
     r"|[\[\]!_0-9A-Za-z]+"
     r"|[_A-Za-z][_0-9A-Za-z]* \{ \.\.\. \})'"
 )
@@ -172,8 +169,7 @@ _LITERAL = re.compile(r'"""(?:[^"\\]|\\.|"(?!""))*"""|"(?:[^"\\\n]|\\.)*"', re.S
 
 
 def requote(message: str) -> str:
-    """A syntax, validation or execution message graphql-core wrote, quoted as graphql-js quotes
-    it."""
+    """A syntax, validation or execution message graphql-core wrote, in graphql-js's words."""
     if message.startswith("Syntax Error: "):
         m = _SYNTAX_TAIL.search(message)
         if m:
@@ -186,7 +182,7 @@ def requote(message: str) -> str:
                 )
         return _KEYWORD.sub(r'Expected "\1"', _PUNCTUATOR.sub(r'"\1"', message))
     place = _DIRECTIVE_PLACE.search(message)
-    if place and place.group(2) in _PLACE_NAMES:
+    if place:
         message = message[: place.start(2)] + _PLACE_NAMES[place.group(2)] + place.group(3)
     parts = []
     last = 0
@@ -216,42 +212,31 @@ def requote(message: str) -> str:
 # --- a variable's refusals, as graphql-js makes them -----------------------------------------
 
 
-def _type_name(type_: Any) -> str:
-    return str(type_)
+_BUILT_IN = frozenset({"Int", "Float", "String", "Boolean", "ID"})
 
 
-def _builtin(type_: GraphQLScalarType, value: Any) -> Any:
-    """graphql-js's ``parseValue`` for a built-in scalar, or ``Undefined`` for any other scalar."""
+def _built_in_refusal(name: str, value: Any) -> str | None:
+    """The message graphql-js's ``parseValue`` for the built-in scalar ``name`` refuses ``value``
+    with, or ``None`` where it takes it."""
     is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
-    integral = is_number and (
-        isinstance(value, int) or (math.isfinite(value) and value.is_integer())
-    )
-    name = type_.name
+    integral = is_number and float(value).is_integer()
     if name == "Int":
         if not integral:
-            raise GraphQLError(f"Int cannot represent non-integer value: {inspect(value)}")
+            return f"Int cannot represent non-integer value: {inspect(value)}"
         if not -(2**31) <= value <= 2**31 - 1:
-            raise GraphQLError(
-                f"Int cannot represent non 32-bit signed integer value: {number(value)}"
-            )
-        return value
-    if name == "Float":
+            return f"Int cannot represent non 32-bit signed integer value: {number(value)}"
+    elif name == "Float":
         if not is_number or not math.isfinite(value):
-            raise GraphQLError(f"Float cannot represent non numeric value: {inspect(value)}")
-        return value
-    if name == "String":
+            return f"Float cannot represent non numeric value: {inspect(value)}"
+    elif name == "String":
         if not isinstance(value, str):
-            raise GraphQLError(f"String cannot represent a non string value: {inspect(value)}")
-        return value
-    if name == "Boolean":
+            return f"String cannot represent a non string value: {inspect(value)}"
+    elif name == "Boolean":
         if not isinstance(value, bool):
-            raise GraphQLError(f"Boolean cannot represent a non boolean value: {inspect(value)}")
-        return value
-    if name == "ID":
-        if isinstance(value, str) or integral:
-            return value
-        raise GraphQLError(f"ID cannot represent value: {inspect(value)}")
-    return Undefined
+            return f"Boolean cannot represent a non boolean value: {inspect(value)}"
+    elif name == "ID" and not (isinstance(value, str) or integral):
+        return f"ID cannot represent value: {inspect(value)}"
+    return None
 
 
 def _enum(type_: GraphQLEnumType, value: Any) -> Any:
@@ -277,14 +262,14 @@ def coerce_input_value(value: Any, type_: Any, on_error: OnError, path: tuple = 
     """Report each refusal graphql-js's ``coerceInputValue`` makes of ``value`` as a ``type_``, to
     ``on_error(path, invalid_value, error)``, in the order graphql-js makes them."""
     if isinstance(type_, GraphQLNonNull):
-        if value is not None:
+        if value is None:
+            on_error(
+                list(path),
+                value,
+                GraphQLError(f'Expected non-nullable type "{type_}" not to be null.'),
+            )
+        else:
             coerce_input_value(value, type_.of_type, on_error, path)
-            return
-        on_error(
-            list(path),
-            value,
-            GraphQLError(f'Expected non-nullable type "{_type_name(type_)}" not to be null.'),
-        )
         return
     if value is None:
         return
@@ -311,8 +296,7 @@ def coerce_input_value(value: Any, type_: Any, on_error: OnError, path: tuple = 
                         list(path),
                         value,
                         GraphQLError(
-                            f'Field "{name}" of required type "{_type_name(field.type)}" '
-                            "was not provided."
+                            f'Field "{name}" of required type "{field.type}" was not provided.'
                         ),
                     )
                 continue
@@ -334,12 +318,15 @@ def coerce_input_value(value: Any, type_: Any, on_error: OnError, path: tuple = 
         except GraphQLError as error:
             on_error(list(path), value, error)
         return
+    if type_.name in _BUILT_IN:
+        message = _built_in_refusal(type_.name, value)
+        if message is not None:
+            on_error(list(path), value, GraphQLError(message))
+        return
     try:
-        if _builtin(type_, value) is Undefined:
-            type_.parse_value(value)
-    except GraphQLError as error:
-        on_error(list(path), value, error)
-    except Exception as error:  # a scalar's own refusal, as graphql-js wraps a thrown Error
+        type_.parse_value(value)
+    # A custom scalar's refusal, a ValueError from Linear's, as graphql-js wraps a thrown Error.
+    except Exception as error:
         on_error(
             list(path),
             value,
@@ -358,10 +345,10 @@ class _TooMany(Exception):
 def coerce_variable_values(
     schema: GraphQLSchema, definitions: list[VariableDefinitionNode], inputs: Any
 ) -> list[GraphQLError]:
-    """The refusals graphql-js's ``getVariableValues`` makes of the variables ``inputs`` for an
-    operation declaring ``definitions``, as ``execute`` asks it: at most fifty, then one saying
-    so. An empty list is a request whose variables graphql-js coerces."""
-    inputs = inputs if isinstance(inputs, dict) else {}
+    """The refusals graphql-js's ``getVariableValues`` makes of the variables ``inputs`` for a
+    validated operation declaring ``definitions``, as ``execute`` asks it: at most fifty, then one
+    saying so. An empty list is a request whose variables graphql-js coerces."""
+    inputs = inputs or {}
     errors: list[GraphQLError] = []
 
     def report(error: GraphQLError) -> None:
@@ -373,21 +360,11 @@ def coerce_variable_values(
         for definition in definitions:
             name = definition.variable.name.value
             type_ = type_from_ast(schema, definition.type)
-            if type_ is None or not is_input_type(type_):
-                report(
-                    GraphQLError(
-                        f'Variable "${name}" expected value of type '
-                        f'"{print_ast(definition.type)}" which cannot be used as an input type.',
-                        definition.type,
-                    )
-                )
-                continue
             if name not in inputs:
                 if definition.default_value is None and isinstance(type_, GraphQLNonNull):
                     report(
                         GraphQLError(
-                            f'Variable "${name}" of required type "{_type_name(type_)}" '
-                            "was not provided.",
+                            f'Variable "${name}" of required type "{type_}" was not provided.',
                             definition,
                         )
                     )
@@ -396,18 +373,17 @@ def coerce_variable_values(
             if value is None and isinstance(type_, GraphQLNonNull):
                 report(
                     GraphQLError(
-                        f'Variable "${name}" of non-null type "{_type_name(type_)}" '
-                        "must not be null.",
+                        f'Variable "${name}" of non-null type "{type_}" must not be null.',
                         definition,
                     )
                 )
                 continue
 
-            def on_error(path: list, invalid: Any, error: GraphQLError, name=name, node=definition):
+            def on_error(path: list, invalid: Any, error: GraphQLError) -> None:
                 prefix = f'Variable "${name}" got invalid value {inspect(invalid)}'
                 if path:
                     prefix += f' at "{name}{_print_path(path)}"'
-                report(GraphQLError(f"{prefix}; {error.message}", node))
+                report(GraphQLError(f"{prefix}; {error.message}", definition))
 
             coerce_input_value(value, type_, on_error)
     except _TooMany:

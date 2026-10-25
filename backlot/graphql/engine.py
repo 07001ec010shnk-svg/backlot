@@ -92,8 +92,8 @@ def _ids_as_graphql_js_reads_them(value: Any, type_: Any) -> Any:
 Scalar = Mapping[str, Callable[..., Any]]
 
 
-#: Apollo Server's codes for the refusals it and graphql-js make, as both vendors carried them on
-#: 2026-10-25 (UTC).
+#: Apollo Server's codes for the refusals it and graphql-js make, as api.fireflies.ai carried each
+#: on 2026-10-25 (UTC); api.linear.app carried each but ``OPERATION_RESOLUTION_FAILURE``.
 BAD_REQUEST = "BAD_REQUEST"
 PARSE_FAILED = "GRAPHQL_PARSE_FAILED"
 VALIDATION_FAILED = "GRAPHQL_VALIDATION_FAILED"
@@ -120,9 +120,9 @@ class Result:
 
     ``refusals`` holds the request errors, made before execution, and ``payload`` then carries no
     ``data``; a router writes them in its vendor's envelope. ``assigned`` holds the index in
-    ``payload["errors"]`` of each error graphql-core made as the operation ran, which carries the
-    ``extensions.code`` Apollo Server gives an error with none of its own. ``raised`` marks a field
-    error that is Backlot's own failure rather than a refusal; :func:`_raised` tells the two apart.
+    ``payload["errors"]`` of each error graphql-core made as the operation ran (:meth:`Engine.run`).
+    ``raised`` marks a field error that is Backlot's own failure rather than a refusal;
+    :func:`_raised` tells the two apart.
     """
 
     payload: dict
@@ -142,9 +142,8 @@ class Result:
 
 @dataclass(frozen=True)
 class Operation:
-    """A request read up to the choice of its operation (:meth:`Engine.resolve`): the parsed
-    ``document``, the ``operation`` chosen from it, and the ``variables`` and operation ``name``
-    sent with it."""
+    """What :meth:`Engine.resolve` makes of a request it goes on with: the parsed ``document``, the
+    ``operation`` chosen from it, and the ``variables`` and operation ``name`` sent with it."""
 
     document: DocumentNode
     operation: OperationDefinitionNode
@@ -185,7 +184,7 @@ def _raised(error: GraphQLError) -> bool:
     )
 
 
-def _refused(*refusals: Refusal) -> Result:
+def refused(*refusals: Refusal) -> Result:
     """The request errors ``refusals``, in Apollo Server's own envelope: ``message``, the
     ``locations`` where there are any, and ``extensions.code``."""
     errors = []
@@ -199,16 +198,13 @@ def _refused(*refusals: Refusal) -> Result:
 
 
 def _refusal(message: str, code: str = BAD_REQUEST, status: int = 400) -> Result:
-    return _refused(Refusal(message, code, status=status))
+    return refused(Refusal(message, code, status=status))
 
 
 def _js_truthy(value: Any) -> bool:
-    """Whether JavaScript reads the JSON value ``value`` as true."""
-    if value is None or value is False or value == "":
-        return False
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return value == value and value != 0
-    return True
+    """Whether JavaScript reads the JSON value ``value`` as true: all but ``null``, ``false``,
+    ``""`` and zero."""
+    return value not in (None, False, "", 0)
 
 
 _NOT_A_STRING = "GraphQL queries must be strings."
@@ -229,11 +225,11 @@ RECURSIVELY_ENCODED = (
 
 def body_refusal(payload: Any) -> Result | None:
     """Apollo Server's refusal of a POST body ``payload`` read as JSON, or ``None`` for a body it
-    goes on with. The checks run in this order, each first where two apply, as both vendors
-    answered on 2026-10-25 (UTC): an array, an empty object or a value that is not an object, a
-    truthy `query` that is not a string, `variables` and then `extensions` as a string, then
-    `extensions`, `variables` and `operationName` of the wrong type. A ``null`` member is one not
-    sent."""
+    goes on with. The checks run in this order, each first where two apply: an array, an empty
+    object or a value that is not an object, a truthy `query` that is not a string, `variables` and
+    then `extensions` as a string, then `extensions`, `variables` and `operationName` of the wrong
+    type. Both vendors kept that order with two wrong at once on 2026-10-25 (UTC). A ``null``
+    member is one not sent."""
     if isinstance(payload, list):
         return _refusal("Operation batching disabled.")
     if not isinstance(payload, dict) or not payload:
@@ -271,15 +267,17 @@ def persisted_query_refusal(payload: dict) -> Result | None:
     if not _js_truthy(persisted):
         return None
     version = persisted.get("version") if isinstance(persisted, dict) else None
-    if isinstance(version, bool) or not isinstance(version, (int, float)) or version != 1:
+    if isinstance(version, bool) or version != 1:
         return _refusal(PERSISTED_QUERY_VERSION, INTERNAL_SERVER_ERROR)
     query = payload.get("query")
     if query is None:
         return _refusal("PersistedQueryNotFound", PERSISTED_QUERY_NOT_FOUND, status=200)
     # Both vendors hashed a query holding U+D800 as the same query with U+FFFD in its place on
     # 2026-10-25 (UTC), the UTF-8 Node writes for a lone surrogate.
-    text = js_words.LONE_SURROGATE.sub("\ufffd", query) if isinstance(query, str) else None
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None
+    digest = None
+    if isinstance(query, str):
+        units = query.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+        digest = hashlib.sha256(units.encode("utf-8")).hexdigest()
     if digest is None or persisted.get("sha256Hash") != digest:
         return _refusal(PERSISTED_QUERY_MISMATCH, INTERNAL_SERVER_ERROR)
     return None
@@ -300,8 +298,11 @@ def from_sdl(module_file: str, name: str, resolvers, scalars=None, roots=()) -> 
 
 def _with_roots(schema: GraphQLSchema, roots: tuple[str, ...]) -> GraphQLSchema:
     """``schema`` with each of ``roots``, ``Mutation`` or ``Subscription``, as a root type that
-    has no field. graphql-core refuses a schema with an object type of no field, so this one is
-    marked as checked; it is only validated against and run for ``__typename``."""
+    has no field: the root types a vendor's schema has and its SDL leaves out because Backlot
+    serves none of their fields. A document validated against it is refused a field of one as a
+    field the type does not have, and ``__typename`` on one is answered with the type's name.
+    graphql-core refuses a schema with an object type of no field, so this one is marked as
+    checked; it is only validated against and run for ``__typename``."""
     shadow = GraphQLSchema(
         query=schema.query_type,
         mutation=GraphQLObjectType("Mutation", {}) if "Mutation" in roots else None,
@@ -321,10 +322,7 @@ class Engine:
     is a mapping — so a resolver can simply return dicts and let the selection set decide
     what is emitted.
 
-    ``roots`` names the root types, ``Mutation`` or ``Subscription``, the vendor's schema has and
-    the SDL leaves out because Backlot serves none of their fields. A document is validated as if
-    each were there with no field, so a field of one is refused as one the type does not have and
-    ``__typename`` is answered with the type's name.
+    ``roots`` names the root types :func:`_with_roots` adds.
     """
 
     def __init__(
@@ -338,7 +336,7 @@ class Engine:
         # validate() would do this on the first request otherwise, surfacing a vendor's broken
         # SDL as a 500 rather than as an import-time failure.
         assert_valid_schema(self.schema)
-        self._checked = _with_roots(self.schema, roots) if roots else self.schema
+        self._checked = _with_roots(self.schema, roots)
         for scalar_name, coercion in (scalars or {}).items():
             scalar = self.schema.type_map.get(scalar_name)
             # Same rule as an unknown resolver target below: a misspelt scalar would leave the SDL's
@@ -374,20 +372,20 @@ class Engine:
         """``document`` read as graphql-js reads it under Apollo Server, up to the choice of the
         operation to run: parse, then ``on_document``, a vendor's look at the parsed document
         before it is validated, then validation and the choice of operation, each refused with
-        Apollo Server's code. :meth:`run` takes the :class:`Operation` it returns."""
+        Apollo Server's code; :meth:`run` takes the operation it chose."""
         try:
             doc = parse(document)
         except GraphQLSyntaxError as error:
-            return _refused(
+            return refused(
                 Refusal(js_words.requote(error.message), PARSE_FAILED, js_words.locations(error))
             )
         if on_document is not None:
-            refused = on_document(doc)
-            if refused is not None:
-                return refused
+            answer = on_document(doc)
+            if answer is not None:
+                return answer
         errors = validate(self._checked, doc)
         if errors:
-            return _refused(
+            return refused(
                 *(
                     Refusal(js_words.requote(e.message), VALIDATION_FAILED, js_words.locations(e))
                     for e in errors
@@ -413,11 +411,11 @@ class Engine:
         read with :mod:`backlot.graphql.body`, up to the choice of operation: :func:`body_refusal`,
         then :func:`persisted_query_refusal`, then Apollo Server's refusal of a body with no query,
         then :meth:`resolve`."""
-        refused = body_refusal(payload)
-        if refused is None:
-            refused = persisted_query_refusal(payload)
-        if refused is not None:
-            return refused
+        answer = body_refusal(payload)
+        if answer is None:
+            answer = persisted_query_refusal(payload)
+        if answer is not None:
+            return answer
         query = payload.get("query")
         if not _js_truthy(query):
             return _refusal(NO_QUERY)
@@ -436,7 +434,7 @@ class Engine:
             self.schema, list(operation.operation.variable_definitions), variables
         )
         if coercion:
-            return _refused(
+            return refused(
                 *(Refusal(e.message, BAD_USER_INPUT, js_words.locations(e)) for e in coercion)
             )
         if variables:
@@ -489,12 +487,9 @@ class Engine:
         variables: Any = None,
         operation_name: str | None = None,
         context: Any = None,
-        on_document: Callable[[DocumentNode], Result | None] | None = None,
     ) -> Result:
         """:meth:`resolve`, then :meth:`run` the operation it chose."""
-        resolved = self.resolve(
-            document, variables=variables, operation_name=operation_name, on_document=on_document
-        )
+        resolved = self.resolve(document, variables=variables, operation_name=operation_name)
         return resolved if isinstance(resolved, Result) else self.run(resolved, context=context)
 
     def execute_payload(

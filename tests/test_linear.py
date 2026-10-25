@@ -24,6 +24,7 @@ from backlot.fidelity.graphql_diff import backlot_schema
 from backlot.graphql import linear_filters, mcp_tools
 from tests._helpers import (
     SWEPT_BYTES,
+    WithTheKey,
     build_corpus,
     client_for,
     complete,
@@ -713,18 +714,8 @@ def test_linear_unauthenticated_is_401(client):
 # Linear refused it with for the key, no credential and `nope` alike, at the status their `code` or
 # `extensions.http.status` names (`_status`), or None where Linear served the query with the key and
 # answered 401 without one, as `backlot.graphql.body` and `backlot.graphql.v8_json` read them. A
-# `_WithTheKey` row is answered past the credential. Apollo Server's envelopes are as api.linear.app
-# answered them on 2026-10-25 (UTC), less the newline it ends each with.
-class _WithTheKey(bytes):
-    """Linear's answer with the key, at ``status``, to a document it refuses or runs once the
-    credential is read: without one, the 401."""
-
-    def __new__(cls, answer: bytes, status: int = 400):
-        self = super().__new__(cls, answer)
-        self.status = status
-        return self
-
-
+# `WithTheKey` row draws the 401 without the key. Apollo Server's envelopes are api.linear.app's,
+# but for the newline that ends each there.
 def _apollo(message: bytes) -> bytes:
     """Apollo Server's refusal of a body as Linear writes it around ``message``, already
     JSON-escaped."""
@@ -1529,6 +1520,13 @@ _LINEAR_BODIES = [
         id="a persisted query's hash that does not match",
     ),
     pytest.param(
+        b'{"query":"{ __typename }","extensions":{"persistedQuery":{"version":2,"sha256Hash":"'
+        + b"0" * 64
+        + b'"}}}',
+        b'{"errors":[{"message":"Internal server error","extensions":{"http":{"status":400,"headers":{}},"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}]}',
+        id="a persisted query's version 2",
+    ),
+    pytest.param(
         b'{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"' + b"1" * 64 + b'"}}}',
         b'{"errors":[{"message":"PersistedQueryNotFound","extensions":{"http":{"status":200,'
         b'"headers":{}},"code":"PERSISTED_QUERY_NOT_FOUND","type":"graphql error",'
@@ -1565,7 +1563,7 @@ _LINEAR_BODIES = [
     ),
     pytest.param(
         b'{"query":"query($b: Boolean!) { __typename @include(if: $b) }"}',
-        _WithTheKey(
+        WithTheKey(
             b'{"errors":[{"message":"Variable \\"$b\\" of required type \\"Boolean!\\" was not '
             b'provided.","locations":[{"line":1,"column":7}],"extensions":{"code":"BAD_USER_INPUT",'
             b'"type":"graphql error","userError":true}}]}'
@@ -1609,7 +1607,7 @@ _LINEAR_BODIES = [
     ),
     pytest.param(
         b'{"query":"query($b: Boolean!) { __typename @include(if: $b) }","variables":"{\\"b\\":5}"}',
-        _WithTheKey(
+        WithTheKey(
             b'{"errors":[{"message":"Variable \\"$b\\" got invalid value 5; Boolean cannot represent a non boolean value: 5","locations":[{"line":1,"column":7}],"extensions":{"code":"BAD_USER_INPUT","type":"graphql error","userError":true}}]}'
         ),
         id="variables of a string its operation refuses",
@@ -1621,7 +1619,7 @@ _LINEAR_BODIES = [
     ),
     pytest.param(
         b'{"query":"mutation { __typename }"}',
-        _WithTheKey(b'{"data":{"__typename":"Mutation"}}', 200),
+        WithTheKey(b'{"data":{"__typename":"Mutation"}}', 200),
         id="a mutation of __typename",
     ),
     pytest.param(
@@ -1631,7 +1629,7 @@ _LINEAR_BODIES = [
     ),
     pytest.param(
         b'{"query":"query($x: String = \\"a\\") { issue(id: $x) { id } }","variables":{"x":null}}',
-        _WithTheKey(
+        WithTheKey(
             b'{"errors":[{"message":"Internal server error","path":["issue"],"locations":[{"line":1,"column":37}],"extensions":{"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}],"data":null}',
             200,
         ),
@@ -1639,11 +1637,43 @@ _LINEAR_BODIES = [
     ),
     pytest.param(
         b'{"query":"query($v: Boolean = true) { __typename @include(if: $v) }","variables":{"v":null}}',
-        _WithTheKey(
+        WithTheKey(
             b'{"errors":[{"message":"Internal server error","locations":[{"line":1,"column":53}],"extensions":{"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}],"data":null}',
             200,
         ),
         id="null for a directive's argument at the root",
+    ),
+    pytest.param(
+        b'{"query":"query($x: String = \\"a\\") { team(id: $x) { id } }","variables":{"x":null}}',
+        WithTheKey(
+            b'{"errors":[{"message":"Internal server error","path":["team"],"locations":[{"line":1,"column":36}],"extensions":{"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}],"data":null}',
+            200,
+        ),
+        id="null for team's non-null id",
+    ),
+    pytest.param(
+        b'{"query":"query($v: ID = \\"a\\") { issues(filter: {id: {in: [$v]}}) { nodes { id } } }","variables":{"v":null}}',
+        WithTheKey(
+            b'{"errors":[{"message":"Internal server error","path":["issues"],"locations":[{"line":1,"column":38}],"extensions":{"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}],"data":null}',
+            200,
+        ),
+        id="null inside a filter's list",
+    ),
+    pytest.param(
+        b'{"query":"query($v: Boolean = true) { viewer { id @include(if: $v) } }","variables":{"v":null}}',
+        WithTheKey(
+            b'{"errors":[{"message":"Internal server error","path":["viewer"],"locations":[{"line":1,"column":54}],"extensions":{"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}],"data":null}',
+            200,
+        ),
+        id="null for a directive one level down",
+    ),
+    pytest.param(
+        b'{"query":"query($x: String = \\"a\\") # a\xe2\x80\xa8b\\n{ issue(id: $x) { id } }","variables":{"x":null}}',
+        WithTheKey(
+            b'{"errors":[{"message":"Internal server error","path":["issue"],"locations":[{"line":2,"column":13}],"extensions":{"code":"INTERNAL_SERVER_ERROR","type":"internal error","userError":false}}],"data":null}',
+            200,
+        ),
+        id="null for a non-null argument after U+2028 in a comment",
     ),
     pytest.param(
         b'{"query":"{ ...F }"}',
@@ -2015,11 +2045,11 @@ def test_linear_orders_the_body_and_the_credential(
     r = sent_as(client, "POST", "/linear/graphql", headers, content=body)
     if credential.startswith("Bearer"):
         assert (r.status_code, r.content) == (400, _API_KEY_AS_BEARER)
-    elif credential != "key" and (answer is None or isinstance(answer, _WithTheKey)):
+    elif credential != "key" and (answer is None or isinstance(answer, WithTheKey)):
         assert r.status_code == 401
     elif answer is None:
         assert (r.status_code, r.json()) == (200, {"data": {"__typename": "Query"}})
-    elif isinstance(answer, _WithTheKey):
+    elif isinstance(answer, WithTheKey):
         assert (r.status_code, r.content) == (answer.status, answer)
     else:
         assert (r.status_code, r.content) == (_status(answer), answer)

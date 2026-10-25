@@ -709,8 +709,8 @@ RESOLVERS = {
 }
 
 
-# The root type api.fireflies.ai's introspection names beside `Query` (2026-10-25, UTC), none of
-# whose fields Backlot serves; it names no subscription type.
+# Fireflies' one other root type, which its introspection named beside `Query` with no
+# subscription type when measured on 2026-10-25 (UTC). Backlot serves no mutation.
 ROOTS = ("Mutation",)
 
 

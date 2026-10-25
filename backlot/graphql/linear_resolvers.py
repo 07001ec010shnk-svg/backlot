@@ -2015,8 +2015,8 @@ RESOLVERS = {
 RESOLVERS["IssueSearchResult"] = RESOLVERS["Issue"]
 
 
-# The root types api.linear.app's introspection names beside `Query` (2026-10-25, UTC), none of
-# whose fields Backlot serves.
+# Linear's other root types: its introspection named a mutation and a subscription type on
+# 2026-10-25 (UTC), and Backlot serves no field of either.
 ROOTS = ("Mutation", "Subscription")
 
 

@@ -288,6 +288,16 @@ def gql(client, path: str, query: str, token: str | None = None, **variables):
 SWEPT_BYTES = (0x09, *range(0x20, 0x7F), *range(0x80, 0x100))
 
 
+class WithTheKey(bytes):
+    """A GraphQL vendor's answer with the key, at ``status``, to a body it answers once it has read
+    the credential; without the key the body draws the vendor's refusal of the credential."""
+
+    def __new__(cls, answer: bytes, status: int = 400):
+        self = super().__new__(cls, answer)
+        self.status = status
+        return self
+
+
 def sent_as(client, method: str, path: str, headers, content=None):
     """``method`` on ``path`` with each header's latin-1 bytes as sent, ``headers`` a mapping or a
     sequence of pairs, which can name a header twice. The TestClient re-encodes a header's bytes
