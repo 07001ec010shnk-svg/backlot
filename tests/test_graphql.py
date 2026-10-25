@@ -240,7 +240,7 @@ def _crashed(_root, _info):
             False,
             [1],
         ),
-        # graphql-core refusing an operation of a type the schema does not have
+        # an operation on a root type the test schema has none of
         ("mutation { __typename }", None, False, [0]),
         ("subscription { __typename }", None, False, [0]),
     ],
@@ -1155,6 +1155,13 @@ _GRAPHQL_JS_WORDS = [
         "validate",
         [('Directive "@include" may not be used on QUERY.', [(1, 7)])],
         id="a directive where it may not be used",
+    ),
+    pytest.param(
+        "{ int(v: \"'a'\") }",
+        None,
+        "validate",
+        [("Int cannot represent non-integer value: \"'a'\"", [(1, 10)])],
+        id="a string literal holding quoted text",
     ),
     pytest.param(
         "query($v: Size) { size(v: $v) }",

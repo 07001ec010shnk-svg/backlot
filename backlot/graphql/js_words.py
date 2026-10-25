@@ -184,29 +184,21 @@ def requote(message: str) -> str:
     place = _DIRECTIVE_PLACE.search(message)
     if place:
         message = message[: place.start(2)] + _PLACE_NAMES[place.group(2)] + place.group(3)
-    parts = []
-    last = 0
-    tail = ""
+    # The text between the string literals in ``message``, each ``(start, end)``.
+    gaps, last = [], 0
     for literal in _LITERAL.finditer(message):
-        parts.append(message[last : literal.start()])
-        parts.append(literal)
+        gaps.append((last, literal.start()))
         last = literal.end()
-    parts.append(message[last:])
-    if message.startswith("Expected value of type '"):
-        # A custom scalar's own refusal of a literal follows the `; ` graphql-js wraps it in, in
-        # the scalar's words: Linear's date scalars quote with `'` there (`kind 'IntValue'`).
-        for i, part in enumerate(parts):
-            if isinstance(part, str) and "; " in part:
-                head, rest = part.split("; ", 1)
-                parts[i] = head + "; "
-                tail = rest + "".join(
-                    p if isinstance(p, str) else p.group() for p in parts[i + 1 :]
-                )
-                parts = parts[: i + 1]
-                break
-    return (
-        "".join(_QUOTED.sub(r'"\1"', p) if isinstance(p, str) else p.group() for p in parts) + tail
-    )
+    gaps.append((last, len(message)))
+    # A custom scalar's refusal of a literal follows the first `; ` outside a literal, the one
+    # message graphql-core writes with a `; `, in the scalar's own words: Linear's date scalars
+    # quote with `'` there (`kind 'IntValue'`).
+    cut = next((message.index("; ", a, b) for a, b in gaps if "; " in message[a:b]), len(message))
+    head, out, last = message[:cut], [], 0
+    for literal in _LITERAL.finditer(head):
+        out.append(_QUOTED.sub(r'"\1"', head[last : literal.start()]) + literal.group())
+        last = literal.end()
+    return "".join(out) + _QUOTED.sub(r'"\1"', head[last:]) + message[cut:]
 
 
 # --- a variable's refusals, as graphql-js makes them -----------------------------------------

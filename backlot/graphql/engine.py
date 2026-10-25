@@ -174,14 +174,13 @@ def _raised(error: GraphQLError) -> bool:
     runs the field, such as a null variable, declared with a default, where the field or a directive
     on it takes a non-null argument, and its refusal of an operation of a type the schema does not
     have, such as a subscription to Fireflies. graphql-core gives the first the argument's value as
-    its node and the second the operation."""
+    its node, which the field error keeps, and the second the operation."""
     original = error.original_error
     if getattr(error, "refusal", False) or getattr(original, "refusal", False):
         return False
-    made = original if isinstance(original, GraphQLError) else error
     return not (
-        made.nodes
-        and all(isinstance(node, (ValueNode, OperationDefinitionNode)) for node in made.nodes)
+        error.nodes
+        and all(isinstance(node, (ValueNode, OperationDefinitionNode)) for node in error.nodes)
     )
 
 
