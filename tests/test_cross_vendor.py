@@ -339,10 +339,11 @@ def test_a_graphql_vendor_quotes_a_number_as_javascript_prints_it(
 
 
 # A request to Linear or Fireflies with `Authorization` sent more than once, `{key}` standing for
-# the vendor's own spelling of the admin token, each answered with the 400 page
-# `backlot.main.refuse_a_repeated_authorization_on_linear_and_fireflies` records. The last three
-# rows are the control: one header reaches the vendor, and a path that only starts with the
-# vendor's name is not the vendor's.
+# the vendor's own spelling of the admin token, or with a path that breaks an escape, each answered
+# with the 400 page `backlot.main.refuse_a_repeated_authorization_on_linear_and_fireflies` and
+# `refuse_a_broken_escape_on_linear_and_fireflies` record. The last four rows are the control: one
+# header reaches the vendor, a path that only starts with the vendor's name is not the vendor's,
+# and a broken escape in the query string is not one in the path.
 _TYPENAME = b'{"query":"{ __typename }"}'
 _CLOUDFLARE = 400
 _REPEATED = [
@@ -359,14 +360,23 @@ _REPEATED = [
     pytest.param("HEAD", "/graphql", b"", ("{key}", "nope"), _CLOUDFLARE, id="HEAD"),
     pytest.param("POST", "/nosuch", _TYPENAME, ("{key}", "nope"), _CLOUDFLARE, id="another path"),
     pytest.param("POST", "", _TYPENAME, ("{key}", "nope"), _CLOUDFLARE, id="the root"),
+    pytest.param("POST", "/a%2", _TYPENAME, ("{key}",), _CLOUDFLARE, id="%2 at the end"),
+    pytest.param("POST", "/graphql%zz", _TYPENAME, (), _CLOUDFLARE, id="%zz"),
+    pytest.param("POST", "/nosucha%b", b"{}", (), _CLOUDFLARE, id="% before b"),
+    *(
+        pytest.param(m, p, b"", (), _CLOUDFLARE, id=f"{m} {p}")
+        for m in ("TRACE", "CONNECT", "PURGE")
+        for p in ("/a%zz", "/a%00b")
+    ),
     pytest.param("POST", "/graphql", _TYPENAME, ("{key}",), 200, id="one key"),
     pytest.param("POST", "x/graphql", _TYPENAME, ("{key}", "nope"), 404, id="a longer name"),
+    pytest.param("POST", "/graphql?a=%zz", _TYPENAME, ("{key}",), 200, id="%zz in the query"),
 ]
 
 
 @pytest.mark.parametrize("vendor", ["linear", "fireflies"])
 @pytest.mark.parametrize("method, path, body, values, status", _REPEATED)
-def test_cloudflare_refuses_a_repeated_authorization(
+def test_cloudflare_refuses_a_repeated_authorization_and_a_broken_escape(
     client, tokens_yaml, vendor, method, path, body, values, status
 ):
     admin = tokens_yaml["admin_token"]

@@ -8,9 +8,10 @@ import yaml
 from backlot import store
 from tests._helpers import client_for, gql
 
-# The two ways but a POST of JSON a document reaches each GraphQL server's resolvers: a GET with it
-# in the query string, and on Fireflies a POST of a form, each sent with Apollo Server's preflight
-# header (`backlot.graphql.apollo_http.csrf_refusal`).
+# The ways but a POST of JSON to `/graphql` a document reaches each GraphQL server's resolvers: a
+# GET with it in the query string, and on Fireflies a POST of a form, each sent with Apollo Server's
+# preflight header (`backlot.graphql.apollo_http.csrf_refusal`); and on Linear a POST to another
+# path Express hands Apollo Server (`backlot.routers.linear.routes_to_apollo`).
 _ADMIN = "admin-service-token"
 
 
@@ -186,14 +187,18 @@ def test_linear_team_counts_are_acl_scoped(db, acl, tokens):
 
 
 def _gql(client, query, token, via="POST"):
-    return _sent(client, "/linear/graphql", query, token, via).json()
+    """``query`` sent as ``via`` names it, a method and a path after `/linear` where not
+    `/graphql`."""
+    method, _, path = via.partition(" ")
+    return _sent(client, f"/linear{path or '/graphql'}", query, token, method).json()
 
 
-@pytest.mark.parametrize("via", ["POST", "GET"])
+@pytest.mark.parametrize("via", ["POST", "GET", "POST /GRAPHQL/"])
 def test_linear_by_id_roots_do_not_leak_entities_off_hidden_issues(sample_settings, tokens, via):
     """`blackops` is granted to hana only, so its "Triage" state, in no other team, must fail for
     ava exactly as an absent id would — and must still work for hana and the admin, proving the id
-    is real and the difference is the ACL, whichever way the document is sent."""
+    is real and the difference is the ACL, whichever way and to whichever path the document is
+    sent."""
     from backlot import synth
 
     with client_for(sample_settings) as client:

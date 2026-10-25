@@ -1,9 +1,10 @@
 """Fireflies.ai's GraphQL API, served at ``/fireflies/graphql``.
 
 Fireflies is **GraphQL only** — there is no REST surface to emulate — so this router is one
-endpoint. The schema and the resolvers live in ``backlot/graphql/`` (``fireflies.graphql`` +
-``fireflies_resolvers.py``); everything here is HTTP: a request and credentials in, a GraphQL
-envelope out, or its HTTP layer's for a body it cannot read (:func:`_body_refusal`).
+endpoint, and what answers at any other path (:func:`unrouted`). The schema and the resolvers live
+in ``backlot/graphql/`` (``fireflies.graphql`` + ``fireflies_resolvers.py``); everything here is
+HTTP: a request and credentials in, a GraphQL envelope out, or its HTTP layer's for a body it cannot
+read (:func:`_body_refusal`).
 
 Auth is the bearer path (``Authorization: Bearer <api_key>``), which is what the vendor's own
 quickstart shows for all four of its raw-HTTP examples, read by
@@ -19,6 +20,8 @@ charset go unread: on 2026-10-19 a gzipped body drew the not-JSON 400, and ``cha
 
 from __future__ import annotations
 
+import re
+import urllib.parse
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -36,6 +39,7 @@ from backlot.config import get_settings
 from backlot.graphql import apollo_http, engine
 from backlot.graphql import body as request_body
 from backlot.graphql.fireflies_resolvers import build_engine
+from backlot.routers import sent_path
 
 router = APIRouter(prefix="/fireflies", tags=["fireflies"])
 
@@ -112,15 +116,16 @@ def _auth_failed(seen: dict[str, str], message: str) -> Response:
 
 _FRIENDLY = {"invalid_arguments": True, "INTERNAL_SERVER_ERROR": False}
 
-# The methods Fastify reads a body for and has no route for at this path: it reads the body, then
-# answers its not-found handler's 404 (:func:`_not_found`).
-_READ_THEN_NOT_FOUND = ("DELETE", "PATCH", "PUT")
+# The methods Fastify reads a body for but `OPTIONS`, which `@fastify/cors` answers first: at a path
+# or under a method no route takes, it reads the body, then answers its not-found handler's 404
+# (:func:`_not_found`).
+_BODIED = ("DELETE", "PATCH", "POST", "PUT")
 
 
 @router.api_route("/graphql", methods=list(apollo_http.METHODS), include_in_schema=False)
 async def graphql(request: Request):
-    """The single Fireflies endpoint, in front of which Fireflies runs Fastify and
-    ``@fastify/cors``. Not in the OpenAPI document on purpose: this is a GraphQL service, and
+    """Fireflies' endpoint, the one path Fastify routes, in front of which Fireflies runs nginx
+    (:func:`nginx_passes`), Fastify and ``@fastify/cors``. Not in the OpenAPI document on purpose: this is a GraphQL service, and
     describing one POST route that accepts an arbitrary query would tell an OpenAPI→MCP bridge
     nothing useful (hence no ``SOURCE_PREFIXES`` entry either — see ``backlot/openapi.py``).
     Introspection is the schema description for this endpoint.
@@ -134,7 +139,7 @@ async def graphql(request: Request):
     if method == "OPTIONS":
         return _preflight(request)
     if method not in ("GET", "HEAD", "POST"):
-        if method in _READ_THEN_NOT_FOUND:
+        if method in _BODIED:
             read = await _fastify_read(request, routed=False)
             if isinstance(read, Response):
                 return read
@@ -227,17 +232,56 @@ def _preflight(request: Request) -> Response:
 
 
 def _not_found(request: Request) -> Response:
-    """Fireflies' 404 for a method its route does not take, the method and the path quoted in it as
-    a client puts them after ``https://api.fireflies.ai``, the query string as sent.
+    """Fireflies' 404 for a method or a path no route takes, the method, the path as a client sent
+    it (:func:`~backlot.routers.sent_path`) and the query string as sent quoted in it.
     api.fireflies.ai answered so each of the 28 methods of :data:`apollo_http.METHODS` but GET,
-    HEAD, POST, OPTIONS and Cloudflare's three on 2026-10-25 (UTC), `PUT`, `DELETE` and `PATCH` once
-    Fastify had read their body (:func:`_fastify_read`), and quoted `/graphql?x=%7B%20y&z&a=b+c` as
-    sent."""
-    # The path as sent, but for the segment that names Fireflies here.
-    path = "/" + request.scope["raw_path"].decode("latin-1").split("/", 2)[2]
+    HEAD, POST, OPTIONS and Cloudflare's three at `/graphql` on 2026-10-25 (UTC), `PUT`, `DELETE`
+    and `PATCH` once Fastify had read their body (:func:`_fastify_read`), and quoted
+    `/graphql?x=%7B%20y&z&a=b+c` as sent; and each method at each path nginx passes on
+    (:func:`nginx_passes`) but `/graphql`, quoting `//graphql`, `/graph%71l`'s `PUT` and
+    `/graphql%0A` as sent."""
     query = request.scope["query_string"].decode("latin-1")
-    message = f"Cannot {request.method} {path}{'?' if query else ''}{query}"
+    message = f"Cannot {request.method} {sent_path(request.scope)}{'?' if query else ''}{query}"
     return _body_refusal(message, 404, "not_found")
+
+
+_NGINX_404 = (
+    b"<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n"
+    b"<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
+)
+_NGINX_LOCATION = re.compile(rb"/graphql(/|$)", re.IGNORECASE)
+
+
+def nginx_passes(path: str) -> bool:
+    """Whether nginx in front of Fastify passes on ``path``, as a client sent it
+    (:func:`~backlot.routers.sent_path`): once each escape is decoded and each run of slashes is
+    one, it starts with `/graphql`, in any case, followed by a slash, by nothing or by a newline
+    that ends it. api.fireflies.ai answered with Fastify's 404 at `/GRAPHQL`, `/graphql/x`,
+    `//graphql`, `/%2Fgraphql`, `/graphql%2F` and `/graphql%0A`, and with nginx's
+    (:data:`_NGINX_404`) at `/graphqlx`, `/graphql.json`, `/graphql;x`, `/graphql%20`,
+    `/graphql%7E`, `/x/graphql` and `/`, on 2026-10-25 (UTC)."""
+    decoded = re.sub(rb"/{2,}", b"/", urllib.parse.unquote_to_bytes(path))
+    return _NGINX_LOCATION.match(decoded) is not None
+
+
+@router.api_route("/", methods=list(apollo_http.METHODS), include_in_schema=False)
+async def unrouted(request: Request):
+    """Fireflies' answer at a path Fastify has no route for, each of which ``backlot.main`` routes
+    here: :data:`_NGINX_404` where nginx keeps
+    the request (:func:`nginx_passes`), and Fastify's where it passes it on, ``@fastify/cors``'s to
+    an `OPTIONS` (:func:`_preflight`) and its not-found handler's 404 (:func:`_not_found`) to any
+    other method, once it has read a body (:data:`_BODIED`). api.fireflies.ai answered `{`, an
+    empty body and `a/b/c` at `/graphql/` with Fastify's 400 and 415 and plain text and
+    `application/graphql` with its 404, on 2026-10-25 (UTC)."""
+    if not nginx_passes(sent_path(request.scope)):
+        return Response(_NGINX_404, status_code=404, headers={"content-type": "text/html"})
+    if request.method == "OPTIONS":
+        return _preflight(request)
+    if request.method in _BODIED:
+        read = await _fastify_read(request, routed=False)
+        if isinstance(read, Response):
+            return read
+    return _not_found(request)
 
 
 _FASTIFY_PARSED = ("application/json", "text/plain", "application/x-www-form-urlencoded")

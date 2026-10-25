@@ -1370,12 +1370,18 @@ _PREFLIGHT_ASKED = (("Origin", "https://example.com"), ("Access-Control-Request-
 _Q = "?query=%7B%20__typename%20%7D"
 
 
+_NGINX_404 = (
+    b"<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1>"
+    b"</center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
+)
 _PAST_THE_LIMIT = b"x" * (2**20 + 10)
 _LANDING_PAGE = object()  # Apollo Server's page for a browser, `landing_page`'s
 
 
 def _not_found(method: str, target: str) -> bytes:
-    message = b"Cannot %s /graphql%s" % (method.encode(), target.encode())
+    """Fastify's 404, quoting ``target`` as the test sends it."""
+    path = target if target.startswith("/") else f"/graphql{target}"
+    message = b"Cannot %s %s" % (method.encode(), path.encode())
     return (
         b'{"statusCode":404,"status":false,"code":"not_found","message":"%s","errorMessage":"%s"}'
         % (message, message)
@@ -2119,6 +2125,126 @@ _FIREFLIES_HTTP = [
             ("PUT", "", _J, _TYPENAME, 404, _not_found("PUT", "")),
         )
     ),
+    # A path nginx keeps (`nginx_passes`), one it passes on to Fastify, which routes `/graphql`
+    # alone once it has decoded an escape, and Fastify's answers there (`unrouted`).
+    *(
+        http_row(m, p, h, b, c, 404, "text/html", _NGINX_404, id=f"{m} {p}, {c}")
+        for m, p, h, b, c in (
+            ("POST", "/graphqlx", _J, _TYPENAME, "key"),
+            ("POST", "/graphql.json", _J, _TYPENAME, "key"),
+            ("POST", "/graphql;x", _J, _TYPENAME, "key"),
+            ("POST", "/graphql%20", _J, _TYPENAME, "key"),
+            ("POST", "/x/graphql", _J, _TYPENAME, "key"),
+            ("POST", "/nosuch", _J, _TYPENAME, "key"),
+            ("POST", "/", _J, _TYPENAME, "key"),
+            ("POST", "/a%3Cb%3E", _J, _TYPENAME, "key"),
+            ("POST", "/%C3%A9", _J, _TYPENAME, "key"),
+            ("POST", "/graphql%3B", _J, _TYPENAME, "none"),
+            ("POST", "/graphql%7E", _J, _TYPENAME, "none"),
+            ("POST", "/graph%FFl", _J, _TYPENAME, "none"),
+            ("POST", "/graphql\\", _J, _TYPENAME, "none"),
+            ("POST", "/nosuch", _J, b"{", "none"),
+            ("GET", "/nosuch" + _Q, _P, None, "key"),
+            ("OPTIONS", "/nosuch", _PREFLIGHT_ASKED, None, "none"),
+        )
+    ),
+    http_row("HEAD", "/nosuch" + _Q, _P, None, "key", 404, "text/html", b"", id="HEAD /nosuch"),
+    *(
+        http_row(m, p, h, b, c, 404, _JSON_UTF8, _not_found(m, p), id=f"{m} {p}, {c}")
+        for m, p, h, b, c in (
+            ("POST", "/graphql/", _J, _TYPENAME, "key"),
+            ("POST", "/graphql/", _J, _TYPENAME, "Bearer nope"),
+            ("POST", "/GRAPHQL", _J, _TYPENAME, "key"),
+            ("POST", "/GraphQL", _J, _TYPENAME, "key"),
+            ("POST", "/GRAPHQL/", _J, _TYPENAME, "key"),
+            ("POST", "/graphql//", _J, _TYPENAME, "key"),
+            ("POST", "//graphql", _J, _TYPENAME, "key"),
+            ("POST", "/graphql/x", _J, _TYPENAME, "key"),
+            ("POST", "/graphql%2F", _J, _TYPENAME, "key"),
+            ("POST", "/graphql%2f", _J, _TYPENAME, "none"),
+            ("POST", "/%2Fgraphql", _J, _TYPENAME, "none"),
+            ("POST", "/graphql%0A", _J, _TYPENAME, "none"),
+            ("POST", "/graphql/%C3%A9", _J, _TYPENAME, "none"),
+            ("POST", "/graphql/%25", _J, _TYPENAME, "none"),
+            ("POST", "/graphql/", (("Content-Type", "application/graphql"),), b"{ x }", "none"),
+            ("POST", "/graphql/", (), b"x", "none"),
+            ("POST", "/graphql/", (("Content-Type", "text/plain"),), b"x", "none"),
+            ("PUT", "/graphql/", (("Content-Type", "application/graphql"),), b"{ x }", "none"),
+            ("GET", "/graphql/" + _Q, _P, None, "key"),
+            ("GET", "/graphql/", (("Accept", "text/html"),), None, "none"),
+            ("PUT", "/graph%71l", _J, _TYPENAME, "key"),
+            ("PROPFIND", "/graph%71l", (), None, "key"),
+            ("BIND", "/graphql/", (), None, "key"),
+        )
+    ),
+    *(
+        http_row(m, "/graphql/", _J, b, "none", s, _JSON_UTF8, a, id=f"{m} /graphql/, {b!r}")
+        for m, b, s, a in (
+            ("POST", b"{", 400, _NOT_JSON),
+            ("POST", b"", 400, _EMPTY),
+            ("PUT", b"{", 400, _NOT_JSON),
+        )
+    ),
+    http_row(
+        "POST",
+        "/graphql/",
+        (("Content-Type", "a/b/c"),),
+        b"x",
+        "none",
+        415,
+        _JSON_UTF8,
+        _UNSUPPORTED,
+        id="POST /graphql/, a/b/c",
+    ),
+    http_row("HEAD", "/graphql/" + _Q, _P, None, "key", 404, _JSON_UTF8, b"", id="HEAD /graphql/"),
+    http_row(
+        "OPTIONS",
+        "/graphql/",
+        _PREFLIGHT_ASKED,
+        None,
+        "key",
+        204,
+        None,
+        b"",
+        id="preflight at /graphql/",
+        answered=_FIREFLIES_PREFLIGHT,
+    ),
+    http_row(
+        "OPTIONS",
+        "/graphql/",
+        (),
+        None,
+        "key",
+        400,
+        "text/plain",
+        b"Invalid Preflight Request",
+        id="OPTIONS /graphql/",
+    ),
+    http_row(
+        "POST",
+        "/graph%71l",
+        _J,
+        _TYPENAME,
+        "key",
+        200,
+        _JSON_UTF8,
+        _TYPENAME_DATA,
+        id="POST /graph%71l",
+    ),
+    http_row(
+        "GET",
+        "/%67raphql" + _Q,
+        _P,
+        None,
+        "key",
+        200,
+        _JSON_UTF8,
+        _TYPENAME_DATA,
+        id="GET /%67raphql",
+    ),
+    http_row(
+        "POST", "/graphq%6c", _J, _TYPENAME, "none", 500, _JSON_UTF8, _BAD_KEY, id="POST /graphq%6c"
+    ),
 ]
 _FIREFLIES_CREDENTIALS = {
     "none": None,
@@ -2132,7 +2258,7 @@ _FIREFLIES_CREDENTIALS = {
     "method,target,headers,body,credential,status,media_type,answer,expected_headers",
     _FIREFLIES_HTTP,
 )
-def test_fireflies_answers_each_method_type_and_accept_as_fireflies_does(
+def test_fireflies_answers_each_method_path_type_and_accept_as_fireflies_does(
     client,
     tokens_yaml,
     method,
@@ -2151,7 +2277,9 @@ def test_fireflies_answers_each_method_type_and_accept_as_fireflies_does(
         value = _FIREFLIES_CREDENTIALS[credential].format(t=tokens_yaml["admin_token"])
         sent += [("Authorization", value)] * (2 if credential == "twice" else 1)
     content = body.chunks() if isinstance(body, Chunked) else body
-    r = sent_as(client, method, f"/fireflies/graphql{target}", sent, content=content, bare=True)
+    # A target that starts with a slash is a path; any other follows `/graphql`.
+    path = target if target.startswith("/") else f"/graphql{target}"
+    r = sent_as(client, method, f"/fireflies{path}", sent, content=content, bare=True)
     assert r.status_code == status
     assert r.headers.get("content-type") == media_type
     if answer is _LANDING_PAGE:

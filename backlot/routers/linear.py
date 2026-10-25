@@ -1,9 +1,10 @@
 """Linear's GraphQL API, served at ``/linear/graphql``.
 
 Linear is **GraphQL only** — there is no REST surface to emulate — so this router is one
-endpoint. The schema and the resolvers live in ``backlot/graphql/`` (``linear.graphql`` +
-``linear_resolvers.py``); everything here is HTTP: a request and credentials in, a GraphQL
-envelope out, or Express's for the bodies :func:`_express` answers.
+endpoint, and what answers at any other path (:func:`express`). The schema and the resolvers live in
+``backlot/graphql/`` (``linear.graphql`` + ``linear_resolvers.py``); everything here is HTTP: a
+request and credentials in, a GraphQL envelope out, or Express's for the bodies :func:`_express`
+answers.
 
 Auth is the one place Linear differs from every other source in this repo. A personal API key
 travels as the **bare** header value (``Authorization: lin_api_…``, no scheme), read by
@@ -31,6 +32,8 @@ key's shape that Linear never issued drew it under ``Bearer`` with ``{``, ``NaN`
 
 from __future__ import annotations
 
+import re
+import string
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -43,6 +46,7 @@ from backlot.config import get_settings
 from backlot.graphql import apollo_http, engine, v8_json
 from backlot.graphql import body as request_body
 from backlot.graphql.linear_resolvers import build_engine
+from backlot.routers import sent_path
 
 router = APIRouter(prefix="/linear", tags=["linear"])
 
@@ -57,30 +61,31 @@ _INVALID_INPUT = "INVALID_INPUT"
 ENGINE = build_engine()
 
 
-def _api_key_as_bearer() -> Response:
+_API_KEY_AS_BEARER = (
+    "It looks like you're trying to use an API key as a Bearer token. Remove the Bearer prefix "
+    "from the Authorization header."
+)
+
+
+def _api_key_as_bearer(path: str) -> Response:
     """Linear's 400 for an API key under ``Bearer``, which
-    :func:`backlot.auth.linear_api_key_under_bearer` finds, as api.linear.app sent it on
-    2026-10-18."""
-    return Response(
-        request_body.node_json(
-            {
-                "errors": [
-                    {
-                        "message": "It looks like you're trying to use an API key as a Bearer "
-                        "token. Remove the Bearer prefix from the Authorization header.",
-                        "extensions": {
-                            "type": "invalid input",
-                            "code": "INPUT_ERROR",
-                            "statusCode": 400,
-                            "userError": True,
-                        },
-                    }
-                ]
-            }
-        ),
-        status_code=400,
-        media_type=_JSON,
-    )
+    :func:`backlot.auth.linear_api_key_under_bearer` finds, at ``path`` as a client sent it
+    (:func:`backlot.routers.sent_path`). Where ``path`` starts `/graphql` it is a GraphQL error, as
+    api.linear.app sent it on 2026-10-18; at any other it is the members of :func:`_express`'s
+    envelope, as api.linear.app sent it at `/GRAPHQL`, `//graphql`, `/graph%71l`, `/nosuch` and `/`
+    on 2026-10-25 (UTC), the first three of which it serves as `/graphql`, where `/graphqlx`,
+    `/graphql;x` and `/graphql%2F` drew the GraphQL error."""
+    extensions = {
+        "type": "invalid input",
+        "code": "INPUT_ERROR",
+        "statusCode": 400,
+        "userError": True,
+    }
+    if path.startswith("/graphql"):
+        body: dict = {"errors": [{"message": _API_KEY_AS_BEARER, "extensions": extensions}]}
+    else:
+        body = {"error": _API_KEY_AS_BEARER, "details": {}, "extensions": extensions, "code": 400}
+    return Response(request_body.node_json(body), status_code=400, media_type=_JSON)
 
 
 def _express(message: str, status: int = 400, length: int | None = None) -> Response:
@@ -111,27 +116,38 @@ _LOAD_BALANCER_501 = frozenset(
 )
 
 
-@router.api_route("/graphql", methods=list(apollo_http.METHODS), include_in_schema=False)
-async def graphql(request: Request):
-    """The single Linear endpoint, in front of which Linear runs Express and ``cors``. Not in the
-    OpenAPI document on purpose: this is a GraphQL service, and describing one POST route that
-    accepts an arbitrary query would tell an OpenAPI→MCP bridge nothing useful (hence no
-    ``SOURCE_PREFIXES`` entry either — see ``backlot/openapi.py``). Introspection is the schema
-    description for this endpoint.
-
-    The layers answer in this order, each measured against api.linear.app on 2026-10-25 (UTC) with
-    the one after it wrong too: the load balancer (:data:`_LOAD_BALANCER_501`), ``cors``
-    (:func:`_preflight`), :func:`_api_key_as_bearer`, ``body-parser`` (:func:`_has_body`,
-    :func:`~backlot.graphql.body.express_reads_json`), Apollo Server
-    (:mod:`backlot.graphql.apollo_http`) up to the choice of operation, then the credential and the
-    run (:func:`_answer`)."""
+def _front(request: Request) -> Response | None:
+    """The answer of a layer ahead of Express's routing, whatever the path: the load balancer's
+    (:data:`_LOAD_BALANCER_501`), ``cors``'s (:func:`_preflight`) and :func:`_api_key_as_bearer`,
+    in that order; or None."""
     method = request.method
     if method in _LOAD_BALANCER_501:
         return Response(status_code=501)
     if method == "OPTIONS" and "origin" in request.headers:
         return _preflight(request)
     if method != "OPTIONS" and auth.linear_api_key_under_bearer(request):
-        return _api_key_as_bearer()
+        return _api_key_as_bearer(sent_path(request.scope))
+    return None
+
+
+@router.api_route("/graphql", methods=list(apollo_http.METHODS), include_in_schema=False)
+async def graphql(request: Request):
+    """Linear's endpoint, in front of which Linear runs Express and ``cors``, at `/graphql` and at
+    each other path Express hands Apollo Server (:func:`routes_to_apollo`), which
+    ``backlot.main`` routes here. Not in the OpenAPI document on purpose: this is a GraphQL
+    service, and describing one POST route that accepts an arbitrary query would tell an
+    OpenAPI→MCP bridge nothing useful (hence no ``SOURCE_PREFIXES`` entry either — see
+    ``backlot/openapi.py``). Introspection is the schema description for this endpoint.
+
+    The layers answer in this order, each measured against api.linear.app on 2026-10-25 (UTC) with
+    the one after it wrong too: those of :func:`_front`, ``body-parser`` (:func:`_has_body`,
+    :func:`~backlot.graphql.body.express_reads_json`), Apollo Server
+    (:mod:`backlot.graphql.apollo_http`) up to the choice of operation, then the credential and the
+    run (:func:`_answer`)."""
+    front = _front(request)
+    if front is not None:
+        return front
+    method = request.method
     payload: Any = None
     content_type = request_body.joined_header(request.headers.getlist("content-type"))
     if _has_body(request) and request_body.express_reads_json(content_type):
@@ -198,6 +214,72 @@ def _has_body(request: Request) -> bool:
     and no length with its 415 under `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `PROPFIND` on
     2026-10-25 (UTC), and read no body under `GET` and `HEAD`, a length of 0 among them."""
     return request.method not in ("GET", "HEAD")
+
+
+_UNRESERVED = frozenset(string.ascii_letters + string.digits + "-._~")
+_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
+_BARE = frozenset('"<>^`{|}')
+
+
+def express_path(path: str) -> str:
+    """``path``, as a client sent it (:func:`backlot.routers.sent_path`), as Express reads it behind
+    Linear's front: a backslash is a slash, an escape of a character RFC 3986 leaves unreserved is
+    that character, a run of slashes is one, each of ``"<>^`{|}`` sent bare is escaped in upper
+    case, and any other escape is kept as sent. Express's 404 quoted `/%6Eosuch` as `/nosuch`,
+    `//nosuch` and `/nosuch//x` as `/nosuch` and `/nosuch/x`, `/a\\b` as `/a/b`, `/a%2fb` and
+    `/a%3cb` as sent, and each other printable ASCII character but `%`, `?` and `#` as sent, on
+    2026-10-25 (UTC)."""
+
+    def one(match: re.Match[str]) -> str:
+        char = chr(int(match[1], 16))
+        return char if char in _UNRESERVED else match[0]
+
+    path = re.sub("/{2,}", "/", _ESCAPE.sub(one, path.replace("\\", "/")))
+    return "".join(f"%{ord(char):02X}" if char in _BARE else char for char in path)
+
+
+def routes_to_apollo(path: str) -> bool:
+    """Whether Express hands ``path`` (:func:`express_path`) to Apollo Server: `/graphql` in any
+    case, alone or with a slash after it and anything after that. api.linear.app served
+    `/GRAPHQL`, `/GraphQL/`, `/graphql/`, `/graphql/x` and `/Graphql/X/Y` and answered
+    `/graphqlx`, `/graphql.json`, `/graphql;x`, `/graphql%20` and `/graphql%2F` with Express's 404
+    on 2026-10-25 (UTC)."""
+    return re.fullmatch(r"/graphql(?:/.*)?", path, re.ASCII | re.IGNORECASE) is not None
+
+
+_GREETING = b"Hello from the Linear GraphQL API."
+_HTML = "text/html; charset=utf-8"
+
+
+@router.api_route("/", methods=list(apollo_http.METHODS), include_in_schema=False)
+async def express(request: Request):
+    """Linear's answer at a path Express does not hand Apollo Server (:func:`routes_to_apollo`),
+    each of which ``backlot.main`` routes here:
+    after the layers of :func:`_front`, Express's own, as api.linear.app answered on 2026-10-25
+    (UTC). At `/` that is :data:`_GREETING` to a `GET` and a `HEAD`, and the methods `/` takes, as
+    `text/plain`, to an `OPTIONS`; at any other path, and to any other method, it is ``finalhandler``'s
+    404 page (:func:`_not_found`). The body is not read: `{` under `application/json` drew the
+    404."""
+    front = _front(request)
+    if front is not None:
+        return front
+    path = express_path(sent_path(request.scope))
+    if path == "/" and request.method in ("GET", "HEAD"):
+        return Response(_GREETING, media_type=_HTML)
+    if path == "/" and request.method == "OPTIONS":
+        return Response(b"GET, HEAD", headers={"content-type": "text/plain"})
+    return Response(_not_found(request.method, path), status_code=404, media_type=_HTML)
+
+
+def _not_found(method: str, path: str) -> bytes:
+    """``finalhandler``'s 404 page, `Cannot` ``method`` ``path`` with `&` and `'` escaped for HTML:
+    the other characters ``escape-html`` replaces are escaped in ``path`` by then
+    (:func:`express_path`)."""
+    message = f"Cannot {method} {path}".replace("&", "&amp;").replace("'", "&#39;")
+    return (
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<title>Error</title>\n'
+        f"</head>\n<body>\n<pre>{message}</pre>\n</body>\n</html>\n"
+    ).encode()
 
 
 #: The headers ``cors`` writes on each preflight, as api.linear.app answered every one sent with

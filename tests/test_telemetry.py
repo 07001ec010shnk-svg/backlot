@@ -636,6 +636,42 @@ TEAM = "/msgraph/v1.0/teams/778451ab-3734-4e45-beba-caf1bd343541"
             ("linear", "unparsed", "unknown", 405, None, "client"),
         ),
         (
+            "POST",
+            "/linear/GRAPHQL/",
+            {"headers": LINEAR | JSON, "json": {"query": "{ __typename }"}},
+            ("linear", "query.__typename", "implemented", 200, None, None),
+        ),
+        (
+            "POST",
+            "/linear/nosuch",
+            {"headers": LINEAR | JSON, "json": {"query": "{ __typename }"}},
+            ("linear", "unmatched", "unknown", 404, None, "client"),
+        ),
+        (
+            "GET",
+            "/linear/",
+            {"headers": LINEAR},
+            ("linear", "unmatched", "unknown", 200, None, None),
+        ),
+        (
+            "POST",
+            "/linear/a%zz",
+            {"headers": LINEAR | JSON, "json": {"query": "{ __typename }"}},
+            ("linear", "unmatched", "unknown", 400, None, "client"),
+        ),
+        (
+            "POST",
+            "/fireflies/graphql/",
+            {"headers": JSON, "json": {"query": "{ __typename }"}},
+            ("fireflies", "unmatched", "unknown", 404, "not_found", "client"),
+        ),
+        (
+            "POST",
+            "/fireflies/nosuch",
+            {"headers": JSON, "json": {"query": "{ __typename }"}},
+            ("fireflies", "unmatched", "unknown", 404, None, "client"),
+        ),
+        (
             "GET",
             "/calendar/v3/calendars/primary/events",
             {},

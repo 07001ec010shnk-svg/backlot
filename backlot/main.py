@@ -43,6 +43,7 @@ from backlot.routers import (
     notion,
     oauth,
     s3,
+    sent_path,
     slack,
 )
 from backlot.telemetry import naming, recorder
@@ -753,6 +754,32 @@ async def serve_a_slashed_hubspot_path_as_the_path_without_it(request: Request, 
     return await call_next(request)
 
 
+_GRAPHQL_ENDPOINTS = ("/linear/graphql", "/fireflies/graphql")
+
+
+def _off_a_graphql_endpoint(scope: Scope) -> bool:
+    path = scope["path"]
+    return path.startswith(("/linear/", "/fireflies/")) and path not in _GRAPHQL_ENDPOINTS
+
+
+@_middleware(_off_a_graphql_endpoint)
+async def route_a_linear_or_fireflies_path_as_its_front_does(request: Request, call_next):
+    """Route a `/linear` or `/fireflies` path but the endpoint's own to the route that answers it as
+    the vendor's front does: a `/linear` path Express hands Apollo Server
+    (``linear.routes_to_apollo``) to ``linear.graphql``, and any other to the vendor's root route
+    (``linear.express``, ``fireflies.unrouted``), each of which reads the path as sent off the raw
+    path, which is left alone. Starlette's own routing is not asked: its pattern for the endpoint
+    takes a path with a newline after it (`/graphql%0A`), and its `path` convertor none with a
+    newline inside it, where each vendor's front reads both as another path. The path the
+    telemetry names a call by is then the endpoint's where the endpoint answers."""
+    vendor = request.scope["path"].split("/")[1]
+    served = vendor == "linear" and linear.routes_to_apollo(
+        linear.express_path(sent_path(request.scope))
+    )
+    request.scope["path"] = f"/{vendor}/graphql" if served else f"/{vendor}/"
+    return await call_next(request)
+
+
 def _google_route_match(scope: Scope) -> Match:
     """How the best Google route matches this scope: in full, by its path alone (``PARTIAL``, the
     router's 405), or not at all. Asked of ``backlot.routers.google.router``, which holds the Google
@@ -1282,8 +1309,9 @@ async def refuse_cloudflares_methods_on_linear_and_fireflies(request: Request, c
 
 
 #: The page Cloudflare, in front of Linear and Fireflies, answers a request carrying `Authorization`
-#: more than once with: `text/html` with no charset, CRLF line ends, 155 bytes.
-_CLOUDFLARE_REPEATED_AUTHORIZATION = (
+#: more than once with, and one whose path breaks an escape: `text/html` with no charset, CRLF line
+#: ends, 155 bytes.
+_CLOUDFLARE_BAD_REQUEST = (
     "<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n"
     "<center><h1>400 Bad Request</h1></center>\r\n<hr><center>cloudflare</center>\r\n"
     "</body>\r\n</html>\r\n"
@@ -1298,16 +1326,40 @@ _CLOUDFLARE_REPEATED_AUTHORIZATION = (
 )
 async def refuse_a_repeated_authorization_on_linear_and_fireflies(request: Request, call_next):
     """Answer a `/linear` or `/fireflies` request that carries `Authorization` more than once with
-    :data:`_CLOUDFLARE_REPEATED_AUTHORIZATION`'s 400, ahead of the route, the body and the
+    :data:`_CLOUDFLARE_BAD_REQUEST`'s 400, ahead of the route, the body and the
     credential. api.linear.app and api.fireflies.ai answered it on 2026-10-19 (UTC) to two copies of
     a key, a key and `nope` in either order, a key and an empty value, two empty values, three
     copies and a second header named in lower case; on `POST /graphql` with a query, with no bytes,
     with `{` and with a body past each vendor's size limit, on `GET /graphql`, on `HEAD /graphql`,
     which declared the 155 bytes and sent none, and on `POST /nosuch` and `POST /`."""
     return Response(
-        _CLOUDFLARE_REPEATED_AUTHORIZATION.encode(),
-        status_code=400,
-        headers={"Content-Type": "text/html"},
+        _CLOUDFLARE_BAD_REQUEST.encode(), status_code=400, headers={"Content-Type": "text/html"}
+    )
+
+
+#: A `%` two hex digits do not follow.
+_BROKEN_ESCAPE = re.compile(rb"%(?![0-9A-Fa-f]{2})")
+
+
+def _a_broken_escape(scope: Scope) -> bool:
+    raw = scope.get("raw_path") or scope["path"].encode()
+    return b"%00" in raw or _BROKEN_ESCAPE.search(raw) is not None
+
+
+@_middleware(
+    lambda scope: (
+        _at_or_under(_url_path(scope), ("/linear", "/fireflies")) and _a_broken_escape(scope)
+    )
+)
+async def refuse_a_broken_escape_on_linear_and_fireflies(request: Request, call_next):
+    """Answer a `/linear` or `/fireflies` request whose path holds `%00`, or a `%` two hex digits do
+    not follow, with :data:`_CLOUDFLARE_BAD_REQUEST`'s 400, ahead of
+    :func:`refuse_cloudflares_methods_on_linear_and_fireflies`. api.linear.app and api.fireflies.ai
+    answered so `/a%zz` and `/a%00b` by each method of :data:`_CLOUDFLARE_METHOD`, and `/a%2`,
+    `/graphql%zz` and a `%` before `b` by `POST`, on 2026-10-25 (UTC), and passed `?a=%zz`, `?a=%`,
+    `?a=%2` and `?a=%00` after `/graphql` on to the vendor."""
+    return Response(
+        _CLOUDFLARE_BAD_REQUEST.encode(), status_code=400, headers={"Content-Type": "text/html"}
     )
 
 
