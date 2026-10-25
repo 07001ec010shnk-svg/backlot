@@ -1233,6 +1233,73 @@ async def put_a_request_id_on_github_answers(request: Request, call_next):
     return response
 
 
+# The Google paths whose reads real answers when they arrive as a POST that names one in
+# `X-HTTP-Method-Override` (`answer_a_google_read_sent_as_a_post`), each with the overrides it reads
+# as the GET once the spaces and tabs around one are gone. Measured on 2026-10-25: Drive's `about`
+# and `files.list` read `GET` and `HEAD` in any case (`get`, `gET`, `hEAD`); Gmail's `labels.list`
+# and `messages.list` read the two as spelt and not `get`, `Get` or `head`; and Docs'
+# `documents.get` and Sheets' `spreadsheets.get` and `values.get` read `GET` as spelt and not `get`,
+# `Get`, `HEAD` or `head`. On Drive's `about`, Gmail's `labels.list` and Sheets' `values.get`,
+# `\xa0GET`, `\x85GET` and two `X-HTTP-Method-Override` headers, `GET` both times among them, were
+# not read.
+_GOOGLE_READ_OVERRIDES = {
+    "/drive/v3": ("GET", "HEAD"),
+    "/gmail/v1": ("GET", "HEAD"),
+    "/docs/v1": ("GET",),
+    "/sheets/v4": ("GET",),
+}
+_GOOGLE_OVERRIDE_IN_ANY_CASE = "/drive/v3"
+_FORM_MEDIA_TYPE = "application/x-www-form-urlencoded"
+
+
+@_middleware(
+    lambda scope: (
+        scope["method"] == "POST"
+        and any(scope["path"].startswith(f"{prefix}/") for prefix in _GOOGLE_READ_OVERRIDES)
+    )
+)
+async def answer_a_google_read_sent_as_a_post(request: Request, call_next):
+    """A Google read sent as a POST that names it in `X-HTTP-Method-Override` is answered as the
+    GET it stands for, its form body read as the query string after the URL's own. Which overrides
+    each family reads is :data:`_GOOGLE_READ_OVERRIDES`.
+
+    The Google API Python client sends a read this way on its own: `HttpRequest.execute`
+    (google-api-python-client 2.201.0) turns a GET whose URI passes 2048 characters into a POST with
+    `x-http-method-override: GET`, `content-type: application/x-www-form-urlencoded` and the query
+    string as the body. Measured with a Workspace member's token: on www.googleapis.com/drive/v3 on
+    2026-10-21, `files.list` with a 2,058-byte form body and `about` with `fields=kind` each
+    answered 200 and what the same parameters get on a GET. On 2026-10-23 so did `files.get`,
+    `drives.list` and `changes/startPageToken`, Docs' `documents.get` and Sheets' `values.get`, and
+    on 2026-10-25, with a `gmail.readonly` token, Gmail's `labels.list`, `messages.list` and
+    `getProfile`. A `HEAD` read there was answered as the GET, body and all. On 2026-10-25 the body
+    was read on each of the four when its `Content-Type`, the first where two were sent, held
+    `application/x-www-form-urlencoded` anywhere and in any case, as in
+    `text/plain;application/x-www-form-urlencoded`, where `application/x-www-form-urlencode` was not
+    read. It was not read under no `Content-Type` or `text/plain` on any of the four, nor under
+    `application/json` or `multipart/form-data` on `about`, where `about` was the 400 a GET with no
+    `fields` gets. A `fields` in the URL was read over one in the body, as the first of two in a
+    GET's query is. A POST naming `PUT`, `PATCH`, `DELETE` or `GET, PUT` goes on as a POST: real
+    answered each on `about` as it answers a `PUT` there, with its 404 page, and on 2026-10-25 so it
+    answered a `PUT`, `PATCH` or `DELETE` naming `GET` there.
+
+    Registered just before ``vendor_json_media_type``, outside every middleware that reads the
+    method or the query, so they and the router see the GET.
+    """
+    path = request.scope["path"]
+    prefix = next(p for p in _GOOGLE_READ_OVERRIDES if path.startswith(f"{p}/"))
+    sent = request.headers.getlist("x-http-method-override")
+    override = sent[0].strip(" \t") if len(sent) == 1 else ""
+    if prefix == _GOOGLE_OVERRIDE_IN_ANY_CASE:
+        override = override.upper()
+    if override in _GOOGLE_READ_OVERRIDES[prefix]:
+        form = _FORM_MEDIA_TYPE in request.headers.get("content-type", "").lower()
+        body = await request.body() if form else b""
+        query = request.scope.get("query_string", b"")
+        request.scope["method"] = "GET"
+        request.scope["query_string"] = b"&".join(part for part in (query, body) if part)
+    return await call_next(request)
+
+
 @_middleware(lambda scope: errors.has_json_media_type(_url_path(scope)))
 async def vendor_json_media_type(request: Request, call_next):
     """Put the vendor's own `content-type` on a JSON body, where one is measured.
