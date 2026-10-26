@@ -20,7 +20,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Callable
-from html import escape
+from html.entities import codepoint2name
 from pathlib import Path
 from urllib.parse import quote
 
@@ -1642,18 +1642,34 @@ def _jira_issue(conn, request: Request, row, expand: str = "", fields_only: bool
 # ============================== Confluence ======================================
 
 
+#: How a body's characters are written: storage writes each character HTML 4 names
+#: (`codepoint2name`) as that entity but `Š` and `š`, view and export_view write only `"`, `&`, `<`
+#: and `>` as entities, and every other character measured is itself in all three, `'` among them.
+#: Measured against Confluence Cloud on pages on 2026-10-23, and with twelve of those characters on
+#: a comment and a blog post on 2026-10-25.
+_CONFLUENCE_STORAGE_ENTITIES = {
+    cp: f"&{name};" for cp, name in codepoint2name.items() if cp not in (0x160, 0x161)
+}
+_CONFLUENCE_RENDERED_ENTITIES = str.maketrans(
+    {'"': "&quot;", "&": "&amp;", "<": "&lt;", ">": "&gt;"}
+)
+
+
 def _storage(content: str) -> str:
     """Confluence storage format — XHTML with a leading structured macro, as the real
     editor emits (distinct from the rendered view below)."""
     paras = [p for p in content.split("\n\n") if p.strip()] or [content]
-    return "".join(f"<p>{escape(p)}</p>" for p in paras)
+    return "".join(f"<p>{p.translate(_CONFLUENCE_STORAGE_ENTITIES)}</p>" for p in paras)
 
 
 def _view(content: str) -> str:
     """Rendered ``view`` HTML — differs from storage (wrapped, ids, no ac: macros), as the
     real API returns a rendered representation, not the storage source."""
     paras = [p for p in content.split("\n\n") if p.strip()] or [content]
-    body = "".join(f'<p class="auto-cursor-target">{escape(p)}</p>' for p in paras)
+    body = "".join(
+        f'<p class="auto-cursor-target">{p.translate(_CONFLUENCE_RENDERED_ENTITIES)}</p>'
+        for p in paras
+    )
     return f'<div class="contentLayout2"><div class="columnLayout single">{body}</div></div>'
 
 
@@ -1661,7 +1677,7 @@ def _export_view(content: str) -> str:
     """Rendered ``export_view`` HTML — the real API's export-oriented rendering (same content
     as ``view``, without editor-only attributes like ``auto-cursor-target``)."""
     paras = [p for p in content.split("\n\n") if p.strip()] or [content]
-    body = "".join(f"<p>{escape(p)}</p>" for p in paras)
+    body = "".join(f"<p>{p.translate(_CONFLUENCE_RENDERED_ENTITIES)}</p>" for p in paras)
     return f'<div class="contentLayout2"><div class="columnLayout single">{body}</div></div>'
 
 
