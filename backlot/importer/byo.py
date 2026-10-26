@@ -1101,6 +1101,11 @@ def _paragraphs_pairing_errors(rec: dict) -> list[str]:
                 f"paragraphs[{i}]: a newline ends a paragraph, so a paragraph's text holds none; "
                 "state the next line as the next paragraph"
             )
+        if any(isinstance(t, str) and gdocs.STRIPPED.search(t) for t in texts):
+            msgs.append(
+                f"paragraphs[{i}]: holds a character real strips from a document's text "
+                "(U+0000-U+0008, U+000C-U+001F or U+E000-U+F8FF)"
+            )
     return msgs
 
 

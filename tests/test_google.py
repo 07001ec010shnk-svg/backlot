@@ -6543,15 +6543,18 @@ def test_docs_get_returns_paragraph_text(base, admin_h):
 
 def test_docs_get_serves_stated_paragraphs_as_real_does(tmp_path):
     """A document whose corpus states `paragraphs`, served as real served the same paragraphs
-    written through `batchUpdate` (`backlot.gdocs`): indices in UTF-16 code units, so the emoji counts
-    two; a `headingId` on a heading alone; adjacent runs of one style as one; a link underlined in
-    the link colour; and the newline in its paragraph's last run's style, but for a link."""
+    written through `batchUpdate` (`backlot.gdocs`): indices in UTF-16 code units, so the emoji
+    counts two; a `headingId` on a heading alone; adjacent runs of one style as one; a link
+    underlined in the link colour; and the newline in its paragraph's last run's style, but for a
+    link and the underline it brought. A document stating no paragraphs is read without the
+    characters `insertText` strips, `\r` among them."""
+    url = "https://example.com/"
     link = {
         "underline": True,
         "foregroundColor": {
             "color": {"rgbColor": {"red": 0.06666667, "green": 0.33333334, "blue": 0.8}}
         },
-        "link": {"url": "https://example.com/"},
+        "link": {"url": url},
     }
     record = {
         "source_type": "google_drive",
@@ -6573,7 +6576,7 @@ def test_docs_get_serves_stated_paragraphs_as_real_does(tmp_path):
             {
                 "runs": [
                     {"text": "See "},
-                    {"text": "the spec", "link": "https://example.com/"},
+                    {"text": "the spec", "link": url},
                     {"text": " and "},
                     {"text": "old", "strikethrough": True},
                     {"text": " "},
@@ -6583,15 +6586,29 @@ def test_docs_get_serves_stated_paragraphs_as_real_does(tmp_path):
             },
             {"style": "HEADING_2", "text": "Risks \U0001f600"},
             {"runs": [{"text": "Plain "}, {"text": "bold", "bold": True}]},
-            {"runs": [{"text": "End "}, {"text": "link", "link": "https://example.com/"}]},
+            {"runs": [{"text": "End "}, {"text": "link", "link": url}]},
             {
                 "runs": [
                     {"text": "A "},
-                    {"text": "linkbold", "link": "https://example.com/", "bold": True},
+                    {"text": "linkbold", "link": url, "bold": True},
+                ]
+            },
+            {"runs": [{"text": "pre "}, {"text": "ullink", "underline": True, "link": url}]},
+            {
+                "runs": [
+                    {"text": "a "},
+                    {"text": "ulb", "bold": True, "underline": True, "link": url},
                 ]
             },
             {"text": ""},
         ],
+    }
+    prose = {
+        "source_type": "google_drive",
+        "doc_id": "crlf",
+        "title": "CRLF notes",
+        "author_email": "owner@acme.com",
+        "content": "one\r\ntwo\x01\ue000",
     }
 
     def para(start, end, runs, style="NORMAL_TEXT"):
@@ -6620,10 +6637,11 @@ def test_docs_get_serves_stated_paragraphs_as_real_does(tmp_path):
             },
         }
 
-    with corpus_client(tmp_path, [record]) as (client, settings):
+    with corpus_client(tmp_path, [record, prose]) as (client, settings):
         h = {"Authorization": f"Bearer {settings.admin_token}"}
         fid = served_id("google_drive", "plan")
         doc = client.get(f"/docs/v1/documents/{fid}", headers=h).json()
+        crlf = client.get(f"/docs/v1/documents/{served_id('google_drive', 'crlf')}", headers=h)
     assert doc["body"]["content"][1:] == [
         para(1, 16, [("Quarterly plan\n", {}, 15)], "TITLE"),
         para(
@@ -6642,7 +6660,7 @@ def test_docs_get_serves_stated_paragraphs_as_real_does(tmp_path):
             76,
             [
                 ("See ", {}, 4),
-                ("the spec", {**link, "link": {"url": "https://example.com/"}}, 8),
+                ("the spec", link, 8),
                 (" and ", {}, 5),
                 ("old", {"strikethrough": True}, 3),
                 (" ", {}, 1),
@@ -6658,7 +6676,21 @@ def test_docs_get_serves_stated_paragraphs_as_real_does(tmp_path):
             116,
             [("A ", {}, 2), ("linkbold", {"bold": True, **link}, 8), ("\n", {"bold": True}, 1)],
         ),
-        para(116, 117, [("\n", {}, 1)]),
+        para(116, 127, [("pre ", {}, 4), ("ullink", link, 6), ("\n", {"underline": True}, 1)]),
+        para(
+            127,
+            133,
+            [
+                ("a ", {}, 2),
+                ("ulb", {"bold": True, **link}, 3),
+                ("\n", {"bold": True, "underline": True}, 1),
+            ],
+        ),
+        para(133, 134, [("\n", {}, 1)]),
+    ]
+    assert crlf.json()["body"]["content"][1:] == [
+        para(1, 5, [("one\n", {}, 4)]),
+        para(5, 9, [("two\n", {}, 4)]),
     ]
     headings = [
         el["paragraph"]["paragraphStyle"]["headingId"]

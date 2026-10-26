@@ -6,7 +6,6 @@ import io
 import json
 import sqlite3
 from pathlib import Path
-from unittest.mock import ANY
 
 import pytest
 import yaml
@@ -6045,6 +6044,18 @@ def test_reimporting_a_structured_file_as_prose_drops_its_structure(tmp_path, st
         ("paragraphs", {"paragraphs": [{"style": "TITLE"}]}, "one of"),
         ("paragraphs", {"paragraphs": [{"text": "a\nb"}]}, "holds none"),
         ("paragraphs", {"paragraphs": [{"runs": [{"text": "a"}, {"text": "b\n"}]}]}, "holds none"),
+        ("paragraphs", {"paragraphs": [{"text": "a\rb"}]}, "real strips"),
+        ("paragraphs", {"paragraphs": [{"runs": [{"text": "a\ue000"}]}]}, "real strips"),
+        (
+            "paragraphs",
+            {"paragraphs": [{"runs": [{"text": "a", "link": "example.com"}]}]},
+            "does not match",
+        ),
+        (
+            "paragraphs",
+            {"paragraphs": [{"runs": [{"text": "a", "link": "#heading=h.x"}]}]},
+            "does not match",
+        ),
     ],
 )
 def test_a_structure_a_record_cannot_mean_is_refused(
@@ -6181,9 +6192,10 @@ PARAS_REC = {
 
 
 def test_stated_paragraphs_are_the_body_and_their_text_is_the_content(tmp_path):
-    """The body is stored as real serves it and `content` is the paragraphs' text, one line each,
-    which Drive's export and search read. Two documents with one text and different styles are
-    two documents, so the paragraphs reach the id; one that states none stores no body."""
+    """The body is stored in real's shape with its indices left out, and `content` is the
+    paragraphs' text, one line each, which Drive's export and search read. Two documents with one
+    text and different styles are two documents, so the paragraphs reach the id; one that states
+    none stores no body."""
     restyled = {
         **PARAS_REC,
         "doc_id": "gd-restyled",
@@ -6199,12 +6211,6 @@ def test_stated_paragraphs_are_the_body_and_their_text_is_the_content(tmp_path):
     rows = conn.execute("SELECT id, content FROM gdrive_files ORDER BY rowid").fetchall()
     assert [r["content"] for r in rows] == ["Goals\nShip it\n"] * 3
     body = store.gdrive_doc_body_for(conn, rows[0]["id"])
-    assert body[0] == {"sectionBreak": {"sectionStyle": ANY}}
-    assert body[1]["paragraph"]["paragraphStyle"]["namedStyleType"] == "HEADING_1"
-    assert body[2]["paragraph"]["elements"] == [
-        {"textRun": {"content": "Ship ", "textStyle": {}}},
-        {"textRun": {"content": "it\n", "textStyle": {"bold": True}}},
-    ]
-    assert body[3]["paragraph"]["elements"] == [{"textRun": {"content": "\n", "textStyle": {}}}]
+    assert [el.keys() for el in body] == [{"sectionBreak"}] + [{"paragraph"}] * 3
     assert store.gdrive_doc_body_for(conn, rows[1]["id"]) != body
     assert store.gdrive_doc_body_for(conn, rows[2]["id"]) is None

@@ -499,7 +499,7 @@ CREATE TABLE IF NOT EXISTS gdrive_spreadsheets (
     file_id TEXT PRIMARY KEY, properties TEXT NOT NULL
 );
 
--- A document's stored body (`backlot.gdocs`); one whose record states no `paragraphs` has no row.
+-- A document's stored body (`backlot.gdocs`).
 CREATE TABLE IF NOT EXISTS gdrive_doc_bodies (
     file_id TEXT PRIMARY KEY, body TEXT NOT NULL
 );

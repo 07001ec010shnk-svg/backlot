@@ -3,17 +3,18 @@
 Outside the router for the reason `gsheets` is: the importer is the other caller.
 
 A body is stored as real serves `body.content` with every `startIndex` and `endIndex` left out, and
-:func:`indexed` puts them back at read time, so the stored form is the vendor's own and a write
-changes it in the vendor's terms. A document that states no structure is stored as nothing and
-read through :func:`from_text`.
+:func:`indexed` puts them back at read time, so the stored form is the vendor's own. A document
+that states no structure is stored as nothing and read through :func:`from_text`.
 
-Measured against the live Docs v1 API on 2026-10-26, as a Workspace member on documents it owns.
+Measured against the live Docs v1 API on 2026-10-26, as a Workspace member on documents it owns and
+as a second account on the Docs it can read.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 
 from backlot import synth
@@ -40,7 +41,12 @@ _TEXT_STYLE_ORDER = (
     "link",
 )
 
-# What a link adds to a run besides `link`, through the editor or `updateTextStyle` alike.
+# The characters `insertText` strips from what it inserts: U+0000-U+0008, U+000C-U+001F (`\r`
+# among them) and U+E000-U+F8FF, so no document real holds has one. A tab, `\x0b`, `\x7f`, U+2028
+# and a character past the BMP are kept.
+STRIPPED = re.compile("[\x00-\x08\x0c-\x1f\ue000-\uf8ff]")
+
+# The colour a link gives its run, through the editor or `updateTextStyle` alike.
 _LINK_COLOR = {"color": {"rgbColor": {"red": 0.06666667, "green": 0.33333334, "blue": 0.8}}}
 
 
@@ -71,16 +77,14 @@ def text_style(marks: dict) -> dict:
 def _newline_style(marks: dict) -> dict:
     """The style of a paragraph's newline, which takes its last run's: a run styled up to the end
     of its paragraph styles the newline too, except for the link, which stops before it along with
-    the underline and colour it brought."""
-    if marks.get("link"):
-        marks = {k: v for k, v in marks.items() if k not in ("link", "underline")}
-    return text_style(marks)
+    the underline and colour it brought. An underline the run states itself stays."""
+    return text_style({k: v for k, v in marks.items() if k != "link"})
 
 
 def heading_id(file_id: str, ordinal: int) -> str:
     """A heading paragraph's `headingId`: ``h.`` and twelve base-36 characters, the length 262 of
-    281 measured ids have (the rest are one or two shorter). Real gives one to every TITLE,
-    SUBTITLE and HEADING_n paragraph and none to NORMAL_TEXT."""
+    281 measured ids have (the rest are one or two shorter). Real gave one to every TITLE,
+    SUBTITLE and HEADING_n paragraph in all but one Doc read, and none to NORMAL_TEXT."""
     n = synth.hnum(f"{file_id}\0{ordinal}", length=16)
     digits = "0123456789abcdefghijklmnopqrstuvwxyz"
     out = ""
@@ -112,8 +116,7 @@ def _section_break() -> dict:
 
 def from_paragraphs(file_id: str, paragraphs: list[dict]) -> list[dict]:
     """A corpus's `paragraphs` as a stored body: the section break every body opens with, then one
-    `paragraph` per entry. A heading's `headingId` is drawn here, once, so it stays put as the
-    document around it changes."""
+    `paragraph` per entry. A heading's `headingId` is drawn here, once."""
     content = [_section_break()]
     for i, p in enumerate(paragraphs):
         style = p.get("style") or "NORMAL_TEXT"
@@ -126,9 +129,11 @@ def from_paragraphs(file_id: str, paragraphs: list[dict]) -> list[dict]:
 
 
 def from_text(text: str) -> list[dict]:
-    """A document that states no structure: one unstyled paragraph per line of its text."""
+    """A document that states no structure: one unstyled paragraph per line of its text, without
+    the characters real strips."""
     return [_section_break()] + [
-        _paragraph([(line, {})], {}, "NORMAL_TEXT", None) for line in text.split("\n")
+        _paragraph([(STRIPPED.sub("", line), {})], {}, "NORMAL_TEXT", None)
+        for line in text.split("\n")
     ]
 
 
