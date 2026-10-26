@@ -5915,6 +5915,7 @@ _LINEAR_HTTP = [
         "text/html",
         _CLOUDFLARE_PAGE % ((b"405 Not Allowed",) * 2),
         id="TRACE",
+        answered={"connection": "close"},
     ),
     http_row(
         "CONNECT",
@@ -5926,6 +5927,7 @@ _LINEAR_HTTP = [
         "text/plain; charset=UTF-8",
         b"error code: 1045\n",
         id="CONNECT",
+        answered={"connection": None},
     ),
     http_row(
         "PURGE",
@@ -5937,6 +5939,7 @@ _LINEAR_HTTP = [
         "text/html; charset=UTF-8",
         _CLOUDFLARE_PAGE % ((b"400 Bad Request",) * 2),
         id="PURGE",
+        answered={"connection": None},
     ),
     http_row(
         "TRACE",
@@ -5948,6 +5951,7 @@ _LINEAR_HTTP = [
         "text/html",
         _CLOUDFLARE_PAGE % ((b"400 Bad Request",) * 2),
         id="TRACE, Authorization twice",
+        answered={"connection": "close"},
     ),
     *(
         http_row(m, "", (*_J, *_P), None, "key", 501, None, b"", id=m)

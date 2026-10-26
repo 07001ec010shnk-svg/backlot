@@ -1227,14 +1227,15 @@ async def warn_slack_post_charset(request: Request, call_next):
 #: Cloudflare's answer to each method it refuses in front of Linear and Fireflies, as
 #: api.linear.app and api.fireflies.ai answered each on `/graphql`, `/graphql/`, `/nosuch` and `/`
 #: on 2026-10-25 (UTC): a page with CRLF line ends, or a line of text, and the headers it puts on
-#: it.
+#: it. Both closed the connection after the `TRACE` answer and answered a second request on it after
+#: the other two (`/graphql`, 2026-10-26).
 _CLOUDFLARE_METHOD = {
     "TRACE": (
         405,
         b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n"
         b"<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>cloudflare</center>\r\n"
         b"</body>\r\n</html>\r\n",
-        {"content-type": "text/html"},
+        {"content-type": "text/html", "connection": "close"},
     ),
     "CONNECT": (
         400,

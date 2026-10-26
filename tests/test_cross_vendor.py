@@ -401,10 +401,10 @@ _PAGE = (
     b"<html>\r\n<head><title>%s</title></head>\r\n<body>\r\n<center><h1>%s</h1></center>\r\n"
     b"<hr><center>cloudflare</center>\r\n</body>\r\n</html>\r\n"
 )
-_NOT_ALLOWED = (405, "text/html", _PAGE % ((b"405 Not Allowed",) * 2))
-_ERROR_1045 = (400, "text/plain; charset=UTF-8", b"error code: 1045\n")
-_PURGED = (400, "text/html; charset=UTF-8", _PAGE % ((b"400 Bad Request",) * 2))
-_TWICE = (400, "text/html", _PAGE % ((b"400 Bad Request",) * 2))
+_NOT_ALLOWED = (405, "text/html", "close", _PAGE % ((b"405 Not Allowed",) * 2))
+_ERROR_1045 = (400, "text/plain; charset=UTF-8", None, b"error code: 1045\n")
+_PURGED = (400, "text/html; charset=UTF-8", None, _PAGE % ((b"400 Bad Request",) * 2))
+_TWICE = (400, "text/html", "close", _PAGE % ((b"400 Bad Request",) * 2))
 _CLOUDFLARE_METHODS = [
     *(
         pytest.param(m, path, 1, answer, id=f"{m} {path or '/'}")
@@ -430,7 +430,8 @@ def test_cloudflare_refuses_trace_connect_and_purge(
     if answer is None:
         assert b"cloudflare" not in r.content and r.status_code == 404
         return
-    assert (r.status_code, r.headers["content-type"], r.content) == answer
+    got = (r.status_code, r.headers["content-type"], r.headers.get("connection"), r.content)
+    assert got == answer
 
 
 @pytest.mark.parametrize(

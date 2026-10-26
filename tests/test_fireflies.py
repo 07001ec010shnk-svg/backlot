@@ -1394,6 +1394,7 @@ _FIREFLIES_HTTP = [
         "text/html",
         _CLOUDFLARE_PAGE % ((b"405 Not Allowed",) * 2),
         id="TRACE",
+        answered={"connection": "close"},
     ),
     http_row(
         "CONNECT",
@@ -1405,6 +1406,7 @@ _FIREFLIES_HTTP = [
         "text/plain; charset=UTF-8",
         b"error code: 1045\n",
         id="CONNECT",
+        answered={"connection": None},
     ),
     http_row(
         "PURGE",
@@ -1416,6 +1418,7 @@ _FIREFLIES_HTTP = [
         "text/html; charset=UTF-8",
         _CLOUDFLARE_PAGE % ((b"400 Bad Request",) * 2),
         id="PURGE",
+        answered={"connection": None},
     ),
     http_row(
         "TRACE",
@@ -1427,6 +1430,7 @@ _FIREFLIES_HTTP = [
         "text/html",
         _CLOUDFLARE_PAGE % ((b"400 Bad Request",) * 2),
         id="TRACE, Authorization twice",
+        answered={"connection": "close"},
     ),
     # `@fastify/cors`, whatever the credential and the body.
     *(
