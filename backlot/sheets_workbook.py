@@ -12,6 +12,8 @@ Measured against the live Sheets v4 API on 2026-10-26 unless a docstring says ot
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 from typing import NamedTuple
 
 from backlot import synth
@@ -21,19 +23,25 @@ from backlot import synth
 GRID_ROWS = 1000
 GRID_COLS = 26
 
-# A new workbook's settings. `locale` and `timeZone` are what Backlot serves for every
-# spreadsheet a corpus states; a workbook created through the API may state its own.
+# A new workbook's settings, which a workbook with none stated takes (`store`'s
+# `gdrive_spreadsheets`). Measured: `ON_CHANGE` and `Etc/GMT` are what a freshly created spreadsheet
+# answered with.
 DEFAULT_PROPERTIES = {"locale": "en_US", "autoRecalc": "ON_CHANGE", "timeZone": "Etc/GMT"}
 
-# What a sheet is called when nothing names it, and what a copy is called, by the locale of the
-# spreadsheet it lands in. Measured on `en_US` and `ko_KR` workbooks; any other locale takes the
-# English words, which no measurement has contradicted or confirmed.
-_SHEET_WORD = {"ko_KR": "시트"}
-_COPY_OF = {"ko_KR": "{title}의 사본"}
+# Every locale a spreadsheet accepts, each with what a sheet is called when nothing names it
+# (`{n}` its number) and what a copy is called (`{title}` the source's), in the language of the
+# spreadsheet it lands in. Measured 2026-10-26 by setting each spelling Python's `locale_alias`
+# knows on one spreadsheet, adding an unnamed sheet and copying one: a spelling is matched exactly,
+# so `en_us`, `ko-KR` and `es_419` are refused, and `iw_IL` is accepted where `he_IL` is not.
+LOCALES: dict[str, tuple[str, str]] = {
+    locale: tuple(words)
+    for locale, words in json.loads(
+        (Path(__file__).parent / "data" / "sheets_locales.json").read_text(encoding="utf-8")
+    ).items()
+}
 
 # The `SheetProperties` and `GridProperties` fields a sheet keeps, in proto field order, which is
-# the order real serves them in: `gridProperties`, then `hidden`, `tabColor`, `rightToLeft`,
-# `tabColorStyle`.
+# the order real serves them in.
 SHEET_FIELDS = ("gridProperties", "hidden", "tabColor", "rightToLeft", "tabColorStyle")
 GRID_FIELDS = (
     "rowCount",
@@ -48,7 +56,7 @@ GRID_FIELDS = (
 
 class Sheet(NamedTuple):
     """One sheet. ``properties`` is what a write stated past the id, title and index -- empty for
-    a sheet a corpus stated, whose grid then decides its size."""
+    a sheet a corpus stated, which is 1000 x 26 unless its grid is larger."""
 
     sheet_id: int
     index: int
@@ -114,19 +122,20 @@ class Workbook:
         return any(s.title.casefold() == fold for s in self.sheets)
 
     def default_title(self) -> str:
-        """The first `Sheet<n>` (in the workbook's language) no sheet has. Measured: the first
-        sheet of a new workbook is `Sheet1` under `en_US` and `시트1` under `ko_KR`."""
-        word = _SHEET_WORD.get(self.locale, "Sheet")
+        """The first `Sheet<n>` in the workbook's language (:data:`LOCALES`) no sheet has.
+        Measured: the first sheet of a new workbook is `Sheet1` under `en_US`, `시트1` under
+        `ko_KR`, `Hoja 1` under `es`."""
+        word = LOCALES[self.locale][0]
         n = 1
-        while self.title_taken(f"{word}{n}"):
+        while self.title_taken(word.format(n=n)):
             n += 1
-        return f"{word}{n}"
+        return word.format(n=n)
 
     def copy_title(self, title: str) -> str:
         """What a copy of a sheet titled ``title`` is called here. Measured: `Copy of Other` in an
         `en_US` workbook, then `Copy of Other 1`, `Copy of Other 2`; `Other의 사본` and `Other의 사본
         1` in a `ko_KR` one -- the destination's language, not the source's."""
-        base = _COPY_OF.get(self.locale, "Copy of {title}").format(title=title)
+        base = LOCALES[self.locale][1].format(title=title)
         if not self.title_taken(base):
             return base
         n = 1

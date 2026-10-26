@@ -12,6 +12,7 @@ text keeps a later read honest about what was written.
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -52,22 +53,32 @@ def _truncate15(text: str) -> Decimal:
 
 
 def _number(text: str):
-    """``(value, number_format)`` for a numeric spelling, or None."""
-    s, neg, cur, cur_after, pct = text, False, None, False, False
+    """``(value, number_format)`` for a numeric spelling, or None.
+
+    One negation at most -- parentheses or a minus, before or after a leading currency (`($5)`,
+    `$(5)`, `-$5`, `$-5`); two are text (`-(5)`, `(-5)`, `$(-5)`, `-$(5)`). A currency trails a
+    percent sign but does not precede one (`5%$` reads, `5$%` is text), and a percent sign may lead
+    (`%5`). All measured."""
+    s, negations, cur, cur_after, pct = text, 0, None, False, False
     if s[:1] == "(" and s[-1:] == ")":
-        s, neg = s[1:-1].strip(_SPACE), True
-    if s[:1] == "-":
-        s, neg = s[1:].lstrip(" "), not neg
+        s, negations = s[1:-1].strip(_SPACE), 1
+    elif s[:1] == "-":
+        s, negations = s[1:].lstrip(" "), 1
     if s and s[0] in _CURRENCIES:
         cur, s = s[0], s[1:].lstrip(" ")
-        if s[:1] == "-" and not neg:
-            s, neg = s[1:], True
-        if s[:1] == "(" and s[-1:] == ")":
-            s, neg = s[1:-1], not neg
-    if s[-1:] == "%":
-        s, pct = s[:-1], True
+        if s[:1] == "-":
+            s, negations = s[1:], negations + 1
+        elif s[:1] == "(" and s[-1:] == ")":
+            s, negations = s[1:-1], negations + 1
+    elif s[:1] == "%":
+        s, pct = s[1:], True
     if cur is None and s and s[-1] in _CURRENCIES:
         cur, cur_after, s = s[-1], True, s[:-1].rstrip(" ")
+    if not pct and s[-1:] == "%":
+        s, pct = s[:-1], True
+    if negations > 1:
+        return None
+    neg = negations == 1
     m = _DIGITS.match(s)
     if not s or m is None or not re.search(r"[0-9]", (m["int"] or "") + (m["frac"] or "")):
         return None
@@ -81,8 +92,8 @@ def _number(text: str):
         d = _truncate15((digits or "0") + (frac if frac != "." else "") + (exp or ""))
     except InvalidOperation:
         return None
-    if exp and not Decimal("-1e308") < d < Decimal("1e308"):
-        return None
+    if math.isinf(float(d)):
+        return None  # past a double's range, measured: `1.8e308` is text where `1.7…e308` reads
     if pct:
         d /= 100
     if neg:
@@ -126,11 +137,24 @@ def _year(text: str, today: date) -> tuple[int, str]:
     return y, ("yy" if len(text) == 2 else "yyyy")
 
 
+# The latest year a typed date reaches, measured: `1/1/99999` reads, `1/1/100000` is text.
+_MAX_YEAR = 99999
+
+
 def _serial(y: int, m: int, d: int):
-    try:
-        return date(y, m, d).toordinal() - sheets_format._EPOCH_DAYS
-    except ValueError:
+    """The serial number of a calendar date, or None for one that does not exist. Computed rather
+    than taken from :mod:`datetime`, whose years stop at 9999 where a typed date's do not."""
+    if not (1 <= m <= 12 and 1 <= y <= _MAX_YEAR):
         return None
+    leap = y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+    if not 1 <= d <= (31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)[m - 1]:
+        return None
+    # days from 0001-01-01, the inverse of `sheets_format._civil`
+    yy, mm = (y - 1, m + 9) if m <= 2 else (y, m - 3)
+    era = yy // 400
+    doy = (153 * mm + 2) // 5 + d - 1
+    doe = (yy - era * 400) * 365 + (yy - era * 400) // 4 - (yy - era * 400) // 100 + doy
+    return era * 146097 + doe - 719468 + 719163 - sheets_format._EPOCH_DAYS
 
 
 _NUMERIC_DATE = re.compile(r"(\d+)([/-])(\d+)(?:\2(\d+))?\Z", re.ASCII)
@@ -185,48 +209,78 @@ _WEEKDAYS = {w.casefold() for w in sheets_format.WEEKDAYS}
 _WORDY = re.compile(r"[A-Za-z]+\.?|\d+|[ ,\-]+", re.ASCII)
 
 
+# The parts a month-name date may have, by the order of month (M) and numbers (N), each to the
+# roles its numbers play given the first: a day (D) or a year (Y).
+_WORDY_SHAPES = {
+    "MN": lambda first: "Y" if len(first) == 4 else "D",
+    "MNN": lambda first: "DY",
+    "NM": lambda first: "Y" if len(first) == 4 else "D",
+    "NMN": lambda first: "YD" if len(first) == 4 else "DY",
+}
+
+
 def _wordy_date(s: str, today: date):
     """A date with a month name — `Jan 15, 2024`, `15 Jan 2024`, `January 2024`, `Jan15`,
     `2024 Jan 15`, `Mon Jan 15 2024` — as ``(serial, pattern)`` or None.
 
     The pattern is the input with each part replaced by its token and every separator kept as
-    typed: `Jan. 15, 2024` is `mmm. d, yyyy` and `Jan 15,2024` is `mmm d,yyyy`."""
+    typed: `Jan. 15, 2024` is `mmm. d, yyyy` and `Jan 15,2024` is `mmm d,yyyy`.
+
+    Measured, the orders that read are month-day-year, month-year, day-month-year, year-month-day
+    and year-month, a year after a day being two or four digits and any other year four; a day is
+    one or two digits up to 31. Anything else is text: `Jan 32`, `Jan 99`, `Jan 100`,
+    `Jan 2024 15`, `15 2024 Jan`."""
     parts = _WORDY.findall(s)
     if "".join(parts) != s:
         return None
-    month = day = year = None
-    pattern = []
+    kinds, pattern, numbers = [], [], []
+    month = None
     for p in parts:
         if p[0].isalpha():
             word, dot = (p[:-1], ".") if p.endswith(".") else (p, "")
             got = _month(word)
             if got is not None and month is None:
                 month = got[0]
+                kinds.append("M")
                 pattern.append(got[1] + dot)
             elif not pattern and not dot and word.casefold() in _WEEKDAYS:
                 pattern.append("ddd")
             else:
                 return None
         elif p[0].isdigit():
-            if len(p) >= 3 and year is None:
-                year = _year(p, today)
-                pattern.append(year[1])
-            elif day is None and int(p) <= 31 and (month is not None or year is None):
-                day = p
-                pattern.append("dd" if p.startswith("0") else "d")
-            elif year is None:
-                year = _year(p, today)
-                pattern.append(year[1])
-            else:
-                return None
+            kinds.append("N")
+            numbers.append(p)
+            pattern.append(p)  # replaced by its token below
         else:
             pattern.append(p)
-    if month is None or (day is None and year is None):
+    shape = "".join(kinds)
+    if month is None or shape not in _WORDY_SHAPES:
         return None
-    serial = _serial(year[0] if year else today.year, month, int(day) if day else 1)
+    roles = _WORDY_SHAPES[shape](numbers[0])
+    day = year = None
+    tokens = []
+    for role, text in zip(roles, numbers):
+        if role == "D":
+            if len(text) > 2 or not 1 <= int(text) <= 31:
+                return None
+            day = int(text)
+            tokens.append("dd" if text.startswith("0") else "d")
+        else:
+            if len(text) not in ((2, 4) if roles == "DY" else (4,)):
+                return None
+            year = _year(text, today)
+            tokens.append(year[1])
+    out, k = [], 0
+    for piece in pattern:
+        if piece and piece[0].isdigit():
+            out.append(tokens[k])
+            k += 1
+        else:
+            out.append(piece)
+    serial = _serial(year[0] if year else today.year, month, day or 1)
     if serial is None:
         return None
-    return serial, "".join(pattern)
+    return serial, "".join(out)
 
 
 _TIME = re.compile(
@@ -282,7 +336,9 @@ def _date_or_time(s: str, today: date):
     for i in splits:
         d = _numeric_date(s[:i], today) or _wordy_date(s[:i], today)
         t = _time(s[i + 1 :])
-        if d is not None and t is not None and "[h]" not in t[1]:
+        if d is not None and t is not None:
+            # A duration after a date adds to it, and keeps its `[h]`: measured, `1/15/2024 25:00`
+            # is 1/16 01:00 as `m/d/yyyy [h]:mm:ss`, shown with the hours since the epoch.
             return float(d[0] + t[0]), _nf("DATE_TIME", f"{d[1]} {t[1]}")
     return None
 

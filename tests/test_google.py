@@ -9594,8 +9594,7 @@ def _nf(type_, pattern):
         (True, "TRUE"),
         (False, "FALSE"),
         (None, ""),
-        # General (`sheets_format.general`): ten significant digits, half away from zero on the
-        # decimal spelling, `0` under 1e-10, and scientific from where log10 reaches 15
+        # General (`sheets_format.general`)
         (0.30000000000000004, "0.3"),
         (1 / 3, "0.3333333333"),
         (12345678902.5, "12345678903"),
@@ -13215,8 +13214,8 @@ def test_updated_data_reads_back_the_request_range_not_the_updated_one(wc, wh, w
 
 
 def test_a_prose_spreadsheet_takes_a_write_as_the_grid_it_reads_as(wc, wh, write_settings):
-    """A prose spreadsheet reads as one sheet of its lines, so a write lands in that grid: real has
-    no spreadsheet that refuses one. Once written it is a grid, and exports as one."""
+    """`_workbook`'s line-per-cell sheet is the grid a write lands in, and once written the file
+    exports as that grid."""
     from tests._helpers import served_id
 
     sid = served_id("google_drive", "wr-prose")
@@ -13274,6 +13273,18 @@ def test_a_batch_update_writes_every_entry_or_none(wc, wh, wbook):
         "Other!A5",
     ]
     assert _read_back(wc, h, wbook, "Data!A8:C8") == [["one", "two", "two"]]
+    # what the body leaves unset is read from the query
+    r = wc.post(
+        path,
+        headers=h,
+        params={
+            **_ENTERED,
+            "includeValuesInResponse": "true",
+            "responseValueRenderOption": "UNFORMATTED_VALUE",
+        },
+        json={"data": [{"range": "Data!A9", "values": [["50%"]]}]},
+    )
+    assert r.json()["responses"][0]["updatedData"]["values"] == [[0.5]]
     r = wc.post(path, headers=h, json={"valueInputOption": "RAW", "data": [{"values": [["x"]]}]})
     assert r.json()["error"]["message"] == (
         "Invalid data[0]: ValueRange.range is required but not specified"
@@ -13638,11 +13649,38 @@ def test_a_created_spreadsheet_keeps_what_its_sheets_state(wc, wh):
             "Invalid sheets[0]: You can't delete all the rows on the sheet.",
         ),
         ({"spreadsheetId": "abc"}, "Invalid spreadsheet.spreadsheetId: The id is invalid."),
+        # two refusals at once: real names the one it checks first
+        (
+            {"spreadsheetId": "abc", "properties": {"locale": "xx_YY"}},
+            "Invalid properties: Unsupported locale: xx_YY",
+        ),
+        (
+            {"sheets": [{"properties": {"title": "x" * 101, "sheetId": -1}}]},
+            "Invalid sheets[0]: Sheet id must be non-negative.",
+        ),
+        (
+            {
+                "sheets": [
+                    {"properties": {"title": "a", "sheetId": 7}},
+                    {"properties": {"title": "A", "sheetId": 7}},
+                ]
+            },
+            "Invalid sheets[1].id: Duplicate ids are not allowed. Multiple sheets are assigned to id 7",
+        ),
+        (
+            {"sheets": [{"properties": {"gridProperties": {"rowCount": -1, "columnCount": -1}}}]},
+            "Invalid sheets[0]: You can't delete all the rows on the sheet.",
+        ),
+        (
+            {"sheets": [{"properties": {"index": 3, "hidden": True}}]},
+            "Invalid sheets[0]: You can't hide all the sheets in a document.",
+        ),
         (
             {"bogus": 1},
             "Invalid JSON payload received. Unknown name \"bogus\" at 'spreadsheet': Cannot find field.",
         ),
         ({"properties": {"locale": "xx_YY"}}, "Invalid properties: Unsupported locale: xx_YY"),
+        ({"properties": {"locale": "en_us"}}, "Invalid properties: Unsupported locale: en_us"),
         (
             {"sheets": [{"properties": {"title": "o", "sheetType": "OBJECT"}}]},
             "Object sheets must have exactly one embedded object",
@@ -13695,8 +13733,11 @@ def test_a_create_real_refuses_is_refused_with_reals_message(wc, wh, body, messa
 
 def test_copy_to_adds_a_copy_named_in_the_destinations_language(wc, wh, wbook):
     """Measured: the copy goes last with an id of its own, its source's properties and cells, and
-    a title in the destination's language -- `Copy of Data`, then `Copy of Data 1`. Reading the
+    a title in the destination's language -- `Copy of Data`, then `Copy of Data 1`; an unnamed
+    sheet is named in it too, `Hoja 1` under `es`. Reading the
     source is enough; the destination has to be the caller's to write."""
+    from tests._helpers import served_id
+
     h = wh[_OWNER]
     dest = _create(wc, h, {"properties": {"title": "Dest"}})["spreadsheetId"]
     korean = _create(wc, h, {"properties": {"locale": "ko_KR"}})["spreadsheetId"]
@@ -13709,8 +13750,18 @@ def test_copy_to_adds_a_copy_named_in_the_destinations_language(wc, wh, wbook):
     assert _read_back(wc, h, path, "'Copy of Data'!A1:B2") == [["region", "deals"], ["EMEA", "12"]]
     ko = wc.post(copy, headers=h, json={"destinationSpreadsheetId": korean}).json()
     assert ko["title"] == "Data의 사본"
+    spanish = _create(wc, h, {"properties": {"locale": "es"}})
+    assert spanish["sheets"][0]["properties"]["title"] == "Hoja 1"
+    es = {"destinationSpreadsheetId": spanish["spreadsheetId"]}
+    assert wc.post(copy, headers=h, json=es).json()["title"] == "Copia de Data"
     reader = wh["reader@acme.com"]
     assert wc.post(copy, headers=reader, json={"destinationSpreadsheetId": dest}).status_code == 403
+    assert (
+        wc.post(copy, headers=wh["admin"], json={"destinationSpreadsheetId": dest}).status_code
+        == 403
+    )
+    unseen = f"/sheets/v4/spreadsheets/{served_id('google_drive', 'wr-private')}/sheets/0:copyTo"
+    assert wc.post(unseen, headers=h, json={"destinationSpreadsheetId": dest}).status_code == 403
     for body, message in [
         ({}, "Invalid destinationSpreadsheetId []"),
         ({"destinationSpreadsheetId": "1nope"}, "Invalid destinationSpreadsheetId [1nope]"),
@@ -13760,6 +13811,13 @@ def test_a_data_filter_write_is_bounded_by_what_the_filter_matches(wc, wh, wbook
         "Invalid dataFilterValueRange[0]: dataFilterValueRange.dataFilter matched range Data!$A$7 "
         "whose rows cannot fit the data described in data.values[0]."
     )
+    r = wc.post(
+        path,
+        headers=h,
+        params={**_RAW, "includeValuesInResponse": "true"},
+        json={"data": [{"dataFilter": {"a1Range": "Data!A4"}, "values": [["q"]]}]},
+    )
+    assert r.json()["responses"][0]["updatedData"]["values"] == [["q"]]
     r = wc.post(path, headers=h, json={"valueInputOption": "RAW", "data": [{"values": [["x"]]}]})
     assert r.json()["error"]["message"] == (
         "Invalid dataFilterValueRange[0]: dataFilterValueRange.filter is required but not specified."
@@ -13774,8 +13832,7 @@ def test_a_data_filter_write_is_bounded_by_what_the_filter_matches(wc, wh, wbook
 
 
 def test_spreadsheet_url_names_the_caller(wc, wh, wbook):
-    """Measured: `spreadsheetUrl` carries the CALLER's account id as `ouid`, the owner and a
-    reader of one spreadsheet each their own; the admin token is no account."""
+    """`_sheets_url`: the owner and a reader each get their own `ouid`, the admin none."""
     from backlot import synth
 
     for who in (_OWNER, "reader@acme.com"):

@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import re
 from decimal import ROUND_HALF_UP, Decimal
+from typing import NamedTuple
 
 # The serial-number epoch: day 0 is 1899-12-30, so day 60 is 1900-02-28 and day 61 1900-03-01.
 _EPOCH_DAYS = 693594  # date(1899, 12, 30).toordinal()
@@ -23,7 +24,8 @@ MONTHS = (
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 )  # fmt: skip
-WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+WEEKDAYS = tuple(name[:3] for name in WEEKDAY_NAMES)
 
 # The family a number format belongs to, by its `type`. A USER_ENTERED write keeps a cell's format
 # when what it infers is of the same family, so this grouping is what decides inheritance
@@ -37,6 +39,7 @@ FAMILY = {
     "DATE": "date",
     "TIME": "time",
     "DATE_TIME": "date_time",
+    "TEXT": "text",
 }
 
 # The types `dateTimeRenderOption=FORMATTED_STRING` renders as their display string.
@@ -94,30 +97,177 @@ def general(x) -> str:
     return _strip(_fixed(d, max(0, 9 - exp)))
 
 
-# A numeric pattern: an optional quoted currency before or after a body.
-_NUMERIC = re.compile(
-    r'(?:"(?P<pre>[^"]+)")?(?P<body>#,##0(?:\.00)?|0(?:\.00)?%|0\.00E\+00)(?:"(?P<suf>[^"]+)")?\Z'
-)
+def _sections(pattern: str) -> list[str]:
+    """A pattern's `;`-separated sections, a `;` inside quotes or after a backslash kept."""
+    out, cur, quoted, escaped = [], "", False, False
+    for ch in pattern:
+        if escaped:
+            cur, escaped = cur + ch, False
+        elif ch == "\\":
+            cur, escaped = cur + ch, True
+        elif ch == '"':
+            cur, quoted = cur + ch, not quoted
+        elif ch == ";" and not quoted:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    return [*out, cur]
 
 
-def _numeric(x, m: re.Match) -> str:
-    body, pre, suf = m["body"], m["pre"] or "", m["suf"] or ""
+class _Numeric(NamedTuple):
+    prefix: str
+    suffix: str
+    int_zeros: int  # `0`s before the decimal point: digits always shown
+    grouping: bool
+    scale: int  # trailing commas, each dividing by 1000
+    frac_zeros: int  # `0`s after the point: decimals always shown
+    frac_optional: int  # `#`/`?` after the point: shown when not zero
+    point: bool
+    percent: int
+    exp_sign: str | None  # "+" for `E+`, "-" for `E-`, None for no exponent
+    exp_zeros: int
+
+
+def _numeric_section(section: str) -> _Numeric | None:
+    """One section read into its parts, or None for one this cannot display -- a condition
+    (`[>100]`), a literal between digits, a text placeholder."""
+    prefix, suffix, digits_seen, after_digits = [], [], False, False
+    int_zeros = frac_zeros = frac_optional = percent = scale = exp_zeros = 0
+    grouping = point = False
+    exp_sign = None
+    part = "int"
+    i = 0
+    while i < len(section):
+        ch = section[i]
+        literal = None
+        if ch == '"':
+            end = section.find('"', i + 1)
+            literal, i = (
+                section[i + 1 : end if end >= 0 else len(section)],
+                (end if end >= 0 else len(section)),
+            )
+        elif ch == "\\" and i + 1 < len(section):
+            literal, i = section[i + 1], i + 1
+        elif ch == "_" and i + 1 < len(section):
+            literal, i = " ", i + 1
+        elif ch == "*" and i + 1 < len(section):
+            i += 1
+        elif ch == "[":
+            end = section.find("]", i)
+            if end < 0 or not section[i + 1 : end].isalnum():
+                return None  # a condition, not a colour
+            i = end
+        elif ch in "0#?":
+            if after_digits and part != "exp":
+                return None
+            digits_seen = True
+            if part == "int":
+                int_zeros += ch == "0"
+            elif part == "frac":
+                frac_zeros += ch == "0"
+                frac_optional += ch != "0"
+            else:
+                exp_zeros += 1
+        elif ch == "," and digits_seen and part == "int":
+            if i + 1 < len(section) and section[i + 1] in "0#?":
+                grouping = True
+            else:
+                scale += 1
+        elif ch == "." and part == "int" and not point:
+            point, part, digits_seen = True, "frac", True
+        elif ch in "Ee" and i + 1 < len(section) and section[i + 1] in "+-" and digits_seen:
+            exp_sign, part, i = section[i + 1], "exp", i + 1
+        elif ch == "@":
+            return None
+        else:
+            percent += ch == "%"
+            literal = ch
+        if literal is not None:
+            if digits_seen:
+                after_digits = True
+                suffix.append(literal)
+            else:
+                prefix.append(literal)
+        i += 1
+    if not digits_seen:
+        return None
+    return _Numeric(
+        "".join(prefix),
+        "".join(suffix),
+        int_zeros,
+        grouping,
+        scale,
+        frac_zeros,
+        frac_optional,
+        point,
+        percent,
+        exp_sign,
+        exp_zeros,
+    )
+
+
+def _digits(d: Decimal, spec: _Numeric) -> str:
+    """``|d|`` under ``spec``, without its sign."""
+    places = spec.frac_zeros + spec.frac_optional
+    if spec.exp_sign is not None:
+        width = max(spec.int_zeros, 1)
+        if d == 0:
+            mantissa, exp = Decimal(0), 0
+        else:
+            exp = d.adjusted() - (width - 1)
+            mantissa = d.scaleb(-exp).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+            if mantissa >= Decimal(10) ** width:
+                exp += 1
+                mantissa = d.scaleb(-exp).quantize(
+                    Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP
+                )
+        body = _decimal_text(abs(mantissa), spec, places)
+        sign = "-" if exp < 0 else ("+" if spec.exp_sign == "+" else "")
+        return f"{body}E{sign}{abs(exp):0{max(spec.exp_zeros, 1)}d}"
+    return _decimal_text(
+        abs(d).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP), spec, places
+    )
+
+
+def _decimal_text(d: Decimal, spec: _Numeric, places: int) -> str:
+    whole, _, frac = format(d, "f").partition(".")
+    whole = whole.lstrip("0")
+    whole = whole.rjust(spec.int_zeros, "0")
+    if spec.grouping and whole:
+        whole = f"{int(whole):,}".rjust(len(whole), "0") if whole.lstrip("0") else whole
+    frac = frac.ljust(places, "0")[:places]
+    keep = spec.frac_zeros + len(frac[spec.frac_zeros :].rstrip("0"))
+    frac = frac[:keep]
+    return whole + ("." + frac if spec.point and (frac or spec.frac_optional) else "")
+
+
+def _numeric(x, pattern: str) -> str:
+    """A number under a numeric pattern: digit placeholders (`0` always shown, `#` when not zero),
+    grouping, a point, `%`, an exponent (`E+00`), literals around them (quoted, escaped, or a
+    plain `$`), and up to three sections, positive;negative;zero. Measured patterns:
+    `0.0`, `0.000`, `#,##0.0`, `0`, `0.0%`, `0.000E+00`, `0E+0`, `$#,##0`, `#,##0;(#,##0)` and
+    `0.00"kg"` beside the patterns a write infers. A pattern this cannot read displays as General."""
+    sections = _sections(pattern)
     d = _dec(x)
-    if body == "0.00E+00":
-        return _sci(d, 2, strip=False)
-    if body.endswith("%"):
-        d *= 100
-    places = 2 if ".00" in body else 0
-    digits = _fixed(abs(d), places)
-    if body.startswith("#,##0"):
-        whole, _, frac = digits.partition(".")
-        digits = f"{int(whole):,}" + (f".{frac}" if frac else "")
-    sign = "-" if _fixed(d, places).startswith("-") else ""
-    return f"{sign}{pre}{digits}{suf}{'%' if body.endswith('%') else ''}"
+    negative_section = len(sections) > 1 and d < 0
+    if len(sections) > 2 and d == 0:
+        section = sections[2]
+    elif negative_section:
+        section = sections[1]
+    else:
+        section = sections[0]
+    spec = _numeric_section(section)
+    if spec is None:
+        return general(x)
+    d = d * Decimal(100) ** spec.percent / Decimal(1000) ** spec.scale
+    text = _digits(d, spec)
+    shown_negative = d < 0 and not negative_section and any(c in "123456789" for c in text)
+    return f"{'-' if shown_negative else ''}{spec.prefix}{text}{spec.suffix}"
 
 
 # Date and time tokens, longest first so `mmmm` is not read as `mm` twice.
-_TOKEN = re.compile(r"\[h\]|am/pm|yyyy|yy|mmmm|mmm|mm|m|ddd|dd|d|h|ss|s")
+_TOKEN = re.compile(r'"[^"]*"|\[h\]|am/pm|yyyy|yy|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|ss|s', re.I)
 
 
 def _civil(days: int) -> tuple[int, int, int]:
@@ -151,20 +301,25 @@ def _date_time(x, pattern: str) -> str:
     year, month, day = _civil(_EPOCH_DAYS + days)
     hour, rem = divmod(secs, 3600)
     minute, second = divmod(rem, 60)
-    ampm = "am/pm" in pattern
+    ampm = "am/pm" in pattern.lower()
     out, prev = [], None
     pos = 0
     for tok in _TOKEN.finditer(pattern):
         out.append(pattern[pos : tok.start()])
         pos = tok.end()
         t = tok.group()
+        if t.startswith('"'):
+            out.append(t[1:-1])
+            continue
+        t = t.lower()
         if t == "[h]":
             hours, rest = divmod(abs(total), 3600)
             out.append(("-" if total < 0 else "") + str(hours))
             minute, second = divmod(rest, 60)
-        elif t == "h":
-            out.append(str((hour % 12 or 12) if ampm else hour))
-        elif t in ("mm", "m") and prev in ("h", "[h]"):
+        elif t in ("h", "hh"):
+            shown = (hour % 12 or 12) if ampm else hour
+            out.append(f"{shown:02d}" if t == "hh" else str(shown))
+        elif t in ("mm", "m") and prev in ("h", "hh", "[h]"):
             out.append(f"{minute:02d}" if t == "mm" else str(minute))
         elif t in ("ss", "s"):
             out.append(f"{second:02d}" if t == "ss" else str(second))
@@ -182,6 +337,8 @@ def _date_time(x, pattern: str) -> str:
             out.append(f"{month:02d}")
         elif t == "m":
             out.append(str(month))
+        elif t == "dddd":
+            out.append(WEEKDAY_NAMES[(_EPOCH_DAYS + days - 1) % 7])
         elif t == "ddd":
             out.append(WEEKDAYS[(_EPOCH_DAYS + days - 1) % 7])
         elif t == "dd":
@@ -193,12 +350,23 @@ def _date_time(x, pattern: str) -> str:
     return "".join(out)
 
 
+# The pattern a number format that names a type and no pattern displays with. Measured on an
+# `en_US` spreadsheet: CURRENCY as dollars to the cent, DATE, TIME and DATE_TIME as these; NUMBER,
+# SCIENTIFIC and TEXT as General, and PERCENT as General a hundred times over with a `%`.
+_TYPE_PATTERNS = {
+    "CURRENCY": '"$"#,##0.00',
+    "DATE": "m/d/yyyy",
+    "TIME": "h:mm:ss am/pm",
+    "DATE_TIME": "m/d/yyyy h:mm:ss",
+}
+
+
 def render(x, number_format: dict) -> str:
-    """A number's display under one of the number formats a write can give a cell."""
-    pattern = number_format["pattern"]
-    if number_format["type"] in DATE_TIME_TYPES:
+    """A number's display under a number format: its pattern, or its type's when it states none."""
+    kind = number_format["type"]
+    pattern = number_format.get("pattern") or _TYPE_PATTERNS.get(kind)
+    if not pattern:
+        return general(_dec(x) * 100) + "%" if kind == "PERCENT" else general(x)
+    if kind in DATE_TIME_TYPES:
         return _date_time(x, pattern)
-    m = _NUMERIC.match(pattern)
-    if m is None:
-        raise ValueError(f"sheets: no rendering for number format pattern {pattern!r}")
-    return _numeric(x, m)
+    return _numeric(x, pattern)

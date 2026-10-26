@@ -56,7 +56,8 @@ def cell(value, *, error: str | None = None, number_format: dict | None = None) 
 
 
 def cell_value(c: Cell):
-    """A cell's value: a string, a number, a boolean, or None for an empty or error cell."""
+    """A cell's value: a string (`""` for an empty string), a number, a boolean, or None for a
+    cleared, never-written or error cell."""
     return c.get("v") if isinstance(c, dict) else c
 
 

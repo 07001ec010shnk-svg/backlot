@@ -14,7 +14,6 @@ import datetime
 import functools
 import hashlib
 import json
-import locale as pylocale
 import quopri
 import re
 import string
@@ -2696,7 +2695,7 @@ def _drive_q_eval(node, f: dict, me: str | None, fulltext: dict[str, set[str]]) 
         return _drive_q_compare(op, f["created"], value)
     if field == "parents":
         # `root` is the caller's My Drive root by its alias, and so is its id: a file created at
-        # the root carries the id (`_drive_root_parent`), a folder here the alias.
+        # the root carries the id (`synth.drive_root_id`), a folder here the alias.
         roots = _drive_roots(me)
         if value in roots:
             return any(p in roots for p in f["parents"])
@@ -4899,8 +4898,9 @@ def _sheets_format(cell) -> dict:
     """The `effectiveFormat` a cell of this type carries: its `numberFormat` first when it has one,
     and an alignment by what it holds -- an error centred like a boolean, measured 2026-10-26.
 
-    A cell holding a number format and no value carries neither `horizontalAlignment` nor
-    `hyperlinkDisplayType`, measured the same day on a cell whose value was cleared."""
+    A cell with no value and no error (`sheets_grid.CLEARED`, or a cleared cell that kept its
+    number format) carries neither `horizontalAlignment` nor `hyperlinkDisplayType`, measured the
+    same day."""
     nf = sheets_grid.cell_format(cell)
     head = {"numberFormat": nf} if nf else {}
     value = sheets_grid.cell_value(cell)
@@ -4985,11 +4985,6 @@ SHEETS_THEME = {
     ],
 }
 
-# `properties` fields real Sheets always carries beside `title` and `locale`. `ON_CHANGE` is the
-# recalculation setting a spreadsheet has unless someone changes it; `Etc/GMT` is the neutral zone,
-# and matches what a freshly created spreadsheet answered with.
-SHEETS_AUTO_RECALC = sheets_workbook.DEFAULT_PROPERTIES["autoRecalc"]
-SHEETS_TIME_ZONE = sheets_workbook.DEFAULT_PROPERTIES["timeZone"]
 
 _SHEETS_ENUM = "type.googleapis.com/google.apps.sheets.v4"
 
@@ -5368,7 +5363,7 @@ def _sheets_value(cell) -> dict:
 
     An error cell is ``errorValue`` with its type alone: an error typed as a literal (`#N/A`)
     carries no ``message``, measured 2026-10-26. A real cell may also hold ``formulaValue``, which
-    nothing here stores: a written formula is kept as its text."""
+    nothing here stores (`sheets_input`)."""
     if (error := sheets_grid.cell_error(cell)) is not None:
         return {"errorValue": {"type": error}}
     cell = sheets_grid.cell_value(cell)
@@ -5415,7 +5410,7 @@ def _sheets_grid_data(sheet: _Sheet, body: str, spec: str) -> dict:
 
     ``userEnteredValue`` and ``effectiveValue`` are equal here and both absent from an empty cell.
     Measured, they differ on real Sheets only for a FORMULA cell — the formula in the first, its
-    result in the second — and a corpus cannot state a formula, so there is nothing to differ over.
+    result in the second — and a formula is stored as its text, so there is nothing to differ over.
 
     ``rowMetadata``/``columnMetadata`` cover the RANGE, one entry per row and column of it —
     measured, 2 and 2 for ``Data!A1:B2`` against the same sheet whose unscoped block carries 1000
@@ -5472,8 +5467,8 @@ def _sheets_render(cell, render: str, date_time: str = "SERIAL_NUMBER"):
 
     Measured: ``FORMATTED_VALUE`` gives the display string, while ``UNFORMATTED_VALUE`` and
     ``FORMULA`` both give the raw typed value — a JSON number for a number, a JSON boolean for a
-    boolean. The two agree for every NON-FORMULA cell on the real API, and a corpus states no
-    formulas, so they agree here for every cell.
+    boolean. The two agree for every NON-FORMULA cell on the real API, and a formula is stored as
+    its text (`sheets_input`), so they agree here for every cell.
 
     An empty cell is ``""`` under every option, measured — a JSON string even under
     ``UNFORMATTED_VALUE``, never null.
@@ -5569,7 +5564,7 @@ def _workbook(request: Request, spreadsheet_id: str) -> tuple:
 
 def _sheets_settings(conn, spreadsheet_id: str) -> dict:
     """A workbook's stated settings (`locale`, `timeZone`, `autoRecalc`), empty when it states
-    none, which every spreadsheet a corpus holds does (`sheets_workbook.DEFAULT_PROPERTIES`)."""
+    none (`store`'s `gdrive_spreadsheets`)."""
     rows = store.parts_for(
         conn, "google_drive", "gdrive_spreadsheets", (spreadsheet_id,), order_by="file_id"
     )
@@ -6231,9 +6226,8 @@ async def sheets_get_by_data_filter(spreadsheet_id: str, request: Request):
 # request, its refusals, and the counts the answer carries.
 #
 # A write replaces the workbook's sheets in the overlay together with the file's `content` and
-# `updated_ts` (`store.replace_parts`): `content` is the first sheet's CSV, which `files.export`
-# and fullText search read, and `updated_ts` is `modifiedTime`, which real moves to the write's
-# own time. Real's Drive shows both about a minute later; this shows them at once.
+# `updated_ts` (`store.replace_parts`, `store.PATCHABLE`). Real's Drive shows both about a minute
+# later; this shows them at once.
 
 _PJ_INSERT_DATA = _pj_enum("InsertDataOption", "OVERWRITE", "INSERT_ROWS")
 _PJ_VALUE_INPUT = _pj_enum(
@@ -6317,6 +6311,28 @@ def _sheets_write_options(request: Request, *, append: bool = False) -> dict:
         },
     )
     return {name: (values[-1] if values else None) for name, values in parsed.items()}
+
+
+def _sheets_batch_options(query: dict, body: dict) -> tuple[str, bool, dict]:
+    """``(valueInputOption, includeValuesInResponse, render options)`` of a batch write: each field
+    the body leaves unset is taken from the query (`_sheets_write_options`), as real maps a query
+    parameter onto the request."""
+    named = body.get("value_input_option")
+    option = _sheets_input_option(
+        _PJ_VALUE_INPUT.names[named] if named else query["valueInputOption"]
+    )
+    include = bool(body.get("include_values_in_response") or query["includeValuesInResponse"])
+    render = body.get("response_value_render_option")
+    dates = body.get("response_date_time_render_option")
+    opts = {
+        "responseValueRenderOption": _PJ_RENDER.names[render]
+        if render
+        else query["responseValueRenderOption"] or _PJ_RENDER.names[0],
+        "responseDateTimeRenderOption": _PJ_DATETIME.names[dates]
+        if dates
+        else query["responseDateTimeRenderOption"] or _PJ_DATETIME.names[0],
+    }
+    return option, include, opts
 
 
 def _sheets_input_option(name: str | None) -> str:
@@ -6570,28 +6586,17 @@ async def sheets_values_batch_update(spreadsheet_id: str, request: Request):
     entry writes nothing, and its refusal names it -- ``Invalid data[1]: Unable to parse range:
     Nope!A1``, ``Invalid data[0]: ValueRange.range is required but not specified``. Measured.
 
-    The entries are written in order, so where two overlap the later wins. ``valueInputOption``
-    may come in the body or, as real maps a query parameter onto the request, the query; the body
-    is read first. The totals count distinct rows, columns and cells per sheet across the whole
+    The entries are written in order, so where two overlap the later wins. The options may come in
+    the body or the query (`_sheets_batch_options`). The totals count distinct rows, columns and cells per sheet across the whole
     batch (one cell written twice totals 1), and ``totalUpdatedSheets`` every sheet an entry names,
     one that wrote nothing included. With no entries the answer is ``spreadsheetId`` alone."""
     _sheets_alt(request)
     _require(request)
-    query = _typed_query(
-        request,
-        {
-            "valueInputOption": lambda raw: _sheets_enum_value(
-                raw, "value_input_option", _PJ_VALUE_INPUT
-            )
-        },
-    )["valueInputOption"]
+    query = _sheets_write_options(request)
     body = protojson.read(await request.body(), _PJ_BATCH_UPDATE)
     tree, _ = _sheets_mask(request, "sheets.BatchUpdateValuesResponse")
     row, sheets = _sheets_writable(request, spreadsheet_id)
-    named = body.get("value_input_option")
-    option = _sheets_input_option(
-        _PJ_VALUE_INPUT.names[named] if named else (query[-1] if query else None)
-    )
+    option, include, opts = _sheets_batch_options(query, body)
     entries = body.get("data", [])
     writings = []
     for i, entry in enumerate(entries):
@@ -6632,16 +6637,10 @@ async def sheets_values_batch_update(spreadsheet_id: str, request: Request):
         "totalUpdatedSheets": len({w.sheet.index for w, _, _, _ in results}),
     }
     out.update({k: v for k, v in totals.items() if v})
-    opts = {
-        "responseValueRenderOption": _PJ_RENDER.names[body.get("response_value_render_option", 0)],
-        "responseDateTimeRenderOption": _PJ_DATETIME.names[
-            body.get("response_date_time_render_option", 0)
-        ],
-    }
     responses = []
     for w, spec, major, written in results:
         answer = _sheets_update_response(spreadsheet_id, w, written)
-        if body.get("include_values_in_response"):
+        if include:
             answer["updatedData"] = _sheets_updated_data(w, spec, after, major, opts)
         responses.append(answer)
     out["responses"] = responses
@@ -6945,21 +6944,18 @@ _PJ_CREATE = protojson.Message(
 
 def _sheets_cell(cell: dict):
     """A `CellData` a request states, as a stored cell: its `userEnteredValue`, and its
-    `userEnteredFormat.numberFormat` when it is one `sheets_format` can display. A formula is kept
-    as its text, as a written one is (`sheets_input`). An `errorValue` is refused by the caller."""
+    `userEnteredFormat.numberFormat` as stated -- a type with no pattern included, which real keeps
+    that way and displays in the type's default (`sheets_format.render`). A formula is kept as a
+    written one is (`sheets_input`); an `errorValue` is refused by the caller."""
     value = cell.get("user_entered_value") or {}
-    fmt = (cell.get("user_entered_format") or {}).get("number_format")
+    fmt = (cell.get("user_entered_format") or {}).get("number_format") or {}
+    kind = _PJ_ENUM_FIELDS[("sheets.NumberFormat", "type")].names[fmt.get("type", 0)]
     number_format = None
-    if fmt and fmt.get("pattern"):
-        candidate = {
-            "type": _PJ_ENUM_FIELDS[("sheets.NumberFormat", "type")].names[fmt.get("type", 0)],
-            "pattern": fmt["pattern"],
+    if fmt and kind != "NUMBER_FORMAT_TYPE_UNSPECIFIED":
+        number_format = {
+            "type": kind,
+            **({"pattern": fmt["pattern"]} if fmt.get("pattern") else {}),
         }
-        try:
-            sheets_format.render(0, candidate)
-            number_format = candidate
-        except ValueError:
-            pass
     for key in ("string_value", "formula_value"):
         if key in value:
             text = value[key]
@@ -6978,7 +6974,11 @@ def _sheets_cell(cell: dict):
 
 
 def _sheets_stated_sheet(i: int, sheet: dict, book: sheets_workbook.Workbook) -> _Sheet:
-    """One `Sheet` of a create request, checked as real checks it, as the sheet it makes."""
+    """One `Sheet` of a create request, checked as real checks it, as the sheet it makes.
+
+    In real's order, measured 2026-10-26 by sending two refusals at once: the id (negative, then
+    taken) ahead of the title (too long, then taken), and the row count ahead of the column
+    count."""
     where = f"Invalid sheets[{i}]"
     props = sheet.get("properties") or {}
     kind = _PJ_ENUM_FIELDS[("sheets.SheetProperties", "sheetType")].names[
@@ -6987,10 +6987,6 @@ def _sheets_stated_sheet(i: int, sheet: dict, book: sheets_workbook.Workbook) ->
     if kind not in ("SHEET_TYPE_UNSPECIFIED", "GRID"):
         raise gerr.invalid_argument("Object sheets must have exactly one embedded object")
     title = props.get("title") or book.default_title()
-    if len(title) > 100:
-        raise gerr.invalid_argument(f"{where}: {_SHEETS_TITLE_TOO_LONG}")
-    if book.title_taken(title):
-        raise gerr.invalid_argument(f"{where}: {_SHEETS_TITLE_TAKEN.format(title=title)}")
     if "sheet_id" in props:
         if props["sheet_id"] < 0:
             raise gerr.invalid_argument(f"{where}: Sheet id must be non-negative.")
@@ -7002,11 +6998,15 @@ def _sheets_stated_sheet(i: int, sheet: dict, book: sheets_workbook.Workbook) ->
         sheet_id = props["sheet_id"]
     else:
         sheet_id = book.new_sheet_id(title)
+    if len(title) > 100:
+        raise gerr.invalid_argument(f"{where}: {_SHEETS_TITLE_TOO_LONG}")
+    if book.title_taken(title):
+        raise gerr.invalid_argument(f"{where}: {_SHEETS_TITLE_TAKEN.format(title=title)}")
     grid = props.get("grid_properties") or {}
-    if grid.get("column_count", 0) < 0:
-        raise gerr.invalid_argument(f"{where}: {_SHEETS_NO_COLUMNS}")
     if grid.get("row_count", 0) < 0:
         raise gerr.invalid_argument(f"{where}: {_SHEETS_NO_ROWS}")
+    if grid.get("column_count", 0) < 0:
+        raise gerr.invalid_argument(f"{where}: {_SHEETS_NO_COLUMNS}")
     stated: dict = {
         "gridProperties": {
             "rowCount": grid.get("row_count") or sheets_workbook.GRID_ROWS,
@@ -7099,12 +7099,11 @@ async def sheets_create(request: Request):
       (`sheets_workbook.Workbook.default_title`), and titles collide without regard to case;
     * ``rowCount: 0`` is no row count, and the grid is 1000 x 26;
     * ``data`` is stored though the answer carries no grid;
-    * an unsupported ``locale`` is refused, a ``timeZone`` that names no zone is replaced by
+    * a ``locale`` not spelled as one of :data:`sheets_workbook.LOCALES` is refused, a ``timeZone`` that names no zone is replaced by
       `Etc/GMT`;
     * the Drive file's ``parents`` is the caller's root, and its one permission the owner's.
 
-    Named ranges, developer metadata, data sources and every cell format but a number format are
-    read and not kept: nothing here serves them back."""
+    What a request states and this does not keep is listed in `docs/write-overlay.md`."""
     _sheets_alt(request)
     caller = _require(request)
     body = protojson.read(await request.body(), _PJ_CREATE, field="spreadsheet").get(
@@ -7113,15 +7112,13 @@ async def sheets_create(request: Request):
     tree, _ = _sheets_mask(request, "sheets.Spreadsheet")
     if _BATCH_OUTER.get() is not None:
         raise gerr.unimplemented()
-    if body.get("spreadsheet_id"):
-        raise gerr.invalid_argument("Invalid spreadsheet.spreadsheetId: The id is invalid.")
     conn = auth.conn(request)
     owner = _sheets_creator(request, caller)
     file_id = _sheets_new_file_id(conn, owner)
     stated = body.get("properties") or {}
     settings = dict(sheets_workbook.DEFAULT_PROPERTIES)
     if stated.get("locale"):
-        if stated["locale"].lower() not in pylocale.locale_alias:
+        if stated["locale"] not in sheets_workbook.LOCALES:
             raise gerr.invalid_argument(
                 f"Invalid properties: Unsupported locale: {stated['locale']}"
             )
@@ -7132,18 +7129,25 @@ async def sheets_create(request: Request):
         settings["autoRecalc"] = _PJ_ENUM_FIELDS[
             ("sheets.SpreadsheetProperties", "autoRecalc")
         ].names[stated["auto_recalc"]]
+    # measured: the properties are refused ahead of a stated `spreadsheetId`
+    if body.get("spreadsheet_id"):
+        raise gerr.invalid_argument("Invalid spreadsheet.spreadsheetId: The id is invalid.")
     book = sheets_workbook.Workbook(file_id, [], settings)
     requested = body.get("sheets") or []
+    misplaced = False
     for i, sheet in enumerate(requested):
         made = _sheets_stated_sheet(i, sheet, book)
         index = (sheet.get("properties") or {}).get("index")
         if index is not None and index > len(book.sheets):
-            raise gerr.invalid_argument(f"Invalid sheets: {_SHEETS_INDEX_TOO_HIGH}")
+            misplaced, index = True, None
         book.add_sheet(made, index)
     if not requested:
         book.add_sheet(_Sheet(0, 0, book.default_title(), [], {}))
+    # measured: every sheet hidden is refused ahead of an index past the end
     if all(s.properties.get("hidden") for s in book.sheets):
         raise gerr.invalid_argument(f"Invalid sheets[0]: {_SHEETS_ALL_HIDDEN}")
+    if misplaced:
+        raise gerr.invalid_argument(f"Invalid sheets: {_SHEETS_INDEX_TOO_HIGH}")
     title = stated.get("title") or SHEETS_UNTITLED
     now = int(time.time())
     store.insert_document(
@@ -7310,11 +7314,11 @@ async def sheets_values_batch_update_by_data_filter(spreadsheet_id: str, request
     and a refusal names the entry as ``Invalid dataFilterValueRange[<n>]: ``."""
     _sheets_alt(request)
     _require(request)
+    query = _sheets_write_options(request)
     body = protojson.read(await request.body(), _PJ_BATCH_UPDATE_BY_FILTER)
     tree, _ = _sheets_mask(request, "sheets.BatchUpdateValuesByDataFilterResponse")
     row, sheets = _sheets_writable(request, spreadsheet_id)
-    named = body.get("value_input_option")
-    option = _sheets_input_option(_PJ_VALUE_INPUT.names[named] if named else None)
+    option, include, opts = _sheets_batch_options(query, body)
     writings = []
     for i, entry in enumerate(body.get("data", [])):
         where = f"Invalid dataFilterValueRange[{i}]: "
@@ -7356,18 +7360,12 @@ async def sheets_values_batch_update_by_data_filter(spreadsheet_id: str, request
         "totalUpdatedSheets": len({w.sheet.index for w, _, _, _, _ in results}),
     }
     out.update({k: v for k, v in totals.items() if v})
-    opts = {
-        "responseValueRenderOption": _PJ_RENDER.names[body.get("response_value_render_option", 0)],
-        "responseDateTimeRenderOption": _PJ_DATETIME.names[
-            body.get("response_date_time_render_option", 0)
-        ],
-    }
     responses = []
     for w, name, major, entry, done in results:
         answer = _sheets_update_response(spreadsheet_id, w, done)
         del answer["spreadsheetId"]
         answer["dataFilter"] = _sheets_filter_echo(entry["data_filter"])
-        if body.get("include_values_in_response"):
+        if include:
             answer["updatedData"] = _sheets_updated_data(w, name, after, major, opts)
         responses.append(answer)
     out["responses"] = responses

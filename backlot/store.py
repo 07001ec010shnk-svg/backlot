@@ -471,12 +471,14 @@ DROP INDEX IF EXISTS idx_gdrive_served;
 -- per file because it is what a client addresses a sheet by -- two sharing one would leave the
 -- loser unreachable -- and a collision here is a loud import failure instead of a silent shadow.
 --
--- A cell in `grid` is a JSON scalar, so the type a corpus stated survives the round trip and
+-- A cell in `grid` is a JSON scalar as a corpus states it, or after a served write the object
+-- `sheets_grid.Cell` describes, so the type a corpus stated survives the round trip and
 -- `valueRenderOption` has something to distinguish.
+--
 -- `properties` is the sheet's `SheetProperties` past its id, title and index -- its grid size,
--- `hidden`, `tabColor` and the rest -- as JSON, and NULL for a sheet a corpus stated, whose grid
--- then decides its size alone. A served write states it, so a sheet keeps the size a write gave
--- it rather than one derived from how far its cells reach.
+-- `hidden`, `tabColor` and the rest -- as JSON, and NULL for a sheet a corpus stated, whose size
+-- is then `sheets_workbook.Sheet.rows`/`cols`. A served write states it, so a sheet keeps the size
+-- a write gave it rather than one derived from how far its cells reach.
 CREATE TABLE IF NOT EXISTS gdrive_sheets (
     file_id TEXT NOT NULL, sheet_index INTEGER NOT NULL,
     sheet_id INTEGER NOT NULL, title TEXT NOT NULL, grid TEXT NOT NULL, properties TEXT,

@@ -55,8 +55,7 @@ after which it is a grid: real has no spreadsheet that refuses a write.
 
 `USER_ENTERED` reads a typed string the way the Sheets UI does, into a number with a number format
 (`12.5%`, `$1,234.50`, `2024-01-15`, `10:30 PM`), a boolean, an error or text, and a cell keeps or
-replaces its format by the rules real applies, measured input by input. A formula is the exception:
-it is stored as the text typed rather than evaluated.
+replaces its format by the rules real applies, measured input by input.
 
 `spreadsheets.create` makes a new workbook at the caller's My Drive root, owned by the caller and
 shared with nobody: it is listed under `'root' in parents`, and anyone else is refused it as a file

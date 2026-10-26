@@ -8,7 +8,7 @@ baseline records.
 
 `sheets` reads a grid holding each kind of cell a corpus states, a range that starts past the
 first row and column, a second sheet for a grid range to name, and a prose spreadsheet beside it,
-then writes to the grid as its owner.
+then writes to the grid, copies a sheet and creates a workbook, as its owner.
 """
 
 from __future__ import annotations
