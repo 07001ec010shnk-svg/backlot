@@ -1381,7 +1381,8 @@ async def refuse_a_broken_escape_on_linear_and_fireflies(request: Request, call_
     :func:`refuse_cloudflares_methods_on_linear_and_fireflies`. api.linear.app and api.fireflies.ai
     answered so `/a%zz` and `/a%00b` by each method of :data:`_CLOUDFLARE_METHOD`, and `/a%2`,
     `/graphql%zz` and a `%` before `b` by `POST`, on 2026-10-25 (UTC), and passed `?a=%zz`, `?a=%`,
-    `?a=%2` and `?a=%00` after `/graphql` on to the vendor."""
+    `?a=%2` and `?a=%00` after `/graphql` on to the vendor. Both closed the connection after the 400
+    (`POST /graphql%zz`, `POST /a%00b`, `GET /a%2`, 2026-10-26)."""
     return Response(
         request_target.CLOUDFLARE_PAGE,
         status_code=400,
