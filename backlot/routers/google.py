@@ -17,6 +17,7 @@ import json
 import quopri
 import re
 import string
+import time
 import xml.parsers.expat
 from contextvars import ContextVar
 from email.parser import BytesParser
@@ -32,7 +33,16 @@ from pydantic import BaseModel, ConfigDict
 from starlette.datastructures import QueryParams
 from starlette.routing import Match
 
-from backlot import auth, collation, protojson, sheets_grid, store, synth
+from backlot import (
+    auth,
+    collation,
+    protojson,
+    sheets_format,
+    sheets_grid,
+    sheets_input,
+    store,
+    synth,
+)
 from backlot.acl import Caller
 from backlot.config import get_settings
 from backlot.errors import google as gerr
@@ -4692,6 +4702,10 @@ SHEETS_GRID_COLS = 26
 # cell it can describe has anything to put there -- not because the field resists derivation, but
 # because nothing a corpus says would trigger one.
 _CELL_FORMAT_ALIGN = {"str": "LEFT", "num": "RIGHT", "bool": "CENTER"}
+_CELL_FORMAT_BOX = {
+    "backgroundColor": {"red": 1, "green": 1, "blue": 1},
+    "padding": {"top": 2, "right": 3, "bottom": 2, "left": 3},
+}
 _CELL_FORMAT_REST = {
     "verticalAlignment": "BOTTOM",
     "wrapStrategy": "OVERFLOW_CELL",
@@ -4711,19 +4725,24 @@ _CELL_FORMAT_REST = {
 
 
 def _sheets_format(cell) -> dict:
-    """The `effectiveFormat` a cell of this type carries."""
-    if isinstance(cell, bool):
+    """The `effectiveFormat` a cell of this type carries: its `numberFormat` first when it has one,
+    and an alignment by what it holds -- an error centred like a boolean, measured 2026-10-26.
+
+    A cell holding a number format and no value carries neither `horizontalAlignment` nor
+    `hyperlinkDisplayType`, measured the same day on a cell whose value was cleared."""
+    nf = sheets_grid.cell_format(cell)
+    head = {"numberFormat": nf} if nf else {}
+    value = sheets_grid.cell_value(cell)
+    if sheets_grid.cell_error(cell) is None and value is None:
+        rest = {k: v for k, v in _CELL_FORMAT_REST.items() if k != "hyperlinkDisplayType"}
+        return {**head, **_CELL_FORMAT_BOX, **rest}
+    if isinstance(value, bool) or sheets_grid.cell_error(cell) is not None:
         align = _CELL_FORMAT_ALIGN["bool"]
-    elif isinstance(cell, (int, float)):
+    elif isinstance(value, (int, float)):
         align = _CELL_FORMAT_ALIGN["num"]
     else:
         align = _CELL_FORMAT_ALIGN["str"]
-    return {
-        "backgroundColor": {"red": 1, "green": 1, "blue": 1},
-        "padding": {"top": 2, "right": 3, "bottom": 2, "left": 3},
-        "horizontalAlignment": align,
-        **_CELL_FORMAT_REST,
-    }
+    return {**head, **_CELL_FORMAT_BOX, "horizontalAlignment": align, **_CELL_FORMAT_REST}
 
 
 # A track's default size in pixels, carried by every `rowMetadata`/`columnMetadata` entry a
@@ -5176,8 +5195,12 @@ def _sheets_value(cell) -> dict:
     ``bool`` is tested BEFORE the numeric branch because it is a subclass of ``int`` in Python —
     unguarded, TRUE would serve as ``numberValue: 1``.
 
-    A real cell may also hold ``formulaValue`` (in ``userEnteredValue``) or ``errorValue`` (in
-    ``effectiveValue``). A corpus states neither, so neither is emitted."""
+    An error cell is ``errorValue`` with its type alone: an error typed as a literal (`#N/A`)
+    carries no ``message``, measured 2026-10-26. A real cell may also hold ``formulaValue``, which
+    nothing here stores: a written formula is kept as its text."""
+    if (error := sheets_grid.cell_error(cell)) is not None:
+        return {"errorValue": {"type": error}}
+    cell = sheets_grid.cell_value(cell)
     if cell is None or cell == "":
         return {}
     if isinstance(cell, bool):
@@ -5229,7 +5252,7 @@ def _sheets_grid_data(sheet: _Sheet, body: str, spec: str) -> dict:
     the default track sizes; a corpus states no track size, so there is nothing to vary."""
     r0, c0, r1x, c1, block = _sheets_block(sheet, body, spec)
     width = c1 - c0
-    while block and all(sheets_grid.formatted(c) == "" for c in block[-1]):
+    while block and not any(_sheets_cell_data(c) for c in block[-1]):
         block.pop()
     out: dict = {}
     if r0:
@@ -5239,19 +5262,7 @@ def _sheets_grid_data(sheet: _Sheet, body: str, spec: str) -> dict:
     if block:
         row_data = []
         for row in block:
-            vals = [
-                (
-                    {
-                        "userEnteredValue": v,
-                        "effectiveValue": v,
-                        "formattedValue": sheets_grid.formatted(row[i]),
-                        "effectiveFormat": _sheets_format(row[i]),
-                    }
-                    if i < len(row) and (v := _sheets_value(row[i]))
-                    else {}
-                )
-                for i in range(width)
-            ]
+            vals = [_sheets_cell_data(row[i]) if i < len(row) else {} for i in range(width)]
             while vals and not vals[-1]:
                 vals.pop()
             row_data.append({"values": vals} if vals else {})
@@ -5261,7 +5272,31 @@ def _sheets_grid_data(sheet: _Sheet, body: str, spec: str) -> dict:
     return out
 
 
-def _sheets_render(cell, render: str):
+def _sheets_cell_data(cell) -> dict:
+    """One cell's ``CellData``, or ``{}`` for one holding nothing.
+
+    Keys in real's order, measured 2026-10-26: ``userEnteredValue``, ``effectiveValue``,
+    ``formattedValue``, then ``userEnteredFormat`` for a cell given a number format, then
+    ``effectiveFormat``. A cell a write emptied is served with its format keys alone
+    (``sheets_grid.EMPTY_STRING``, ``sheets_grid.CLEARED``)."""
+    v = _sheets_value(cell)
+    nf = sheets_grid.cell_format(cell)
+    if not v and not isinstance(cell, dict):
+        return {}
+    out = {}
+    if v:
+        out = {
+            "userEnteredValue": v,
+            "effectiveValue": v,
+            "formattedValue": sheets_grid.formatted(cell),
+        }
+    if nf:
+        out["userEnteredFormat"] = {"numberFormat": nf}
+    out["effectiveFormat"] = _sheets_format(cell)
+    return out
+
+
+def _sheets_render(cell, render: str, date_time: str = "SERIAL_NUMBER"):
     """One cell as ``values.get`` returns it under ``render``.
 
     Measured: ``FORMATTED_VALUE`` gives the display string, while ``UNFORMATTED_VALUE`` and
@@ -5270,13 +5305,33 @@ def _sheets_render(cell, render: str):
     formulas, so they agree here for every cell.
 
     An empty cell is ``""`` under every option, measured — a JSON string even under
-    ``UNFORMATTED_VALUE``, never null."""
-    if cell is None:
+    ``UNFORMATTED_VALUE``, never null.
+
+    Measured 2026-10-26: an error is its bare code under ``FORMATTED_VALUE`` and ``<code> ()``
+    under the other two when it carries no message, and ``date_time=FORMATTED_STRING`` serves a
+    cell with a DATE, TIME or DATE_TIME format as its display string under every option."""
+    if (error := sheets_grid.cell_error(cell)) is not None:
+        code = sheets_grid.ERROR_CODES[error]
+        return code if render == "FORMATTED_VALUE" else f"{code} ()"
+    value = sheets_grid.cell_value(cell)
+    if value is None:
         return ""
-    return sheets_grid.formatted(cell) if render == "FORMATTED_VALUE" else cell
+    if render == "FORMATTED_VALUE":
+        return sheets_grid.formatted(cell)
+    nf = sheets_grid.cell_format(cell)
+    if (
+        date_time == "FORMATTED_STRING"
+        and nf
+        and nf["type"] in sheets_format.DATE_TIME_TYPES
+        and not isinstance(value, (bool, str))
+    ):
+        return sheets_grid.formatted(cell)
+    return value
 
 
-def _sheets_value_range(spec: str, sheets: list[_Sheet], major: str, render: str) -> dict:
+def _sheets_value_range(
+    spec: str, sheets: list[_Sheet], major: str, render: str, date_time: str = "SERIAL_NUMBER"
+) -> dict:
     """One ``ValueRange``.
 
     Trailing empty cells are dropped PER ROW rather than padded out to the requested bounds, so
@@ -5288,7 +5343,7 @@ def _sheets_value_range(spec: str, sheets: list[_Sheet], major: str, render: str
     an empty list would claim the range exists and is blank."""
     sheet, body = _a1_sheet(spec, sheets)
     r0, c0, r1, c1, raw = _sheets_block(sheet, body, spec)
-    block = [[_sheets_render(c, render) for c in row] for row in raw]
+    block = [[_sheets_render(c, render, date_time) for c in row] for row in raw]
     out = {"range": _a1_name(sheet, r0, c0, r1, c1), "majorDimension": major}
     if major == "COLUMNS":
         width = max((len(r) for r in block), default=0)
@@ -5365,8 +5420,9 @@ def _sheets_enum_value(raw: str, field: str, enum: protojson.Enum) -> str:
         raise gerr.invalid_field_value(field, _a1_enum_error(field, enum, raw)) from None
 
 
-def _sheets_options(request: Request) -> tuple[str, str]:
-    """Validate the read enums and return ``(majorDimension, valueRenderOption)``. Real Sheets 400s
+def _sheets_options(request: Request) -> tuple[str, str, str]:
+    """Validate the read enums and return ``(majorDimension, valueRenderOption,
+    dateTimeRenderOption)``. Real Sheets 400s
     on an unknown value; accepting one silently would hand back ROWS-shaped data to a client that
     asked for columns, and a silently unapplied option is worse than a refusal.
     """
@@ -5382,10 +5438,8 @@ def _sheets_options(request: Request) -> tuple[str, str]:
             "valueRenderOption": lambda raw: _sheets_enum_value(
                 raw, "value_render_option", _PJ_RENDER
             ),
-            # Validated and then unused, deliberately. It selects between a date cell's serial
-            # number and its formatted string, and a corpus states no date cells — every cell is a
-            # string, a number, a boolean or empty — so the two renderings coincide here. Leaving
-            # it unvalidated instead would accept the one thing a client can get wrong about it.
+            # A date, time or date-time cell's serial number or its display string. Only a written
+            # cell can be one: a corpus states no number formats.
             "dateTimeRenderOption": lambda raw: _sheets_enum_value(
                 raw, "date_time_render_option", _PJ_DATETIME
             ),
@@ -5393,7 +5447,8 @@ def _sheets_options(request: Request) -> tuple[str, str]:
     )
     major = (enums["majorDimension"] or ["ROWS"])[-1]
     render = (enums["valueRenderOption"] or ["FORMATTED_VALUE"])[-1]
-    return _sheets_major(major), render
+    date_time = (enums["dateTimeRenderOption"] or ["SERIAL_NUMBER"])[-1]
+    return _sheets_major(major), render, date_time
 
 
 def _sheets_major(name: str) -> str:
@@ -5427,13 +5482,15 @@ async def sheets_values_batch_get(spreadsheet_id: str, request: Request):
     Sheets — unlike the rest of this module's behaviour, it is unverified."""
     _sheets_alt(request)
     _require(request)
-    major, render = _sheets_options(request)
+    major, render, date_time = _sheets_options(request)
     tree, _ = _sheets_mask(request, "sheets.BatchGetValuesResponse")
     _row, sheets = _workbook(request, spreadsheet_id)
     ranges = request.query_params.getlist("ranges")
     body = {"spreadsheetId": spreadsheet_id}
     if ranges:
-        body["valueRanges"] = [_sheets_value_range(r, sheets, major, render) for r in ranges]
+        body["valueRanges"] = [
+            _sheets_value_range(r, sheets, major, render, date_time) for r in ranges
+        ]
     return _sheets_respond(request, body, tree)
 
 
@@ -5445,10 +5502,12 @@ async def sheets_values_get(spreadsheet_id: str, a1_range: str, request: Request
     """One range of a spreadsheet, ACL-enforced through the same lookup as ``spreadsheets.get``."""
     _sheets_alt(request)
     _require(request)
-    major, render = _sheets_options(request)
+    major, render, date_time = _sheets_options(request)
     tree, _ = _sheets_mask(request, "sheets.ValueRange")
     _row, sheets = _workbook(request, spreadsheet_id)
-    return _sheets_respond(request, _sheets_value_range(a1_range, sheets, major, render), tree)
+    return _sheets_respond(
+        request, _sheets_value_range(a1_range, sheets, major, render, date_time), tree
+    )
 
 
 # --- the two reads issued over POST ------------------------------------------------------------
@@ -5875,7 +5934,7 @@ async def sheets_values_batch_get_by_data_filter(spreadsheet_id: str, request: R
     (`_sheets_mask`), then the spreadsheet's lookup, then a `valueRenderOption` number the
     enum does not declare (a 400 of the service's own), then an empty filter list, then the filters
     (:func:`_sheets_selections`), then a `majorDimension` number it does not declare (a 500). A
-    `dateTimeRenderOption` number it does not declare is ignored, as the option is."""
+    `dateTimeRenderOption` number it does not declare reads as `SERIAL_NUMBER`."""
     _sheets_alt(request)
     _require(request)
     body = protojson.read(await request.body(), _PJ_BATCH_GET_BY_FILTER)
@@ -5892,6 +5951,8 @@ async def sheets_values_batch_get_by_data_filter(spreadsheet_id: str, request: R
     if not 0 <= major < len(_PJ_DIMENSION.names):
         raise gerr.internal_error()
     major, render = _sheets_major(_PJ_DIMENSION.names[major]), _PJ_RENDER.names[render]
+    date_time = body.get("date_time_render_option", 0)
+    date_time = _PJ_DATETIME.names[date_time] if 0 <= date_time < 2 else "SERIAL_NUMBER"
 
     # NOT the order the filters arrived in. Measured: the answers come back sorted by where each
     # range starts, column before row — `Data!A2` precedes `Data!B1`, `Data!B9` precedes
@@ -5905,7 +5966,7 @@ async def sheets_values_batch_get_by_data_filter(spreadsheet_id: str, request: R
     def answer(selection) -> dict:
         if isinstance(selection, _Empty):
             return {"range": "#REF!", "majorDimension": major}
-        return _sheets_value_range(selection, sheets, major, render)
+        return _sheets_value_range(selection, sheets, major, render, date_time)
 
     out: dict = {"spreadsheetId": spreadsheet_id}
     # Filters whose answers name the same range share one entry, which lists them in the order
@@ -5965,6 +6026,479 @@ async def sheets_get_by_data_filter(spreadsheet_id: str, request: Request):
     return _sheets_respond(
         request, _sheets_book(spreadsheet_id, row, sheets, specs, grid, view, tree), tree
     )
+
+
+# --- Sheets `values` writes ----------------------------------------------------------------------
+#
+# Measured against the live Sheets v4 API on 2026-10-26, as a Workspace member writing a
+# spreadsheet it owns and as one it was shared with to read. What a written string becomes is
+# `backlot.sheets_input`'s, how a number displays `backlot.sheets_format`'s; this section is the
+# request, its refusals, and the counts the answer carries.
+#
+# A write replaces the workbook's sheets in the overlay together with the file's `content` and
+# `updated_ts` (`store.replace_parts`): `content` is the first sheet's CSV, which `files.export`
+# and fullText search read, and `updated_ts` is `modifiedTime`, which real moves to the write's
+# own time. Real's Drive shows both about a minute later; this shows them at once.
+
+_PJ_VALUE_INPUT = _pj_enum(
+    "ValueInputOption", "INPUT_VALUE_OPTION_UNSPECIFIED", "RAW", "USER_ENTERED"
+)
+_PJ_VALUE_RANGE = protojson.Message(
+    f"{_SHEETS_ENUM}.ValueRange",
+    (
+        protojson.Field("range", "range", "string"),
+        protojson.Field("majorDimension", "major_dimension", "enum", enum=_PJ_DIMENSION),
+        protojson.Field("values", "values", "rows"),
+    ),
+)
+# `values.update` takes its `ValueRange` as the request's `data` field, which every refusal names.
+_PJ_UPDATE = protojson.Message(
+    f"{_SHEETS_ENUM}.UpdateValuesRequest",
+    (protojson.Field("data", "data", "message", message=_PJ_VALUE_RANGE),),
+)
+_PJ_BATCH_UPDATE = protojson.Message(
+    f"{_SHEETS_ENUM}.BatchUpdateValuesRequest",
+    (
+        protojson.Field("valueInputOption", "value_input_option", "enum", enum=_PJ_VALUE_INPUT),
+        protojson.Field("data", "data", "message", message=_PJ_VALUE_RANGE, repeated=True),
+        protojson.Field("includeValuesInResponse", "include_values_in_response", "bool"),
+        protojson.Field(
+            "responseValueRenderOption", "response_value_render_option", "enum", enum=_PJ_RENDER
+        ),
+        protojson.Field(
+            "responseDateTimeRenderOption",
+            "response_date_time_render_option",
+            "enum",
+            enum=_PJ_DATETIME,
+        ),
+    ),
+)
+_PJ_CLEAR = protojson.Message(f"{_SHEETS_ENUM}.ClearValuesRequest", ())
+_PJ_BATCH_CLEAR = protojson.Message(
+    f"{_SHEETS_ENUM}.BatchClearValuesRequest",
+    (protojson.Field("ranges", "ranges", "string", repeated=True),),
+)
+
+_P_SHEETS_UPDATE = [
+    qp("valueInputOption"),
+    qp("includeValuesInResponse", "boolean"),
+    qp("responseValueRenderOption"),
+    qp("responseDateTimeRenderOption"),
+    *_P_SHEETS_STD,
+]
+
+
+def _sheets_write_options(request: Request) -> dict:
+    """The typed query values a write reads, refused as the reads' are (`_typed_query`): a bad one
+    is a 400 ahead of the lookup, measured, so a reader sending `includeValuesInResponse=bogus`
+    gets it rather than its 403. Each by its last repeat, ``None`` when absent."""
+    parsed = _typed_query(
+        request,
+        {
+            "valueInputOption": lambda raw: _sheets_enum_value(
+                raw, "value_input_option", _PJ_VALUE_INPUT
+            ),
+            "includeValuesInResponse": lambda raw: _sheets_bool_value(
+                raw, "include_values_in_response"
+            ),
+            "responseValueRenderOption": lambda raw: _sheets_enum_value(
+                raw, "response_value_render_option", _PJ_RENDER
+            ),
+            "responseDateTimeRenderOption": lambda raw: _sheets_enum_value(
+                raw, "response_date_time_render_option", _PJ_DATETIME
+            ),
+        },
+    )
+    return {name: (values[-1] if values else None) for name, values in parsed.items()}
+
+
+def _sheets_input_option(name: str | None) -> str:
+    """The `valueInputOption` a write runs under. It has no default: absent, and as its zero value
+    by name or number, it is 400 ``'valueInputOption' is required but not specified``, measured."""
+    if name in (None, _PJ_VALUE_INPUT.names[0]):
+        raise gerr.invalid_argument("'valueInputOption' is required but not specified")
+    return name
+
+
+def _sheets_writable(request: Request, spreadsheet_id: str) -> tuple:
+    """``(row, sheets)`` for a spreadsheet the caller may write, or the refusal real gives.
+
+    The lookup is the reads' (`_workbook`): a missing id or a Doc is 404, a file nobody shared with
+    the caller 403. Of the files the caller can read, only its own may be written -- every grant
+    here makes a reader (`_drive_file_capabilities`), and a reader's write is the same 403
+    ``The caller does not have permission``, measured on update, batchUpdate, clear, batchClear and
+    append. Both come ahead of a missing `valueInputOption` and of any check on the range."""
+    row, sheets = _workbook(request, spreadsheet_id)
+    if not _drive_owned_by(row["author_email"], _require(request).email):
+        raise gerr.permission_denied()
+    return row, sheets
+
+
+class _Writing(NamedTuple):
+    """One `ValueRange` resolved against its sheet: where it starts, the bound it may not pass
+    (``None`` for a single cell, which is an anchor the values grow from), and its rows."""
+
+    sheet: _Sheet
+    r0: int
+    c0: int
+    bound: tuple[int, int, int, int] | None
+    rows: list[list]
+
+
+def _sheets_writing(spec: str, sheets: list[_Sheet], values: list, major: str, *, prefix: str = ""):
+    """Resolve one write, refusing it the way real does. ``prefix`` is how a batch names the
+    entry (``Invalid data[1]: ``).
+
+    Measured: a range of one cell is an ANCHOR -- `B2` with two rows of two writes `B2:C3` -- and
+    the grid grows to fit what runs past its edge, while an anchor itself past the edge is the
+    grid-limits 400. Any other range, `A7:A7` included, is a BOUND: a row or column past it is
+    ``Requested writing within range [Data!A7], but tried writing to column [B]``. A cell that is
+    an object or a list is ``Invalid values[<row>][<column>]: <its proto text>``, the row counted
+    from the top of the sheet and the column from the start of the range."""
+    try:
+        sheet, body = _a1_sheet(spec, sheets)
+        classified = _a1_classify(body) if body else None
+        single = classified is not None and len(classified[1]) == 1
+        single = single and classified[1][0].row is not None and classified[1][0].col is not None
+        r0, c0, r1, c1 = _a1_range(spec, body, sheet)
+        if major == "COLUMNS":
+            height = max((len(col) for col in values), default=0)
+            rows = [[col[i] if i < len(col) else None for col in values] for i in range(height)]
+        else:
+            rows = [list(row) for row in values]
+        if not single:
+            name = _a1_name(sheet, r0, c0, r1, c1)
+            for i, row in enumerate(rows):
+                if i >= r1 - r0:
+                    raise gerr.invalid_argument(
+                        f"Requested writing within range [{name}], but tried writing to row "
+                        f"[{r0 + i + 1}]"
+                    )
+                if len(row) > c1 - c0:
+                    raise gerr.invalid_argument(
+                        f"Requested writing within range [{name}], but tried writing to column "
+                        f"[{_a1_col_letters(c1)}]"
+                    )
+        for i, row in enumerate(rows):
+            for j, value in enumerate(row):
+                if isinstance(value, (dict, list)):
+                    raise gerr.invalid_argument(
+                        f"Invalid values[{r0 + i}][{j}]: {protojson.value_debug(value)}"
+                    )
+    except gerr.GoogleError as exc:
+        if not prefix:
+            raise
+        raise gerr.invalid_argument(prefix + exc.message) from None
+    return _Writing(sheet, r0, c0, None if single else (r0, c0, r1, c1), rows)
+
+
+def _sheets_grids(sheets: list[_Sheet]) -> dict[int, list[list]]:
+    """Each sheet's cells as a list a write can change in place, by sheet index."""
+    return {sh.index: [list(row) for row in sh.grid] for sh in sheets}
+
+
+def _sheets_put(grid: list[list], r: int, c: int, cell) -> None:
+    """Set one cell, growing the stored grid to hold it."""
+    while len(grid) <= r:
+        grid.append([])
+    row = grid[r]
+    while len(row) <= c:
+        row.append(None)
+    row[c] = cell
+
+
+def _sheets_apply(writing: _Writing, grids: dict, option: str, today) -> set[tuple[int, int]]:
+    """Write one resolved range into ``grids`` and return the cells it wrote. A JSON null leaves
+    its cell as it was and is not counted; ``""`` is a write, measured."""
+    grid = grids[writing.sheet.index]
+    written = set()
+    for i, row in enumerate(writing.rows):
+        for j, value in enumerate(row):
+            if value is None:
+                continue
+            r, c = writing.r0 + i, writing.c0 + j
+            current = grid[r][c] if r < len(grid) and c < len(grid[r]) else None
+            _sheets_put(grid, r, c, sheets_input.apply(current, value, option, today))
+            written.add((r, c))
+    return written
+
+
+def _sheets_update_response(spreadsheet_id: str, writing: _Writing, written: set) -> dict:
+    """An ``UpdateValuesResponse``. Measured: ``updatedRange`` runs from the range's first cell to
+    the last row and column written (a null at either end trims it, `[[null, "x"]]` at `A1:C1` is
+    `A1:B1`), and the three counts are the distinct rows, columns and cells written. With nothing
+    written it is the first cell alone and the counts are absent."""
+    out = {"spreadsheetId": spreadsheet_id}
+    sheet = writing.sheet
+    if not written:
+        out["updatedRange"] = _a1_name(
+            sheet, writing.r0, writing.c0, writing.r0 + 1, writing.c0 + 1
+        )
+        return out
+    r1 = max(r for r, _ in written) + 1
+    c1 = max(c for _, c in written) + 1
+    out["updatedRange"] = _a1_name(sheet, writing.r0, writing.c0, r1, c1)
+    out["updatedRows"] = len({r for r, _ in written})
+    out["updatedColumns"] = len({c for _, c in written})
+    out["updatedCells"] = len(written)
+    return out
+
+
+def _sheets_reloaded(sheets: list[_Sheet], grids: dict) -> list[_Sheet]:
+    """The sheets as they read after a write, each grid rectangular again
+    (`sheets_grid.normalise_grid`'s invariant) and as tall as the write made it."""
+    out = []
+    for sh in sheets:
+        grid = grids[sh.index]
+        width = max((len(r) for r in grid), default=0)
+        out.append(sh._replace(grid=[r + [None] * (width - len(r)) for r in grid]))
+    return out
+
+
+def _sheets_save(conn, row, sheets: list[_Sheet]) -> None:
+    """Store a written workbook: every sheet, the first one's CSV as the file's `content`, and the
+    write's time as its `updated_ts`."""
+    store.replace_parts(
+        conn,
+        "google_drive",
+        (row["id"],),
+        "gdrive_sheets",
+        [
+            {
+                "sheet_index": sh.index,
+                "sheet_id": sh.sheet_id,
+                "title": sh.title,
+                "grid": json.dumps(sh.grid, sort_keys=True),
+            }
+            for sh in sheets
+        ],
+        {"content": sheets_grid.to_csv(sheets[0].grid), "updated_ts": int(time.time())},
+    )
+
+
+def _sheets_today() -> datetime.date:
+    """The date a typed date without a year falls in: measured, `1/15` stored 2026-01-15 when
+    written in 2026. Taken in the spreadsheet's time zone, which every workbook here serves as
+    GMT (`SHEETS_TIME_ZONE`)."""
+    return datetime.datetime.now(datetime.UTC).date()
+
+
+def _sheets_updated_data(writing: _Writing, spec: str, sheets: list[_Sheet], major: str, opts):
+    """``updatedData``: the REQUEST range read back after the write, under the response render
+    options -- not ``updatedRange``, measured: `[[null, "=1+1"]]` at `A1:D2` answers
+    ``updatedRange`` `A1:B1` beside ``updatedData`` over `A1:D2`, cells the write left alone
+    included."""
+    return _sheets_value_range(
+        spec,
+        sheets,
+        major,
+        opts["responseValueRenderOption"] or "FORMATTED_VALUE",
+        opts["responseDateTimeRenderOption"] or "SERIAL_NUMBER",
+    )
+
+
+@router.put(
+    "/sheets/v4/spreadsheets/{spreadsheet_id}/values/{a1_range:path}",
+    openapi_extra={"parameters": _P_SHEETS_UPDATE},
+)
+async def sheets_values_update(spreadsheet_id: str, a1_range: str, request: Request):
+    """``spreadsheets.values.update``.
+
+    Refused in real's order, measured: the credential, the typed query values, the body, the
+    `fields` mask, the lookup and who may write (`_sheets_writable`), then a missing
+    `valueInputOption`, then a body `range` that is not the URL's, then the range and its values
+    (`_sheets_writing`). The body's `range`, when sent, must be the URL's as typed: `data!a1:b1`
+    and `'Data'!A1:B1` against `Data!A1:B1` are each ``Request range[Data!A1:B1] does not match
+    value's range[data!a1:b1]``. Where a mismatched `range` and an unparseable URL range fall
+    relative to each other was not measured."""
+    _sheets_alt(request)
+    _require(request)
+    opts = _sheets_write_options(request)
+    body = protojson.read(await request.body(), _PJ_UPDATE, field="data").get("data", {})
+    tree, _ = _sheets_mask(request, "sheets.UpdateValuesResponse")
+    row, sheets = _sheets_writable(request, spreadsheet_id)
+    option = _sheets_input_option(opts["valueInputOption"])
+    if "range" in body and body["range"] != a1_range:
+        raise gerr.invalid_argument(
+            f"Request range[{a1_range}] does not match value's range[{body['range']}]"
+        )
+    major = _sheets_major(_PJ_DIMENSION.names[body.get("major_dimension", 0)])
+    writing = _sheets_writing(a1_range, sheets, body.get("values", []), major)
+    grids = _sheets_grids(sheets)
+    written = _sheets_apply(writing, grids, option, _sheets_today())
+    after = _sheets_reloaded(sheets, grids)
+    if written:
+        _sheets_save(auth.conn(request), row, after)
+    out = _sheets_update_response(spreadsheet_id, writing, written)
+    if opts["includeValuesInResponse"]:
+        out["updatedData"] = _sheets_updated_data(writing, a1_range, after, major, opts)
+    return _sheets_respond(request, out, tree)
+
+
+@router.post(
+    "/sheets/v4/spreadsheets/{spreadsheet_id}/values:batchUpdate",
+    openapi_extra={"parameters": _P_SHEETS_STD},
+)
+async def sheets_values_batch_update(spreadsheet_id: str, request: Request):
+    """``spreadsheets.values.batchUpdate``: every entry checked before any is written, so one bad
+    entry writes nothing, and its refusal names it -- ``Invalid data[1]: Unable to parse range:
+    Nope!A1``, ``Invalid data[0]: ValueRange.range is required but not specified``. Measured.
+
+    The entries are written in order, so where two overlap the later wins. ``valueInputOption``
+    may come in the body or, as real maps a query parameter onto the request, the query; the body
+    is read first. The totals count distinct rows, columns and cells per sheet across the whole
+    batch (one cell written twice totals 1), and ``totalUpdatedSheets`` every sheet an entry names,
+    one that wrote nothing included. With no entries the answer is ``spreadsheetId`` alone."""
+    _sheets_alt(request)
+    _require(request)
+    query = _typed_query(
+        request,
+        {
+            "valueInputOption": lambda raw: _sheets_enum_value(
+                raw, "value_input_option", _PJ_VALUE_INPUT
+            )
+        },
+    )["valueInputOption"]
+    body = protojson.read(await request.body(), _PJ_BATCH_UPDATE)
+    tree, _ = _sheets_mask(request, "sheets.BatchUpdateValuesResponse")
+    row, sheets = _sheets_writable(request, spreadsheet_id)
+    named = body.get("value_input_option")
+    option = _sheets_input_option(
+        _PJ_VALUE_INPUT.names[named] if named else (query[-1] if query else None)
+    )
+    entries = body.get("data", [])
+    writings = []
+    for i, entry in enumerate(entries):
+        if not entry.get("range"):
+            raise gerr.invalid_argument(
+                f"Invalid data[{i}]: ValueRange.range is required but not specified"
+            )
+        major = _sheets_major(_PJ_DIMENSION.names[entry.get("major_dimension", 0)])
+        writings.append(
+            (
+                _sheets_writing(
+                    entry["range"],
+                    sheets,
+                    entry.get("values", []),
+                    major,
+                    prefix=f"Invalid data[{i}]: ",
+                ),
+                entry["range"],
+                major,
+            )
+        )
+    out: dict = {"spreadsheetId": spreadsheet_id}
+    if not writings:
+        return _sheets_respond(request, out, tree)
+    grids = _sheets_grids(sheets)
+    today = _sheets_today()
+    results = [
+        (w, spec, major, _sheets_apply(w, grids, option, today)) for w, spec, major in writings
+    ]
+    after = _sheets_reloaded(sheets, grids)
+    every = {(w.sheet.index, r, c) for w, _, _, written in results for r, c in written}
+    if every:
+        _sheets_save(auth.conn(request), row, after)
+    totals = {
+        "totalUpdatedRows": len({(s, r) for s, r, _ in every}),
+        "totalUpdatedColumns": len({(s, c) for s, _, c in every}),
+        "totalUpdatedCells": len(every),
+        "totalUpdatedSheets": len({w.sheet.index for w, _, _, _ in results}),
+    }
+    out.update({k: v for k, v in totals.items() if v})
+    opts = {
+        "responseValueRenderOption": _PJ_RENDER.names[body.get("response_value_render_option", 0)],
+        "responseDateTimeRenderOption": _PJ_DATETIME.names[
+            body.get("response_date_time_render_option", 0)
+        ],
+    }
+    responses = []
+    for w, spec, major, written in results:
+        answer = _sheets_update_response(spreadsheet_id, w, written)
+        if body.get("include_values_in_response"):
+            answer["updatedData"] = _sheets_updated_data(w, spec, after, major, opts)
+        responses.append(answer)
+    out["responses"] = responses
+    return _sheets_respond(request, out, tree)
+
+
+def _sheets_clearing(spec: str, sheets: list[_Sheet], *, prefix: str = ""):
+    """``(sheet, r0, c0, r1, c1)`` a clear covers. Resolved as a read resolves a range -- an end
+    past the grid is cut (`Z1:AC2` clears `Z1:AA2`) and a start past it refused -- measured."""
+    try:
+        sheet, body = _a1_sheet(spec, sheets)
+        return (sheet, *_a1_range(spec, body, sheet))
+    except gerr.GoogleError as exc:
+        if not prefix:
+            raise
+        raise gerr.invalid_argument(prefix + exc.message) from None
+
+
+def _sheets_clear(grids: dict, clearing) -> bool:
+    """Empty the cells a clear covers, keeping each one's number format, as real does (measured:
+    a percent cell cleared and then written a RAW `0.5` displays `50.00%`). Whether anything
+    changed."""
+    sheet, r0, c0, r1, c1 = clearing
+    grid = grids[sheet.index]
+    changed = False
+    for r in range(r0, min(r1, len(grid))):
+        row = grid[r]
+        for c in range(c0, min(c1, len(row))):
+            cell = row[c]
+            if sheets_grid.cell_value(cell) is not None or sheets_grid.cell_error(cell):
+                row[c] = sheets_grid.cell(None, number_format=sheets_grid.cell_format(cell))
+                changed = True
+    return changed
+
+
+@router.post(
+    "/sheets/v4/spreadsheets/{spreadsheet_id}/values/{a1_range:path}:clear",
+    openapi_extra={"parameters": _P_SHEETS_STD},
+)
+async def sheets_values_clear(spreadsheet_id: str, a1_range: str, request: Request):
+    """``spreadsheets.values.clear``: ``{spreadsheetId, clearedRange}``, the range as resolved.
+    Its body is an empty message, so any name in it is ``Unknown name "bogus": Cannot find
+    field.``, with no location, measured."""
+    _sheets_alt(request)
+    _require(request)
+    protojson.read(await request.body(), _PJ_CLEAR)
+    tree, _ = _sheets_mask(request, "sheets.ClearValuesResponse")
+    row, sheets = _sheets_writable(request, spreadsheet_id)
+    clearing = _sheets_clearing(a1_range, sheets)
+    grids = _sheets_grids(sheets)
+    if _sheets_clear(grids, clearing):
+        _sheets_save(auth.conn(request), row, _sheets_reloaded(sheets, grids))
+    sheet, r0, c0, r1, c1 = clearing
+    out = {"spreadsheetId": spreadsheet_id, "clearedRange": _a1_name(sheet, r0, c0, r1, c1)}
+    return _sheets_respond(request, out, tree)
+
+
+@router.post(
+    "/sheets/v4/spreadsheets/{spreadsheet_id}/values:batchClear",
+    openapi_extra={"parameters": _P_SHEETS_STD},
+)
+async def sheets_values_batch_clear(spreadsheet_id: str, request: Request):
+    """``spreadsheets.values.batchClear``: ``clearedRanges`` in the order sent, each as resolved,
+    and nothing cleared when one range is refused -- ``Invalid range[1]: Unable to parse range:
+    Nope!A1``. With no ranges the answer is ``spreadsheetId`` alone. Measured."""
+    _sheets_alt(request)
+    _require(request)
+    body = protojson.read(await request.body(), _PJ_BATCH_CLEAR)
+    tree, _ = _sheets_mask(request, "sheets.BatchClearValuesResponse")
+    row, sheets = _sheets_writable(request, spreadsheet_id)
+    clearings = [
+        _sheets_clearing(spec, sheets, prefix=f"Invalid range[{i}]: ")
+        for i, spec in enumerate(body.get("ranges", []))
+    ]
+    out: dict = {"spreadsheetId": spreadsheet_id}
+    if not clearings:
+        return _sheets_respond(request, out, tree)
+    grids = _sheets_grids(sheets)
+    changed = [_sheets_clear(grids, c) for c in clearings]
+    if any(changed):
+        _sheets_save(auth.conn(request), row, _sheets_reloaded(sheets, grids))
+    out["clearedRanges"] = [_a1_name(*c) for c in clearings]
+    return _sheets_respond(request, out, tree)
 
 
 @router.get("/slides/v1/presentations/{presentation_id}")

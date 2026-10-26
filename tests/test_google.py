@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import datetime
 import io
 import json
 import re
@@ -20,7 +21,7 @@ import jwt
 import pytest
 import yaml
 
-from backlot import oauth, sheets_grid, store, synth
+from backlot import oauth, sheets_grid, sheets_input, store, synth
 from backlot.config import Settings
 from backlot.errors import google as gerr
 from tests._helpers import (
@@ -9580,12 +9581,204 @@ def test_public_key_not_exposed(creds):
 # --- the grid behind a spreadsheet: normalising it, and serialising it the way export does ------
 
 
+def _nf(type_, pattern):
+    return {"type": type_, "pattern": pattern}
+
+
 @pytest.mark.parametrize(
     "cell,want",
-    [("hello", "hello"), (42, "42"), (3.5, "3.5"), (True, "TRUE"), (False, "FALSE"), (None, "")],
+    [
+        ("hello", "hello"),
+        (42, "42"),
+        (3.5, "3.5"),
+        (True, "TRUE"),
+        (False, "FALSE"),
+        (None, ""),
+        # General (`sheets_format.general`): ten significant digits, half away from zero on the
+        # decimal spelling, `0` under 1e-10, and scientific from where log10 reaches 15
+        (0.30000000000000004, "0.3"),
+        (1 / 3, "0.3333333333"),
+        (12345678902.5, "12345678903"),
+        (123456789012345, "123456789012345"),
+        (999999999999998, "1E+15"),
+        (999999999999990, "999999999999990"),
+        (1234567890123456, "1.23457E+15"),
+        (1e-7, "0.0000001"),
+        (2.5e-10, "0.00000000025"),
+        (9.9e-11, "0"),
+        (-1e-11, "0"),
+        (1e100, "1E+100"),
+        # a number format, as a write leaves one
+        (sheets_grid.cell(0.125, number_format=_nf("PERCENT", "0%")), "13%"),
+        (sheets_grid.cell(0.12345, number_format=_nf("PERCENT", "0.00%")), "12.35%"),
+        (sheets_grid.cell(2.675, number_format=_nf("NUMBER", "#,##0.00")), "2.68"),
+        (sheets_grid.cell(-0.4, number_format=_nf("NUMBER", "#,##0")), "0"),
+        (sheets_grid.cell(-5.5, number_format=_nf("CURRENCY", '"$"#,##0.00')), "-$5.50"),
+        (sheets_grid.cell(1234.5, number_format=_nf("CURRENCY", '#,##0"$"')), "1,235$"),
+        (sheets_grid.cell(-0.004, number_format=_nf("CURRENCY", '"$"#,##0.00')), "$0.00"),
+        (sheets_grid.cell(9.995, number_format=_nf("SCIENTIFIC", "0.00E+00")), "1.00E+01"),
+        (sheets_grid.cell(0, number_format=_nf("SCIENTIFIC", "0.00E+00")), "0.00E+00"),
+        (sheets_grid.cell(60, number_format=_nf("DATE", "yyyy-mm-dd")), "1900-02-28"),
+        (sheets_grid.cell(2958466, number_format=_nf("DATE", "yyyy-mm-dd")), "10000-01-01"),
+        (sheets_grid.cell(45306.9999999, number_format=_nf("DATE", "yyyy-mm-dd")), "2024-01-16"),
+        (sheets_grid.cell(1, number_format=_nf("DATE", "m/d/yy")), "12/31/99"),
+        (sheets_grid.cell(45306, number_format=_nf("DATE", "ddd mmm d yyyy")), "Mon Jan 15 2024"),
+        (sheets_grid.cell(45306, number_format=_nf("DATE", "mmmm d, yyyy")), "January 15, 2024"),
+        (sheets_grid.cell(0.4380208333333333, number_format=_nf("TIME", "h:mm")), "10:30"),
+        (sheets_grid.cell(0.999999, number_format=_nf("TIME", "h:mm")), "0:00"),
+        (sheets_grid.cell(-0.25, number_format=_nf("TIME", "h:mm")), "18:00"),
+        (
+            sheets_grid.cell(0.937505787037037, number_format=_nf("TIME", "h:mm:ss am/pm")),
+            "10:30:01 PM",
+        ),
+        (sheets_grid.cell(0, number_format=_nf("TIME", "h:mm am/pm")), "12:00 AM"),
+        (sheets_grid.cell(-0.5, number_format=_nf("TIME", "[h]:mm:ss")), "-12:00:00"),
+        (sheets_grid.cell(100.25, number_format=_nf("TIME", "[h]:mm:ss")), "2406:00:00"),
+        (
+            sheets_grid.cell(45306.4375, number_format=_nf("DATE_TIME", "m/d/yyyy h:mm")),
+            "1/15/2024 10:30",
+        ),
+        # a boolean keeps its display under any format, an error displays its code
+        (sheets_grid.cell(True, number_format=_nf("PERCENT", "0%")), "TRUE"),
+        (sheets_grid.cell(None, error="N_A"), "#N/A"),
+        (sheets_grid.cell(None, error="NULL_VALUE"), "#NULL!"),
+        (sheets_grid.cell(None, number_format=_nf("PERCENT", "0%")), ""),
+    ],
 )
 def test_a_cell_formats_the_way_the_real_api_displays_it(cell, want):
     assert sheets_grid.formatted(cell) == want
+
+
+_TODAY = datetime.date(2026, 10, 26)
+
+
+@pytest.mark.parametrize(
+    "typed,value,shown,pattern",
+    [
+        # as `sheets_input` measured them: the value stored, its display, its format
+        ("42", 42, "42", None),
+        ("  7  ", 7, "7", None),
+        ("(5)", -5, "-5", None),
+        ("- 5", -5, "-5", None),
+        ("1,234", 1234, "1,234", "#,##0"),
+        ("1,2345", 12345, "12,345", "#,##0"),
+        (",123", 123, "123", "#,##0"),
+        ("1,234.", 1234, "1,234.00", "#,##0.00"),
+        ("1e3", 1000, "1.00E+03", "0.00E+00"),
+        ("1e3%", 10, "1.00E+01", "0.00E+00"),
+        ("1e-400", 0, "0.00E+00", "0.00E+00"),
+        ("12%", 0.12, "12%", "0%"),
+        ("12.%", 0.12, "12.00%", "0.00%"),
+        ("(5%)", -0.05, "-5%", "0%"),
+        ("$5.555", 5.555, "$5.56", '"$"#,##0.00'),
+        ("$-5", -5, "-$5", '"$"#,##0'),
+        ("5 $", 5, "5$", '#,##0"$"'),
+        ("€5", 5, "€5", '"€"#,##0'),
+        ("$5%", 0.05, "$0", '"$"#,##0'),
+        ("0.1234567890123456789", 0.123456789012345, "0.123456789", None),
+        ("1234567890123456.5", 1234567890123450, "1.23457E+15", None),
+        ("2024-01-15", 45306, "2024-01-15", "yyyy-mm-dd"),
+        ("2024-1-15", 45306, "2024-1-15", "yyyy-m-d"),
+        ("1/05/2024", 45296, "01/05/2024", "mm/dd/yyyy"),
+        ("1/15/29", 47133, "1/15/29", "m/d/yy"),
+        ("1/15/30", 10973, "1/15/30", "m/d/yy"),
+        ("1/15/0024", 45306, "1/15/2024", "m/d/yyyy"),
+        ("1/15/124", -648655, "1/15/0124", "m/d/yyyy"),
+        ("1/15", 46037, "1/15", "m/d"),
+        ("01/2024", 45292, "01/2024", "mm/yyyy"),
+        ("12/30/1899", 0, "12/30/1899", "m/d/yyyy"),
+        ("jan 15, 2024", 45306, "Jan 15, 2024", "mmm d, yyyy"),
+        ("Jan. 15, 2024", 45306, "Jan. 15, 2024", "mmm. d, yyyy"),
+        ("Jan15", 46037, "Jan15", "mmmd"),
+        ("05 Jan 2024", 45296, "05 Jan 2024", "dd mmm yyyy"),
+        ("15 January, 2024", 45306, "15 January, 2024", "d mmmm, yyyy"),
+        ("Mon Jan 15 2024", 45306, "Mon Jan 15 2024", "ddd mmm d yyyy"),
+        ("10:30", 0.4375, "10:30", "h:mm"),
+        ("10:60", 0.4583333333333333, "11:00", "h:mm"),
+        ("10pm", 0.9166666666666666, "10:00 PM", "h:mm am/pm"),
+        ("10:30:15.5", 0.43767939814814816, "10:30:16", "h:mm:ss"),
+        ("25:00", 1.0416666666666667, "25:00:00", "[h]:mm:ss"),
+        ("-1:00", -0.041666666666666664, "-1:00:00", "[h]:mm:ss"),
+        ("2024-01-15T10:30", 45306.4375, "2024-01-15 10:30", "yyyy-mm-dd h:mm"),
+        ("1/15/2024 10:30 PM", 45306.9375, "1/15/2024 10:30 PM", "m/d/yyyy h:mm am/pm"),
+        ("tRuE", True, "TRUE", None),
+        ("'0123", "0123", "0123", None),
+        ("''x", "'x", "'x", None),
+        # each of these stays the text typed
+        ("TRUE ", "TRUE ", "TRUE ", None),
+        ("12,34", "12,34", "12,34", None),
+        ("1234567890123456", "1234567890123456", "1234567890123456", None),
+        ("1e400", "1e400", "1e400", None),
+        ("$1e3", "$1e3", "$1e3", None),
+        ("5 %", "5 %", "5 %", None),
+        ("£5", "£5", "£5", None),
+        ("٣", "٣", "٣", None),
+        ("Sept 15, 2024", "Sept 15, 2024", "Sept 15, 2024", None),
+        ("2/29/2023", "2/29/2023", "2/29/2023", None),
+        ("15/01/2024", "15/01/2024", "15/01/2024", None),
+        ("2024.01.15", "2024.01.15", "2024.01.15", None),
+        ("13:00 PM", "13:00 PM", "13:00 PM", None),
+        ("9:5", "9:5", "9:5", None),
+        ("2024-01-15T10:30:15Z", "2024-01-15T10:30:15Z", "2024-01-15T10:30:15Z", None),
+        (" =1+1", " =1+1", " =1+1", None),
+    ],
+)
+def test_a_user_entered_string_is_read_the_way_the_real_api_reads_it(typed, value, shown, pattern):
+    cell = sheets_input.apply(None, typed, "USER_ENTERED", _TODAY)
+    got = sheets_grid.cell_value(cell)
+    assert got == value and type(got) is type(value)
+    assert sheets_grid.formatted(cell) == shown
+    assert (sheets_grid.cell_format(cell) or {}).get("pattern") == pattern
+
+
+@pytest.mark.parametrize(
+    "typed,error",
+    [
+        ("#N/A", "N_A"),
+        ("#n/a", "N_A"),
+        ("#N/A ", "N_A"),
+        ("#ref!", "REF"),
+        ("#NULL!", "NULL_VALUE"),
+    ],
+)
+def test_a_typed_error_literal_is_an_error_cell(typed, error):
+    assert sheets_grid.cell_error(sheets_input.apply(None, typed, "USER_ENTERED", _TODAY)) == error
+
+
+_PCT = _nf("PERCENT", "0.00%")
+_NUM = _nf("NUMBER", "#,##0")
+_DATE = _nf("DATE", "yyyy-mm-dd")
+
+
+@pytest.mark.parametrize(
+    "existing,written,option,want",
+    [
+        # `sheets_input.apply`'s rules, a cell's format against each kind of write: a format the write
+        # infers is kept when the cell's is of its family and replaces it otherwise
+        (_PCT, "12%", "USER_ENTERED", _PCT),
+        (_NUM, "$5", "USER_ENTERED", _NUM),
+        (_PCT, "1,234", "USER_ENTERED", _NUM),
+        (_DATE, "12.5%", "USER_ENTERED", _PCT),
+        (_nf("DATE_TIME", "yyyy-mm-dd h:mm"), "2024-01-15", "USER_ENTERED", _DATE),
+        # one that infers none keeps a number-family format and drops any other
+        (_NUM, "abc", "USER_ENTERED", _NUM),
+        (_NUM, "#N/A", "USER_ENTERED", _NUM),
+        (_PCT, "42", "USER_ENTERED", None),
+        (_DATE, "TRUE", "USER_ENTERED", None),
+        # an apostrophe drops it, a formula and an empty string keep it
+        (_NUM, "'x", "USER_ENTERED", None),
+        (_PCT, "=1+1", "USER_ENTERED", _PCT),
+        (_PCT, "", "USER_ENTERED", _PCT),
+        # a JSON number or boolean keeps it under either option; a RAW string, "" too, drops it
+        (_PCT, 0.5, "RAW", _PCT),
+        (_DATE, True, "USER_ENTERED", _DATE),
+        (_NUM, "txt", "RAW", None),
+        (_PCT, "", "RAW", None),
+    ],
+)
+def test_a_write_keeps_or_replaces_a_cells_number_format(existing, written, option, want):
+    cell = sheets_grid.cell(None, number_format=existing)
+    assert sheets_grid.cell_format(sheets_input.apply(cell, written, option, _TODAY)) == want
 
 
 def test_normalise_pads_short_rows_and_collapses_integral_floats():
@@ -12620,3 +12813,531 @@ def test_google_request_whose_override_is_not_read_goes_on_as_sent(
     posted = sent_as(client, method, url, named, content=b"fields=kind")
     control = sent_as(client, method, url, plain, content=b"fields=kind")
     assert (posted.status_code, posted.content) == (control.status_code, control.content)
+
+
+# --- Sheets `values` writes --------------------------------------------------------------------
+#
+# A corpus of its own, and a server of its own per test (`wc`): every test here writes, and a
+# write left in one test's overlay would be the next one's starting state.
+
+WRITE_RECORDS = [
+    {
+        "source_type": "google_drive",
+        "doc_id": "wr-book",
+        "subtype": "spreadsheet",
+        "title": "Book",
+        "folder": "ops",
+        "visibility": "public",
+        "author_email": "owner@acme.com",
+        "created": "2026-07-01T09:00:00Z",
+        "updated": "2026-07-14T17:20:00Z",
+        "sheets": [
+            {"title": "Data", "grid": [["region", "deals"], ["EMEA", 12]]},
+            {"title": "Other", "grid": [["o"]]},
+        ],
+    },
+    {
+        "source_type": "google_drive",
+        "doc_id": "wr-prose",
+        "subtype": "spreadsheet",
+        "title": "Prose",
+        "folder": "ops",
+        "visibility": "public",
+        "author_email": "owner@acme.com",
+        "content": "month,revenue\nJan,1",
+        "created": "2026-07-01T09:00:00Z",
+        "updated": "2026-07-14T17:20:00Z",
+    },
+    {
+        "source_type": "google_drive",
+        "doc_id": "wr-doc",
+        "subtype": "document",
+        "title": "Notes",
+        "folder": "ops",
+        "visibility": "public",
+        "author_email": "owner@acme.com",
+        "content": "notes",
+        "created": "2026-07-01T09:00:00Z",
+        "updated": "2026-07-14T17:20:00Z",
+    },
+    {
+        "source_type": "google_drive",
+        "doc_id": "wr-private",
+        "subtype": "spreadsheet",
+        "title": "Private",
+        "folder": "hr",
+        "visibility": "private",
+        "author_email": "reader@acme.com",
+        "created": "2026-07-01T09:00:00Z",
+        "updated": "2026-07-14T17:20:00Z",
+        "sheets": [{"title": "Sheet1", "grid": [["x"]]}],
+    },
+]
+
+
+@pytest.fixture(scope="module")
+def write_settings(tmp_path_factory):
+    from tests._helpers import build_corpus
+
+    return build_corpus(tmp_path_factory.mktemp("writes"), WRITE_RECORDS, raw=True)
+
+
+@pytest.fixture
+def wc(write_settings):
+    from tests._helpers import client_for
+
+    with client_for(write_settings, reload=True) as c:
+        yield c
+
+
+@pytest.fixture(scope="module")
+def wh(write_settings):
+    """Headers for each user of the write corpus, and the admin's."""
+    data = yaml.safe_load(write_settings.tokens_path.read_text(encoding="utf-8"))
+    out = {u["email"]: {"Authorization": f"Bearer {u['token']}"} for u in data["users"]}
+    out["admin"] = {"Authorization": f"Bearer {data['admin_token']}"}
+    return out
+
+
+@pytest.fixture(scope="module")
+def wbook(write_settings):
+    from tests._helpers import served_id
+
+    return f"/sheets/v4/spreadsheets/{served_id('google_drive', 'wr-book')}"
+
+
+_OWNER = "owner@acme.com"
+_RAW = {"valueInputOption": "RAW"}
+_ENTERED = {"valueInputOption": "USER_ENTERED"}
+
+
+def _read_back(wc, h, wbook, rng, **params):
+    r = wc.get(f"{wbook}/values/{quote(rng, safe='')}", headers=h, params=params)
+    assert r.status_code == 200, r.text
+    return r.json().get("values")
+
+
+def test_an_update_answers_what_it_wrote_and_every_read_sees_it(wc, wh, wbook):
+    """Measured: the counts are the distinct rows, columns and cells written, and
+    `updatedRange` runs from the range's first cell to the last one written. The write then reads
+    back through `values.get` in each rendering, through the grid, and through Drive."""
+    h = wh[_OWNER]
+    r = wc.put(
+        f"{wbook}/values/Data!A3:D3",
+        headers=h,
+        params=_ENTERED,
+        json={"values": [["APAC", "12.5%", "2024-01-15", None]]},
+    )
+    assert r.status_code == 200, r.text
+    sid = wbook.rsplit("/", 1)[1]
+    assert r.json() == {
+        "spreadsheetId": sid,
+        "updatedRange": "Data!A3:C3",
+        "updatedRows": 1,
+        "updatedColumns": 3,
+        "updatedCells": 3,
+    }
+    assert _read_back(wc, h, wbook, "Data!A3:C3") == [["APAC", "12.50%", "2024-01-15"]]
+    assert _read_back(wc, h, wbook, "Data!A3:C3", valueRenderOption="UNFORMATTED_VALUE") == [
+        ["APAC", 0.125, 45306]
+    ]
+    assert _read_back(
+        wc,
+        h,
+        wbook,
+        "Data!A3:C3",
+        valueRenderOption="UNFORMATTED_VALUE",
+        dateTimeRenderOption="FORMATTED_STRING",
+    ) == [["APAC", 0.125, "2024-01-15"]]
+    cell = wc.get(
+        wbook,
+        headers=h,
+        params={
+            "ranges": "Data!B3",
+            "includeGridData": "true",
+            "fields": "sheets.data.rowData.values(userEnteredValue,formattedValue,userEnteredFormat)",
+        },
+    ).json()["sheets"][0]["data"][0]["rowData"][0]["values"][0]
+    assert cell == {
+        "userEnteredValue": {"numberValue": 0.125},
+        "formattedValue": "12.50%",
+        "userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}},
+    }
+    drive = wc.get(f"/drive/v3/files/{sid}", headers=h, params={"fields": "modifiedTime"}).json()
+    assert drive["modifiedTime"] > "2026-07-14T17:20:00"
+    csv_ = wc.get(f"/drive/v3/files/{sid}/export", headers=h, params={"mimeType": "text/csv"})
+    assert csv_.text == "region,deals,\r\nEMEA,12,\r\nAPAC,12.50%,2024-01-15"
+    hits = wc.get("/drive/v3/files", headers=h, params={"q": "fullText contains 'APAC'"}).json()
+    assert [f["id"] for f in hits["files"]] == [sid]
+
+
+def test_a_null_leaves_its_cell_and_an_empty_string_clears_it(wc, wh, wbook):
+    r = wc.put(
+        f"{wbook}/values/Data!A1:B1", headers=wh[_OWNER], params=_RAW, json={"values": [[None, ""]]}
+    )
+    assert r.json()["updatedRange"] == "Data!A1:B1"
+    assert (r.json()["updatedColumns"], r.json()["updatedCells"]) == (1, 1)
+    assert _read_back(wc, wh[_OWNER], wbook, "Data!A1:B2") == [["region"], ["EMEA", "12"]]
+
+
+@pytest.mark.parametrize("body", [{"values": []}, {}, {"values": [[None]]}, {"values": [[]]}])
+def test_a_write_of_nothing_answers_its_first_cell_and_changes_nothing(wc, wh, wbook, body):
+    sid = wbook.rsplit("/", 1)[1]
+    r = wc.put(f"{wbook}/values/Data!B5:C6", headers=wh[_OWNER], params=_RAW, json=body)
+    assert r.json() == {"spreadsheetId": sid, "updatedRange": "Data!B5"}
+    assert wc.get("/_meta/overlay").json()["google_drive_patch"] == []
+
+
+def test_a_single_cell_is_an_anchor_that_grows_the_grid(wc, wh, wbook):
+    """Measured: a block from `Y1` three wide writes `Y1:AA1` and the sheet becomes 27 columns
+    wide; only an anchor itself past the edge is refused."""
+    h = wh[_OWNER]
+    r = wc.put(
+        f"{wbook}/values/Data!Y1", headers=h, params=_RAW, json={"values": [["x", "y", "z"]]}
+    )
+    assert r.json()["updatedRange"] == "Data!Y1:AA1"
+    grid = wc.get(wbook, headers=h).json()["sheets"][0]["properties"]["gridProperties"]
+    assert grid == {"rowCount": 1000, "columnCount": 27}
+    r = wc.put(f"{wbook}/values/Data!AC1", headers=h, params=_RAW, json={"values": [["x"]]})
+    assert r.status_code == 400
+    assert r.json()["error"]["message"] == (
+        "Range (Data!AC1) exceeds grid limits. Max rows: 1000, max columns: 27"
+    )
+
+
+@pytest.mark.parametrize(
+    "rng,body,message",
+    [
+        (
+            "Data!A1:B1",
+            {"values": [["a", "b"], ["c"]]},
+            "Requested writing within range [Data!A1:B1], but tried writing to row [2]",
+        ),
+        (
+            "Data!A7:A7",
+            {"values": [["x", "y"]]},
+            "Requested writing within range [Data!A7], but tried writing to column [B]",
+        ),
+        ("Nope!A1", {"values": [["x"]]}, "Unable to parse range: Nope!A1"),
+        (
+            "Data!A1:B1",
+            {"range": "data!a1:b1", "values": [["a"]]},
+            "Request range[Data!A1:B1] does not match value's range[data!a1:b1]",
+        ),
+        (
+            "Data!B5",
+            {"values": [["ok", {"a": 1}]]},
+            'Invalid values[4][1]: struct_value \t {\n  fields {\n    key: "a"\n    value {\n'
+            "      number_value: 1.0\n    }\n  }\n}\n",
+        ),
+        (
+            "Data!A3",
+            {"values": [[[1, 2]]]},
+            "Invalid values[2][0]: list_value \t {\n  values {\n    number_value: 1.0\n  }\n"
+            "  values {\n    number_value: 2.0\n  }\n}\n",
+        ),
+        (
+            "Data!A1",
+            {"bogus": 1},
+            "Invalid JSON payload received. Unknown name \"bogus\" at 'data': Cannot find field.",
+        ),
+        (
+            "Data!A1",
+            {"values": ["x"]},
+            "Invalid value at 'data.values[0]' (type.googleapis.com/google.protobuf.ListValue), "
+            '"x"',
+        ),
+    ],
+)
+def test_a_write_real_refuses_is_refused_with_reals_message(wc, wh, wbook, rng, body, message):
+    r = wc.put(f"{wbook}/values/{quote(rng, safe='')}", headers=wh[_OWNER], params=_RAW, json=body)
+    assert r.status_code == 400
+    assert r.json()["error"]["message"] == message
+    assert wc.get("/_meta/overlay").json()["gdrive_sheets"] == []
+
+
+@pytest.mark.parametrize(
+    "who,book,params,body,status,message",
+    [
+        # a reader is refused ahead of a missing option and of a range that does not parse ...
+        (
+            "reader@acme.com",
+            "wr-book",
+            {},
+            {"values": [["x"]]},
+            403,
+            "The caller does not have permission",
+        ),
+        (
+            "reader@acme.com",
+            "wr-book",
+            _RAW,
+            {"values": [["x"]]},
+            403,
+            "The caller does not have permission",
+        ),
+        # ... and behind the typed query values and the body
+        (
+            "reader@acme.com",
+            "wr-book",
+            {**_RAW, "includeValuesInResponse": "bogus"},
+            {"values": [["x"]]},
+            400,
+            "Invalid value at 'include_values_in_response' (TYPE_BOOL), \"bogus\"",
+        ),
+        # a file the caller cannot see is the same 403, a Doc the 404 the reads give it
+        (
+            _OWNER,
+            "wr-private",
+            _RAW,
+            {"values": [["x"]]},
+            403,
+            "The caller does not have permission",
+        ),
+        (_OWNER, "wr-doc", _RAW, {"values": [["x"]]}, 404, "Requested entity was not found."),
+        ("admin", "wr-book", _RAW, {"values": [["x"]]}, 403, "The caller does not have permission"),
+        # the option has no default, and its zero value is no value
+        (
+            _OWNER,
+            "wr-book",
+            {},
+            {"values": [["x"]]},
+            400,
+            "'valueInputOption' is required but not specified",
+        ),
+        (
+            _OWNER,
+            "wr-book",
+            {"valueInputOption": "INPUT_VALUE_OPTION_UNSPECIFIED"},
+            {"values": [["x"]]},
+            400,
+            "'valueInputOption' is required but not specified",
+        ),
+        (
+            _OWNER,
+            "wr-book",
+            {"valueInputOption": "BOGUS"},
+            {"values": [["x"]]},
+            400,
+            "Invalid value at 'value_input_option' "
+            '(type.googleapis.com/google.apps.sheets.v4.ValueInputOption), "BOGUS"',
+        ),
+    ],
+)
+def test_who_may_write_and_in_what_order_a_write_is_refused(
+    wc, wh, who, book, params, body, status, message
+):
+    from tests._helpers import served_id
+
+    path = f"/sheets/v4/spreadsheets/{served_id('google_drive', book)}/values/A1"
+    r = wc.put(path, headers=wh[who], params=params, json=body)
+    assert (r.status_code, r.json()["error"]["message"]) == (status, message)
+
+
+@pytest.mark.parametrize(
+    "method,suffix,rpc",
+    [
+        ("PUT", "/values/A1", "UpdateValues"),
+        ("POST", "/values:batchUpdate", "BatchUpdateValues"),
+        ("POST", "/values/A1:clear", "ClearValues"),
+        ("POST", "/values:batchClear", "BatchClearValues"),
+        ("POST", "/values:batchGetByDataFilter", "BatchGetValuesByDataFilter"),
+        ("POST", ":getByDataFilter", "GetSpreadsheetByDataFilter"),
+    ],
+)
+def test_a_sheets_post_or_put_with_no_credential_names_its_rpc(wc, wbook, method, suffix, rpc):
+    """No credential on these is a 401 whose ErrorInfo names the RPC."""
+    r = wc.request(method, f"{wbook}{suffix}", params=_RAW, json={})
+    assert r.status_code == 401
+    assert r.json()["error"]["details"] == [
+        {
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "CREDENTIALS_MISSING",
+            "domain": "googleapis.com",
+            "metadata": {
+                "method": f"google.apps.sheets.v4.SpreadsheetsService.{rpc}",
+                "service": "sheets.googleapis.com",
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize("option", ["raw", "1"])
+def test_value_input_option_reads_a_name_in_any_case_or_its_number(wc, wh, wbook, option):
+    r = wc.put(
+        f"{wbook}/values/Data!A1",
+        headers=wh[_OWNER],
+        params={"valueInputOption": option},
+        json={"values": [["=1"]]},
+    )
+    assert r.status_code == 200
+    assert _read_back(wc, wh[_OWNER], wbook, "Data!A1") == [["=1"]]
+
+
+def test_columns_writes_each_inner_list_down_a_column(wc, wh, wbook):
+    r = wc.put(
+        f"{wbook}/values/Data!D1:E3",
+        headers=wh[_OWNER],
+        params={**_RAW, "includeValuesInResponse": "true"},
+        json={"majorDimension": "COLUMNS", "values": [["d1", "d2", "d3"], ["e1"]]},
+    )
+    assert r.json()["updatedData"] == {
+        "range": "Data!D1:E3",
+        "majorDimension": "COLUMNS",
+        "values": [["d1", "d2", "d3"], ["e1"]],
+    }
+    assert _read_back(wc, wh[_OWNER], wbook, "Data!D1:E3") == [["d1", "e1"], ["d2"], ["d3"]]
+
+
+def test_updated_data_reads_back_the_request_range_not_the_updated_one(wc, wh, wbook):
+    """Measured: `[[null, "x"]]` over `A1:C2` updates `B1` alone and answers the whole request
+    range read back, cells the write left alone included, under the response render options."""
+    r = wc.put(
+        f"{wbook}/values/Data!A1:C2",
+        headers=wh[_OWNER],
+        params={
+            **_ENTERED,
+            "includeValuesInResponse": "true",
+            "responseValueRenderOption": "UNFORMATTED_VALUE",
+        },
+        json={"values": [[None, "12%"]]},
+    )
+    assert r.json()["updatedRange"] == "Data!A1:B1"
+    assert r.json()["updatedData"] == {
+        "range": "Data!A1:C2",
+        "majorDimension": "ROWS",
+        "values": [["region", 0.12], ["EMEA", 12]],
+    }
+
+
+def test_a_prose_spreadsheet_takes_a_write_as_the_grid_it_reads_as(wc, wh, write_settings):
+    """A prose spreadsheet reads as one sheet of its lines, so a write lands in that grid: real has
+    no spreadsheet that refuses one. Once written it is a grid, and exports as one."""
+    from tests._helpers import served_id
+
+    sid = served_id("google_drive", "wr-prose")
+    book = f"/sheets/v4/spreadsheets/{sid}"
+    h = wh[_OWNER]
+    r = wc.put(f"{book}/values/B2", headers=h, params=_RAW, json={"values": [["new"]]})
+    assert r.json()["updatedRange"] == "Sheet1!B2"
+    assert _read_back(wc, h, book, "A1:B2") == [["month,revenue"], ["Jan,1", "new"]]
+    props = wc.get(book, headers=h).json()["sheets"][0]["properties"]
+    assert (props["sheetId"], props["title"]) == (0, "Sheet1")
+    csv_ = wc.get(f"/drive/v3/files/{sid}/export", headers=h, params={"mimeType": "text/csv"})
+    assert csv_.text == '"month,revenue",\r\n"Jan,1",new'
+
+
+def test_a_batch_update_writes_every_entry_or_none(wc, wh, wbook):
+    """Measured: one bad entry refuses the call by its index and writes nothing; the totals count
+    distinct cells across the batch, and every sheet an entry names."""
+    h = wh[_OWNER]
+    path = f"{wbook}/values:batchUpdate"
+    r = wc.post(
+        path,
+        headers=h,
+        json={
+            "valueInputOption": "RAW",
+            "data": [
+                {"range": "Data!A5", "values": [["first"]]},
+                {"range": "Nope!A1", "values": [["x"]]},
+            ],
+        },
+    )
+    assert r.json()["error"]["message"] == "Invalid data[1]: Unable to parse range: Nope!A1"
+    assert _read_back(wc, h, wbook, "Data!A5") is None
+    r = wc.post(
+        path,
+        headers=h,
+        json={
+            "valueInputOption": "RAW",
+            "data": [
+                {"range": "Data!A8:B8", "values": [["one", "one"]]},
+                {"range": "Data!B8:C8", "values": [["two", "two"]]},
+                {"range": "Other!A5"},
+            ],
+        },
+    )
+    body = r.json()
+    assert {k: v for k, v in body.items() if k.startswith("total")} == {
+        "totalUpdatedRows": 1,
+        "totalUpdatedColumns": 3,
+        "totalUpdatedCells": 3,
+        "totalUpdatedSheets": 2,
+    }
+    assert [x["updatedRange"] for x in body["responses"]] == [
+        "Data!A8:B8",
+        "Data!B8:C8",
+        "Other!A5",
+    ]
+    assert _read_back(wc, h, wbook, "Data!A8:C8") == [["one", "two", "two"]]
+    r = wc.post(path, headers=h, json={"valueInputOption": "RAW", "data": [{"values": [["x"]]}]})
+    assert r.json()["error"]["message"] == (
+        "Invalid data[0]: ValueRange.range is required but not specified"
+    )
+    sid = wbook.rsplit("/", 1)[1]
+    assert wc.post(path, headers=h, json={"valueInputOption": "RAW"}).json() == {
+        "spreadsheetId": sid
+    }
+
+
+def test_a_clear_empties_the_values_and_keeps_the_formats(wc, wh, wbook):
+    """Measured: `clearedRange` is the range as resolved, cut at the grid's edge; a cleared percent
+    cell written a RAW `0.5` afterwards displays `50.00%`."""
+    h = wh[_OWNER]
+    wc.put(f"{wbook}/values/Data!C1", headers=h, params=_ENTERED, json={"values": [["12.5%"]]})
+    r = wc.post(f"{wbook}/values/Data!C1:AC1:clear", headers=h)
+    assert r.json()["clearedRange"] == "Data!C1:Z1"
+    wc.put(f"{wbook}/values/Data!C1", headers=h, params=_RAW, json={"values": [[0.5]]})
+    assert _read_back(wc, h, wbook, "Data!C1") == [["50.00%"]]
+    r = wc.post(f"{wbook}/values:batchClear", headers=h, json={"ranges": ["Data!A1", "Nope!A1"]})
+    assert r.json()["error"]["message"] == "Invalid range[1]: Unable to parse range: Nope!A1"
+    assert _read_back(wc, h, wbook, "Data!A1") == [["region"]]
+    r = wc.post(f"{wbook}/values:batchClear", headers=h, json={"ranges": ["Other", "data!b2:a1"]})
+    assert r.json()["clearedRanges"] == ["Other!A1:Z1000", "Data!A1:B2"]
+    assert _read_back(wc, h, wbook, "Data!A1:B2") is None
+    r = wc.post(f"{wbook}/values/Data!A1:clear", headers=h, json={"bogus": 1})
+    assert r.json()["error"]["message"] == (
+        'Invalid JSON payload received. Unknown name "bogus": Cannot find field.'
+    )
+    r = wc.post(f"{wbook}/values/Data!A1:clear", headers=wh["reader@acme.com"])
+    assert r.status_code == 403
+
+
+def test_a_written_cell_carries_its_format_and_an_error_its_type(wc, wh, wbook):
+    """`userEnteredFormat` sits between `formattedValue` and an
+    `effectiveFormat` that opens with the same `numberFormat`; a typed error is `errorValue` with
+    no message, centred, and reads `#N/A ()` unformatted; a cleared cell keeps its format and
+    with it a trimmed `effectiveFormat`, no alignment and no `hyperlinkDisplayType`."""
+    h = wh[_OWNER]
+    wc.put(
+        f"{wbook}/values/Data!A4:C4",
+        headers=h,
+        params=_ENTERED,
+        json={"values": [["$5", "#N/A", "12%"]]},
+    )
+    wc.post(f"{wbook}/values/Data!C4:clear", headers=h)
+    values = _cells(wc, h, wbook.rsplit("/", 1)[1], "Data!A4:C4")[0]["values"]
+    assert list(values[0]) == [
+        "userEnteredValue",
+        "effectiveValue",
+        "formattedValue",
+        "userEnteredFormat",
+        "effectiveFormat",
+    ]
+    currency = {"type": "CURRENCY", "pattern": '"$"#,##0'}
+    assert values[0]["effectiveFormat"] == {
+        "numberFormat": currency,
+        **_CELL_FORMAT,
+        "horizontalAlignment": "RIGHT",
+    }
+    assert list(values[0]["effectiveFormat"])[:2] == ["numberFormat", "backgroundColor"]
+    assert values[1]["effectiveValue"] == {"errorValue": {"type": "N_A"}}
+    assert values[1]["effectiveFormat"]["horizontalAlignment"] == "CENTER"
+    trimmed = {k: v for k, v in _CELL_FORMAT.items() if k != "hyperlinkDisplayType"}
+    assert values[2] == {
+        "userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0%"}},
+        "effectiveFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0%"}, **trimmed},
+    }
+    assert _read_back(wc, h, wbook, "Data!B4", valueRenderOption="UNFORMATTED_VALUE") == [
+        ["#N/A ()"]
+    ]

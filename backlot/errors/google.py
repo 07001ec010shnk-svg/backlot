@@ -514,14 +514,28 @@ def bad_token(*, named: bool = True) -> GoogleError:
     )
 
 
-def missing_credentials() -> GoogleError:
+def missing_credentials(rpc: tuple[str, str] | None = None) -> GoogleError:
     """No credential, on an operation that does not take an API key (:func:`no_credentials`).
 
     One answer for all of them: measured 2026-09-14, Gmail, Docs and Slides send the same long
     top-level message and the same `errors[]` entry, the short ``Login Required.`` at ``location:
     Authorization``, and measured 2026-09-22 the two Sheets data-filter POSTs send both too. Which
     of them SHOWS that entry still differs — Gmail carries it unless `$.xgafv=2`, the editor
-    families only at `1` — but that is `has_errors_array`'s rule, not a difference in the error."""
+    families only at `1` — but that is `has_errors_array`'s rule, not a difference in the error.
+
+    ``rpc`` is ``(method, service)``, the operation the answer names in a ``CREDENTIALS_MISSING``
+    ErrorInfo: measured 2026-10-26, real carries one on every such 401, Gmail's and Docs' included,
+    and it is given here for the operations in `_RPC_METHODS`."""
+    details = None
+    if rpc is not None:
+        details = [
+            {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "CREDENTIALS_MISSING",
+                "domain": "googleapis.com",
+                "metadata": {"method": rpc[0], "service": rpc[1]},
+            }
+        ]
     return GoogleError(
         401,
         MISSING_CREDENTIALS_MESSAGE,
@@ -530,6 +544,7 @@ def missing_credentials() -> GoogleError:
         location_type="header",
         status="UNAUTHENTICATED",
         short="Login Required.",
+        details=details,
         headers={"WWW-Authenticate": _CHALLENGE},
     )
 
@@ -569,6 +584,27 @@ _UNREGISTERED_CALLER_OPERATIONS = tuple(
 )
 
 
+# The RPC each operation's missing-credential 401 names, by its HTTP method and path, measured
+# 2026-10-26 on `sheets.googleapis.com`. Checked in order, so `:clear` is matched ahead of the
+# update it would otherwise read as.
+_SHEETS_RPC = "google.apps.sheets.v4.SpreadsheetsService"
+_RPC_METHODS = tuple(
+    (method, re.compile(pattern), (f"{_SHEETS_RPC}.{name}", "sheets.googleapis.com"))
+    for method, pattern, name in (
+        ("POST", r"/sheets/v4/spreadsheets/[^/]+/values/.+:clear", "ClearValues"),
+        ("PUT", r"/sheets/v4/spreadsheets/[^/]+/values/.+", "UpdateValues"),
+        ("POST", r"/sheets/v4/spreadsheets/[^/]+/values:batchUpdate", "BatchUpdateValues"),
+        ("POST", r"/sheets/v4/spreadsheets/[^/]+/values:batchClear", "BatchClearValues"),
+        (
+            "POST",
+            r"/sheets/v4/spreadsheets/[^/]+/values:batchGetByDataFilter",
+            "BatchGetValuesByDataFilter",
+        ),
+        ("POST", r"/sheets/v4/spreadsheets/[^/]+:getByDataFilter", "GetSpreadsheetByDataFilter"),
+    )
+)
+
+
 def no_credentials(path: str, method: str) -> GoogleError:
     """What a request with no credential gets on this operation: :func:`unregistered_caller` on the
     ones in `_UNREGISTERED_CALLER_OPERATIONS`, :func:`missing_credentials` on the rest, Gmail, Docs
@@ -580,7 +616,8 @@ def no_credentials(path: str, method: str) -> GoogleError:
     """
     if any(m == method and p.fullmatch(path) for m, p in _UNREGISTERED_CALLER_OPERATIONS):
         return unregistered_caller()
-    return missing_credentials()
+    rpc = next((r for m, p, r in _RPC_METHODS if m == method and p.fullmatch(path)), None)
+    return missing_credentials(rpc)
 
 
 def delegation_denied(email: str) -> GoogleError:

@@ -15,6 +15,7 @@ import codecs
 import json
 import math
 import re
+from decimal import Decimal
 from typing import NamedTuple
 
 from backlot.errors import google as gerr
@@ -28,8 +29,9 @@ class Enum(NamedTuple):
 
 
 class Field(NamedTuple):
-    """One field of a :class:`Message`. ``kind`` is ``int32``, ``string``, ``bool``, ``enum`` or
-    ``message``; ``wrapper`` marks an ``Int32Value``/``StringValue`` field, whose scalar lives in a
+    """One field of a :class:`Message`. ``kind`` is ``int32``, ``string``, ``bool``, ``enum``,
+    ``message`` or ``rows`` (a repeated ``google.protobuf.ListValue``, read whole by
+    :meth:`_Writer.rows`); ``wrapper`` marks an ``Int32Value``/``StringValue`` field, whose scalar lives in a
     ``value`` member that the error path names."""
 
     json_name: str
@@ -275,6 +277,36 @@ class _Writer:
         top.oneofs.add(field.oneof)
         return True
 
+    def rows(self, name: str, value) -> bool:
+        """Read a ``rows`` field whole, and say whether ``name`` was one.
+
+        Each element is a ``ListValue``, a JSON array whose members may be anything JSON holds;
+        what a member may MEAN is the service's question, not the proto layer's. A field that is
+        not an array, or an element that is not one, is refused naming the ListValue type,
+        measured 2026-10-26 on Sheets `values.update`: `"values": "x"` is ``Invalid value at
+        'data.values' (type.googleapis.com/google.protobuf.ListValue), "x"`` and `["x"]` the same
+        at `data.values[0]`."""
+        if self.invalid_depth or not self.stack or self.stack[-1].is_list or not name:
+            return False
+        top = self.stack[-1]
+        field = top.message.find(name)
+        if field is None or field.kind != "rows":
+            return False
+        at = _Frame(top, None, field, None).location()
+        if value is None:
+            return True
+        if not isinstance(value, list) or isinstance(value, _Members):
+            self._invalid_value(at, _LIST_VALUE, _json_text(value))
+            return True
+        out = []
+        for i, row in enumerate(value):
+            if isinstance(row, list) and not isinstance(row, _Members):
+                out.append([_plain(v) for v in row])
+            elif row is not None:
+                self._invalid_value(f"{at}[{i}]", _LIST_VALUE, _json_text(row))
+        top.out[field.name] = out
+        return True
+
     def start_object(self, name: str) -> None:
         if self.invalid_depth:
             self.invalid_depth += 1
@@ -354,10 +386,18 @@ class _Writer:
             self._invalid_name("", name, "Root element must be a message.")
             return
         top = self.stack[-1]
-        if top.is_list:  # an element of a list
-            if piece[0] != "null":
-                at = _Frame(top, None, top.field, None).location()
-                self._invalid_value(at, top.field.message.type_url, value_text(piece))
+        if top.is_list:  # an element of a list; a null one is skipped and not counted
+            if piece[0] == "null":
+                return
+            # A frame counts itself on the list it is made in, so it is made for an element only.
+            at = _Frame(top, None, top.field, None).location()
+            if top.field.kind != "message":  # a repeated scalar: `ranges` of a batch clear
+                try:
+                    top.out.append(_convert(top.field, piece))
+                except ConversionError as exc:
+                    self._invalid_value(at, _type_name(top.field), exc.text)
+                return
+            self._invalid_value(at, top.field.message.type_url, value_text(piece))
             return
         field = self._lookup(top, name)
         # A null leaves the field unset, and so does not take its oneof: a null `a1Range` beside a
@@ -384,6 +424,121 @@ class _Writer:
 
 
 _WRAPPER_DEFAULTS = {"int32": 0, "string": ""}
+_LIST_VALUE = "type.googleapis.com/google.protobuf.ListValue"
+
+
+def _plain(value):
+    """A parsed JSON value as plain Python: an object a dict, a number an int or a float."""
+    if isinstance(value, _Members):
+        return {_text(k): _plain(v) for k, v in value}
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    if isinstance(value, tuple):  # a number, as `_number` read it
+        kind, number = value
+        if kind == "int" and abs(number) < 2**53:
+            return number
+        return float(number)
+    return _text(value) if isinstance(value, str) else value
+
+
+def _json_text(value) -> str:
+    """How a refusal quotes a value it could not convert: a scalar as :func:`value_text` does."""
+    if isinstance(value, list):
+        return json.dumps(_plain(value))
+    return value_text(_piece(value))
+
+
+def _java_double(x: float) -> str:
+    """Java's ``Double.toString``, which the measured `number_value: 1.0` is: shortest digits,
+    plain from 1e-3 up to 1e7 and always with a decimal (`1.0`), else ``<d.ddd>E<n>`` (`1.0E10`)."""
+    if x == 0:
+        return "-0.0" if math.copysign(1, x) < 0 else "0.0"
+    if 1e-3 <= abs(x) < 1e7:
+        return repr(x)
+    d = Decimal(repr(abs(x)))
+    exp = d.adjusted()
+    mantissa = str(d.scaleb(-exp).normalize())
+    if "." not in mantissa:
+        mantissa += ".0"
+    return f"{'-' if x < 0 else ''}{mantissa}E{exp}"
+
+
+def _text_escape(value: str) -> str:
+    r"""A string as protobuf-java's ``TextFormat.escapeBytes`` writes it: ``\\``, ``\"``, ``\'``
+    and the C control escapes by name, and every other byte outside printable ASCII, a UTF-8
+    continuation byte included, as three octal digits."""
+    out = []
+    for byte in value.encode("utf-8"):
+        ch = chr(byte)
+        if ch in _TEXT_ESCAPES:
+            out.append(_TEXT_ESCAPES[ch])
+        elif 0x20 <= byte < 0x7F:
+            out.append(ch)
+        else:
+            out.append(f"\\{byte:03o}")
+    return "".join(out)
+
+
+_TEXT_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "'": "\\'",
+    "\a": "\\a",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\v": "\\v",
+}
+
+
+def _value_lines(value, indent: str) -> list[str]:
+    """A ``google.protobuf.Value`` in protobuf text format, one line each."""
+    if value is None:
+        return [f"{indent}null_value: NULL_VALUE"]
+    if isinstance(value, bool):
+        return [f"{indent}bool_value: {'true' if value else 'false'}"]
+    if isinstance(value, (int, float)):
+        return [f"{indent}number_value: {_java_double(float(value))}"]
+    if isinstance(value, str):
+        return [f'{indent}string_value: "{_text_escape(value)}"']
+    if isinstance(value, dict):
+        return [f"{indent}struct_value {{", *_struct_lines(value, indent + "  "), f"{indent}}}"]
+    return [f"{indent}list_value {{", *_list_lines(value, indent + "  "), f"{indent}}}"]
+
+
+def _struct_lines(value: dict, indent: str) -> list[str]:
+    lines = []
+    for k, v in value.items():
+        lines += [
+            f"{indent}fields {{",
+            f'{indent}  key: "{_text_escape(k)}"',
+            f"{indent}  value {{",
+        ]
+        lines += _value_lines(v, indent + "    ")
+        lines += [f"{indent}  }}", f"{indent}}}"]
+    return lines
+
+
+def _list_lines(value: list, indent: str) -> list[str]:
+    lines = []
+    for v in value:
+        lines += [f"{indent}values {{", *_value_lines(v, indent + "  "), f"{indent}}}"]
+    return lines
+
+
+def value_debug(value) -> str:
+    r"""How Sheets quotes a cell value it cannot store: its ``Value`` kind, a tab, and the message
+    in protobuf text format. Measured 2026-10-26: `{"a": 1}` is ``struct_value \t {\n  fields
+    {\n    key: "a"\n    value {\n      number_value: 1.0\n    }\n  }\n}\n`` and `[1, 2]`
+    ``list_value \t {\n  values {\n    number_value: 1.0\n  }\n  values {\n    number_value:
+    2.0\n  }\n}\n``."""
+    if isinstance(value, dict):
+        kind, body = "struct_value", _struct_lines(value, "  ")
+    else:
+        kind, body = "list_value", _list_lines(value, "  ")
+    return f"{kind} \t " + "\n".join(["{", *body, "}"]) + "\n"
 
 
 def _wrapper(field: Field) -> Message:
@@ -467,6 +622,8 @@ def _walk(writer: _Writer, tree) -> None:
                 end()
             continue
         name, value = entry
+        if writer.rows(name, value):
+            continue
         if isinstance(value, _Members):
             writer.start_object(name)
             pending.append((((_text(k), v) for k, v in value), writer.end_object))
@@ -488,7 +645,7 @@ codecs.register_error("backlot.protojson.space", _space_per_byte)
 _BOM = b"\xef\xbb\xbf"
 
 
-def read(body: bytes, message: Message) -> dict:
+def read(body: bytes, message: Message, *, field: str | None = None) -> dict:
     """``body`` read into ``message``, as a dict keyed by proto field name, or a 400.
 
     The body is parsed whole and then fed to the writer, whose refusals are one 400 naming each, in
@@ -518,6 +675,10 @@ def read(body: bytes, message: Message) -> dict:
         )
     except (ValueError, RecursionError):  # the latter for a body nested past Python's stack
         raise gerr.invalid_json("Unexpected token.") from None
+    if field is not None and isinstance(tree, _Members):
+        # A request whose body is one of its fields (`body: "data"` in the discovery document):
+        # real names that field in every refusal, `Unknown name "bogus" at 'data'`.
+        tree = _Members([(field, tree)])
     writer = _Writer(message)
     _walk(writer, tree)
     if writer.errors:

@@ -11,7 +11,67 @@ pure helper that more than one layer needs lives at this level: ``sigv4`` is the
 ``synth`` is every source's.
 """
 
-Cell = str | int | float | bool | None
+from backlot import sheets_format
+
+# A stored cell. A bare scalar unless a served write made it something a scalar cannot say
+# (`sheets_input.apply`): then an object with `v` (the value, absent when empty), `e` (the error
+# type) and `nf` (the `numberFormat`). A corpus states scalars alone, so a grid that was never
+# written holds nothing else, and a corpus `""` or `None` is a cell nobody wrote.
+#
+# Two objects are empty and still there, measured 2026-10-26: `{"v": ""}` is a cell written an
+# empty string (a RAW `""`, a lone apostrophe), served with a string's format and no value, and
+# `{"nf": {}}` a cell whose value a USER_ENTERED `""` took away, served with a format and no
+# alignment. A never-written cell is neither: it is served as nothing at all.
+Cell = str | int | float | bool | None | dict
+
+# Each error type by the code it displays as.
+ERROR_CODES = {
+    "N_A": "#N/A",
+    "DIVIDE_BY_ZERO": "#DIV/0!",
+    "REF": "#REF!",
+    "VALUE": "#VALUE!",
+    "NAME": "#NAME?",
+    "NUM": "#NUM!",
+    "NULL_VALUE": "#NULL!",
+    "ERROR": "#ERROR!",
+}
+
+
+EMPTY_STRING = {"v": ""}
+CLEARED = {"nf": {}}
+
+
+def cell(value, *, error: str | None = None, number_format: dict | None = None) -> Cell:
+    """A cell as stored, from its parts."""
+    if error is None and not number_format:
+        return value
+    out: dict = {}
+    if value is not None:
+        out["v"] = value
+    if error is not None:
+        out["e"] = error
+    if number_format is not None:
+        out["nf"] = number_format
+    return out
+
+
+def cell_value(c: Cell):
+    """A cell's value: a string, a number, a boolean, or None for an empty or error cell."""
+    return c.get("v") if isinstance(c, dict) else c
+
+
+def cell_error(c: Cell) -> str | None:
+    return c.get("e") if isinstance(c, dict) else None
+
+
+def cell_format(c: Cell) -> dict | None:
+    """A cell's `numberFormat`, or None for one that has none."""
+    return (c.get("nf") or None) if isinstance(c, dict) else None
+
+
+def written(c: Cell) -> bool:
+    """Whether a cell is there to serve: it holds something, or a write left it empty."""
+    return isinstance(c, dict) or (c is not None and c != "")
 
 
 def _scalar(v):
@@ -26,6 +86,9 @@ def _scalar(v):
     return int(v) if v.is_integer() else v
 
 
+collapse = _scalar
+
+
 def normalise_grid(grid: list[list]) -> list[list[Cell]]:
     """A rectangular grid: short rows padded with empty cells to the width of the widest row.
 
@@ -35,18 +98,23 @@ def normalise_grid(grid: list[list]) -> list[list[Cell]]:
     return [[_scalar(r[i]) if i < len(r) else None for i in range(width)] for r in grid]
 
 
-def formatted(cell: Cell) -> str:
+def formatted(c: Cell) -> str:
     """A cell's ``formattedValue`` -- its display string, which is also what export serialises.
 
-    Measured: a boolean displays as TRUE/FALSE, an integral number without a decimal point, and an
-    empty cell as the empty string."""
-    if cell is None:
+    Measured: a boolean displays as TRUE/FALSE whatever its number format, an error as its code,
+    an empty cell as the empty string, and a number under its number format or, with none, in
+    General (:func:`sheets_format.general`)."""
+    if (error := cell_error(c)) is not None:
+        return ERROR_CODES[error]
+    value = cell_value(c)
+    if value is None:
         return ""
-    if isinstance(cell, bool):
-        return "TRUE" if cell else "FALSE"
-    if isinstance(cell, str):
-        return cell
-    return str(cell)
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, str):
+        return value
+    nf = cell_format(c)
+    return sheets_format.render(value, nf) if nf else sheets_format.general(value)
 
 
 def used_extent(grid: list[list[Cell]]) -> tuple[int, int]:

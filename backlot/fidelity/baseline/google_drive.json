@@ -6,7 +6,7 @@
     "https://www.googleapis.com/discovery/v1/apis/sheets/v4/rest",
     "https://www.googleapis.com/discovery/v1/apis/slides/v1/rest"
   ],
-  "measured": "2026-10-22",
+  "measured": "2026-10-26",
   "operations": [
     {
       "operation": "DELETE /drive/v3/drives/{}",
@@ -1007,17 +1007,33 @@
       "operation": "POST /v4/spreadsheets/{}/values/{}:clear",
       "id": "sheets.spreadsheets.values.clear",
       "response": "sheets.ClearValuesResponse",
-      "status": "missing",
-      "kind": "missing_operation",
-      "severity": "gap"
+      "status": "implemented",
+      "params": {
+        "key": {
+          "kind": "missing_param",
+          "severity": "gap"
+        },
+        "uploadType": {
+          "kind": "missing_param",
+          "severity": "gap"
+        }
+      }
     },
     {
       "operation": "POST /v4/spreadsheets/{}/values:batchClear",
       "id": "sheets.spreadsheets.values.batchClear",
       "response": "sheets.BatchClearValuesResponse",
-      "status": "missing",
-      "kind": "missing_operation",
-      "severity": "gap"
+      "status": "implemented",
+      "params": {
+        "key": {
+          "kind": "missing_param",
+          "severity": "gap"
+        },
+        "uploadType": {
+          "kind": "missing_param",
+          "severity": "gap"
+        }
+      }
     },
     {
       "operation": "POST /v4/spreadsheets/{}/values:batchClearByDataFilter",
@@ -1047,9 +1063,17 @@
       "operation": "POST /v4/spreadsheets/{}/values:batchUpdate",
       "id": "sheets.spreadsheets.values.batchUpdate",
       "response": "sheets.BatchUpdateValuesResponse",
-      "status": "missing",
-      "kind": "missing_operation",
-      "severity": "gap"
+      "status": "implemented",
+      "params": {
+        "key": {
+          "kind": "missing_param",
+          "severity": "gap"
+        },
+        "uploadType": {
+          "kind": "missing_param",
+          "severity": "gap"
+        }
+      }
     },
     {
       "operation": "POST /v4/spreadsheets/{}/values:batchUpdateByDataFilter",
@@ -1087,9 +1111,17 @@
       "operation": "PUT /v4/spreadsheets/{}/values/{}",
       "id": "sheets.spreadsheets.values.update",
       "response": "sheets.UpdateValuesResponse",
-      "status": "missing",
-      "kind": "missing_operation",
-      "severity": "gap"
+      "status": "implemented",
+      "params": {
+        "key": {
+          "kind": "missing_param",
+          "severity": "gap"
+        },
+        "uploadType": {
+          "kind": "missing_param",
+          "severity": "gap"
+        }
+      }
     }
   ],
   "batch": {
@@ -1413,6 +1445,20 @@
         }
       }
     },
+    "sheets.BatchClearValuesResponse": {
+      "type_kind": "object",
+      "status": "implemented",
+      "fields": {
+        "clearedRanges": {
+          "status": "implemented",
+          "type": "[string]"
+        },
+        "spreadsheetId": {
+          "status": "implemented",
+          "type": "string"
+        }
+      }
+    },
     "sheets.BatchGetValuesByDataFilterResponse": {
       "type_kind": "object",
       "status": "implemented",
@@ -1438,6 +1484,36 @@
         "valueRanges": {
           "status": "implemented",
           "type": "[sheets.ValueRange]"
+        }
+      }
+    },
+    "sheets.BatchUpdateValuesResponse": {
+      "type_kind": "object",
+      "status": "implemented",
+      "fields": {
+        "responses": {
+          "status": "implemented",
+          "type": "[sheets.UpdateValuesResponse]"
+        },
+        "spreadsheetId": {
+          "status": "implemented",
+          "type": "string"
+        },
+        "totalUpdatedCells": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "totalUpdatedColumns": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "totalUpdatedRows": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "totalUpdatedSheets": {
+          "status": "implemented",
+          "type": "integer"
         }
       }
     },
@@ -2044,6 +2120,20 @@
         "startIndex": {
           "status": "missing",
           "type": "integer"
+        }
+      }
+    },
+    "sheets.ClearValuesResponse": {
+      "type_kind": "object",
+      "status": "implemented",
+      "fields": {
+        "clearedRange": {
+          "status": "implemented",
+          "type": "string"
+        },
+        "spreadsheetId": {
+          "status": "implemented",
+          "type": "string"
         }
       }
     },
@@ -4392,6 +4482,36 @@
         "textFormat": {
           "status": "missing",
           "type": "sheets.TextFormat"
+        }
+      }
+    },
+    "sheets.UpdateValuesResponse": {
+      "type_kind": "object",
+      "status": "implemented",
+      "fields": {
+        "spreadsheetId": {
+          "status": "implemented",
+          "type": "string"
+        },
+        "updatedCells": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "updatedColumns": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "updatedData": {
+          "status": "implemented",
+          "type": "sheets.ValueRange"
+        },
+        "updatedRange": {
+          "status": "implemented",
+          "type": "string"
+        },
+        "updatedRows": {
+          "status": "implemented",
+          "type": "integer"
         }
       }
     },
