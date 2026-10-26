@@ -1402,7 +1402,20 @@ _FIREFLIES_HTTP = [
         id="a persisted query's hash alone",
         answered={"cache-control": "private, no-cache, must-revalidate"},
     ),
-    # Cloudflare, ahead of everything.
+    # Cloudflare, ahead of everything. Its `CONNECT` at `/` carries no `nosniff`; Linear's carries
+    # one.
+    http_row(
+        "CONNECT",
+        "/",
+        (),
+        None,
+        "key",
+        400,
+        "text/plain; charset=UTF-8",
+        b"error code: 1045\n",
+        id="CONNECT /",
+        answered={"x-content-type-options": None},
+    ),
     http_row(
         "TRACE",
         "",

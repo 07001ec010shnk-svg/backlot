@@ -7054,14 +7054,15 @@ _LINEAR_HEADERS = [
             (),
             None,
             "key",
-            400,
+            status,
             {"x-content-type-options": n, "x-request-id": None},
             id=f"{m} {t}",
         )
-        for m, t, n in (
-            ("CONNECT", "/", "nosniff"),
-            ("CONNECT", "/nosuch", None),
-            ("PURGE", "/", None),
+        for m, t, status, n in (
+            ("CONNECT", "/", 400, "nosniff"),
+            ("CONNECT", "/nosuch", 400, None),
+            ("PURGE", "/", 400, None),
+            ("TRACE", "/", 405, None),
         )
     ),
     # `cors` in front of each: the origin sent, each copy without its spaces and tabs and joined,
@@ -7088,6 +7089,8 @@ _LINEAR_HEADERS = [
                 "https://a.example, https://b.example",
             ),
             ("empty", (("Origin", ""),), None),
+            ("tabbed", (("Origin", "\thttps://example.com\t"),), "https://example.com"),
+            ("U+00A0 after", (("Origin", "https://example.com\xa0"),), "https://example.com\xa0"),
         )
     ),
     pytest.param(
@@ -7180,6 +7183,7 @@ _REQUEST_BUDGET = [
     pytest.param([i * 13.13 / 29 for i in range(30)], "2479", id="thirty over 13 seconds"),
     pytest.param([0.0] * 2505, "0", id="past the limit"),
     pytest.param([0.0] * 2000 + [3600.0], "2499", id="an hour on"),
+    pytest.param([0.0, 1.0], "2498", id="0.69 back, rounded down"),
 ]
 
 
@@ -7196,6 +7200,19 @@ def test_linears_request_budget_refills_at_its_limit_an_hour(times, remaining):
         headers = budget.take(request, "lin_api_x")
     assert headers["x-ratelimit-requests-remaining"] == remaining
     assert headers["x-ratelimit-requests-limit"] == "2500"
+
+
+def test_linears_request_budget_counts_a_caller_with_no_credential_by_its_address():
+    from types import SimpleNamespace
+
+    from backlot.routers.linear import RequestBudget
+
+    budget = RequestBudget(clock=lambda: 1_793_022_495.115)
+    taken = [
+        budget.take(SimpleNamespace(client=SimpleNamespace(host=host)), None)
+        for host in ("203.0.113.7", "203.0.113.7", "198.51.100.2")
+    ]
+    assert [h["x-ratelimit-requests-remaining"] for h in taken] == ["1199", "1198", "1199"]
 
 
 def test_linears_request_budget_takes_one_for_a_run_and_none_for_a_refusal(client, tokens_yaml):

@@ -547,11 +547,14 @@ _REQUESTS_AN_HOUR = {True: 2500, False: 1200}
 class RequestBudget:
     """Linear's count of each caller's requests: a bucket of `limit` that refills at `limit` an
     hour, from which each answer to a document Linear ran, or whose variables it refused, takes
-    one. Measured against api.linear.app on 2026-10-26 (UTC): thirty `{ __typename }` sent over
-    13 seconds took `x-ratelimit-requests-remaining` from 2499 to 2478, which is 2,500 an hour
-    flowing back in; twelve documents refused as they validated, sent between two that ran, took
-    none; and `x-ratelimit-requests-reset` was the moment of the answer, in epoch milliseconds, on
-    each. ``clock`` is `time.time` unless a test hands in another."""
+    one, `remaining` being its level rounded down. Measured against api.linear.app on 2026-10-26
+    (UTC): thirty `{ __typename }` sent over 13 seconds took `x-ratelimit-requests-remaining` from
+    2499 to 2478, and the bucket gives each of the 42 answers in that run within 2 of real's, 30
+    of them exactly, where rounding to the nearest gives 12; twelve documents refused as they
+    validated, sent between two that ran, took none; and `x-ratelimit-requests-reset` was the
+    moment of the answer, in epoch milliseconds, on each. A caller with no credential is counted
+    by its address, which the measurement did not vary. ``clock`` is `time.time` unless a test
+    hands in another."""
 
     def __init__(self, clock: Callable[[], float] = time.time):
         self.clock = clock
