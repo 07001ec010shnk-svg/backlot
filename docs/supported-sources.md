@@ -284,9 +284,9 @@ The three editor APIs serve native-doc content for editor-aware clients, read st
 of via Google Drive export.
 
 Only a spreadsheet's owner may write it: every grant a corpus states makes a reader, and a
-reader's write is real's 403. A write lands in a per-server overlay and the corpus file is never written; [Writes, and
-where they go](write-overlay.md) covers what a read then sees, what is not modelled, and how to read
-the overlay back and reset it.
+reader's write is real's 403. A write lands in a per-server overlay and the corpus file is never
+written; [Writes, and where they go](write-overlay.md) covers what a read then sees, what is not
+modelled, and how to read the overlay back and reset it.
 
 Folders are files here: they match `mimeType='…folder'`, project, sort and resolve permissions like
 stored rows. A trashed file is listed to its owner with the rest unless `q` leaves it out with
