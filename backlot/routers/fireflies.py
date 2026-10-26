@@ -118,7 +118,8 @@ _FRIENDLY = {"invalid_arguments": True, "INTERNAL_SERVER_ERROR": False}
 
 # The methods Fastify reads a body for but `OPTIONS`, which `@fastify/cors` answers first: at a path
 # or under a method no route takes, it reads the body, then answers its not-found handler's 404
-# (:func:`_not_found`).
+# (:func:`_not_found`). Any other method's body goes unread: a `PROPFIND` to `/graphql/` under
+# `a/b/c` or with `{` as JSON drew the 404 on 2026-10-26 (UTC).
 _BODIED = ("DELETE", "PATCH", "POST", "PUT")
 
 
@@ -270,8 +271,7 @@ async def unrouted(request: Request):
     here: :data:`_NGINX_404` where nginx keeps the request (:func:`nginx_passes`), and Fastify's
     where it passes it on, :func:`_preflight` to an `OPTIONS` and its not-found handler's 404
     (:func:`_not_found`) to any other method, after reading the body of one of :data:`_BODIED`
-    (:func:`_fastify_read`). A `PROPFIND` to `/graphql/` under `a/b/c` or with `{` as JSON drew the
-    404 on 2026-10-26 (UTC), where a `POST` under `a/b/c` drew the 415."""
+    (:func:`_fastify_read`)."""
     if not nginx_passes(sent_path(request.scope)):
         return Response(_NGINX_404, status_code=404, headers={"content-type": "text/html"})
     if request.method == "OPTIONS":
