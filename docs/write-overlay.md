@@ -107,3 +107,9 @@ the eleven `<source>_acl` tables already are. Making another source writable is 
 through `store.merged_source`, minting ids the way its importer does, and the endpoints themselves.
 A source outside `WRITABLE` gets no overlay tables and reads exactly the SQL it read before writes
 existed.
+
+A source whose documents keep some of their state in a table of their own (a spreadsheet's sheets
+live in `gdrive_sheets`, not on its `gdrive_files` row) names that table in `store.SATELLITES`.
+The overlay mirrors it, `store.replace_parts` writes a document's rows there together with the
+columns that follow from them, and `store.parts_for` reads the overlay's rows for a document when
+it holds any and the corpus's otherwise, never a mix of the two.

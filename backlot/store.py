@@ -233,7 +233,7 @@ def order_columns(source_type: str) -> tuple[str, ...]:
 # path is byte-identical to a build without writes, which is what lets a new write surface ship
 # without re-validating every other vendor. Adding one is this entry, its PATCHABLE columns, and
 # its endpoints.
-WRITABLE = frozenset({"slack"})
+WRITABLE = frozenset({"slack", "google_drive"})
 
 # Per source, the columns a served write may overwrite. Everything else is immutable once written:
 # a patch to an identifier column would move a row out from under its own ACL grant, since a grant
@@ -246,7 +246,18 @@ PATCHABLE = {
     # `subtype` is here because a deleted thread root becomes a `tombstone` rather than
     # disappearing (`chat_delete`), which is a change to the message real keeps serving.
     "slack": frozenset({"content", "reactions", "edited", "thread_ts", "subtype"}),
+    # A Sheets write changes a file's cells, which live in `gdrive_sheets` (see SATELLITES), and
+    # these two follow from them. `content` is the first sheet's CSV, which `files.export` and
+    # fullText search read: measured 2026-10-26, both reflect a `values.update` on real Drive.
+    # `updated_ts` is `modifiedTime`, which real moves to the write's own time.
+    "google_drive": frozenset({"content", "updated_ts"}),
 }
+
+# Per source, the corpus tables that hold PARTS of a document rather than documents, each with the
+# columns that name the document it belongs to. The overlay mirrors each one, and a document the
+# overlay holds parts for reads them from the overlay alone (`parts_for`): a spreadsheet's sheets
+# are replaced together, so a read never mixes a written sheet with a corpus one.
+SATELLITES = {"google_drive": {"gdrive_sheets": ("file_id",)}}
 
 
 def id_columns(source_type: str) -> tuple[str, ...]:
@@ -1413,6 +1424,59 @@ def tombstone_document(conn, source_type: str, key: tuple) -> None:
         conn.commit()
 
 
+def parts_for(conn, source_type: str, table: str, key: tuple, *, order_by: str) -> list:
+    """One document's rows in a :data:`SATELLITES` table: the overlay's when it holds any for that
+    document, the corpus's otherwise. Never both -- a write replaces a document's parts whole."""
+    from backlot import overlay
+
+    where = " AND ".join(f"{c} = ?" for c in SATELLITES[source_type][table])
+    if source_type in WRITABLE and overlay.is_attached(conn):
+        rows = conn.execute(
+            f"SELECT * FROM ov.{table} WHERE {where} ORDER BY {order_by}", list(key)
+        ).fetchall()
+        if rows:
+            return rows
+    return conn.execute(
+        f"SELECT * FROM main.{table} WHERE {where} ORDER BY {order_by}", list(key)
+    ).fetchall()
+
+
+def replace_parts(
+    conn, source_type: str, key: tuple, table: str, rows: list[dict], patches: dict
+) -> None:
+    """Set a document's rows in a :data:`SATELLITES` table to exactly ``rows``, and overwrite the
+    document's ``patches`` columns, in one commit under one lock.
+
+    One commit because the two describe one state: a spreadsheet's `content` is derived from its
+    first sheet, so a reader that saw the new cells beside the old `content` would get two
+    answers for one file from Sheets and from Drive's export. ``rows`` omit the columns that name
+    the document; ``key`` supplies them, in :data:`SATELLITES` order.
+    """
+    from backlot import overlay
+
+    _require_writable(source_type)
+    ref = SATELLITES[source_type][table]
+    for field in patches:
+        _require_patchable(source_type, field)
+    known = {r[1] for r in conn.execute(f"PRAGMA main.table_info({table})")}
+    for row in rows:
+        if unknown := set(row) - known:
+            raise ValueError(f"{source_type}: no such column(s) {sorted(unknown)} on {table}")
+    where = " AND ".join(f"{c} = ?" for c in ref)
+    with overlay.LOCK:
+        conn.execute(f"DELETE FROM ov.{table} WHERE {where}", list(key))
+        for row in rows:
+            values = {**dict(zip(ref, key)), **row}
+            conn.execute(
+                f"INSERT INTO ov.{table} ({', '.join(values)}) "
+                f"VALUES ({','.join('?' for _ in values)})",
+                list(values.values()),
+            )
+        for field, value in patches.items():
+            _patch_locked(conn, source_type, key, field, value)
+        conn.commit()
+
+
 def document_by_key(conn, source_type: str, key: tuple, visible_ids=None) -> sqlite3.Row | None:
     """One document by its identifier, from whichever side holds it, or None if it is tombstoned
     or not visible to this caller."""
@@ -1613,7 +1677,7 @@ def list_documents(
     # other than True: `_drive_trash` reads a column only gdrive_files has. newest_first orders
     # gdrive_files rows by DRIVE_MODIFIED, newest first, ties by id. title matches the whole title,
     # ignoring ASCII case. subtype is Confluence's content type, where a row with none is a page.
-    tbl = table(source_type)
+    tbl = merged_source(conn, source_type)
     sql = f"SELECT * FROM {tbl} WHERE 1=1"
     params: list = []
     sql = _scope(sql, params, grouping_col(source_type), container, author_email, not_author_email)
@@ -2504,7 +2568,9 @@ def list_drive_folder(
     SQL-paginated, so listing a big folder costs one page of rows per request, not a full-corpus
     scan on every page."""
     params: list = [folder]
-    sql = _drive_trash("SELECT * FROM gdrive_files WHERE folder = ?", params, trash)
+    sql = _drive_trash(
+        f"SELECT * FROM {merged_source(conn, 'google_drive')} WHERE folder = ?", params, trash
+    )
     clause, cparams = _acl_clause("google_drive", visible_ids=visible_ids)
     sql += clause + f" ORDER BY {DRIVE_MODIFIED} DESC, id LIMIT ? OFFSET ?"
     params += cparams + [limit, offset]
@@ -2553,11 +2619,11 @@ def list_drive_by_name(
         needle = _like_escape(name)
         # SQLite LIKE is case-insensitive for ASCII and exact elsewhere — real's `name =` rule;
         # no lower() wrapper, which would force a per-row scan.
-        sql = "SELECT * FROM gdrive_files WHERE title LIKE ? ESCAPE '\\'"
+        sql = f"SELECT * FROM {merged_source(conn, 'google_drive')} WHERE title LIKE ? ESCAPE '\\'"
         params: list = [needle]
     else:
         needle = _like_escape(drive_name_fold(name))
-        sql = "SELECT * FROM gdrive_files WHERE title_fold LIKE ? ESCAPE '\\'"
+        sql = f"SELECT * FROM {merged_source(conn, 'google_drive')} WHERE title_fold LIKE ? ESCAPE '\\'"
         params = [f"%{needle}%"]
     sql = _drive_trash(sql, params, trash)
     if container is not None:
@@ -2572,7 +2638,11 @@ def list_drive_by_name(
 def count_drive_folder(conn, folder, visible_ids=None, trash=False) -> int:
     """How many files `list_drive_folder` lists for the same arguments."""
     params: list = [folder]
-    sql = _drive_trash("SELECT COUNT(*) FROM gdrive_files WHERE folder = ?", params, trash)
+    sql = _drive_trash(
+        f"SELECT COUNT(*) FROM {merged_source(conn, 'google_drive')} WHERE folder = ?",
+        params,
+        trash,
+    )
     clause, cparams = _acl_clause("google_drive", visible_ids=visible_ids)
     sql += clause
     params += cparams
@@ -2583,7 +2653,7 @@ def drive_folder_has_visible(conn, folder, visible_ids=None) -> bool:
     """Whether the caller can see any file in a folder — a ``LIMIT 1`` existence check (stops at
     the first visible file), so deciding which folders to surface is a couple of cheap probes."""
     clause, params = _acl_clause("google_drive", visible_ids=visible_ids)
-    sql = f"SELECT 1 FROM gdrive_files WHERE folder = ?{clause} LIMIT 1"
+    sql = f"SELECT 1 FROM {merged_source(conn, 'google_drive')} WHERE folder = ?{clause} LIMIT 1"
     return conn.execute(sql, [folder, *params]).fetchone() is not None
 
 
@@ -2612,7 +2682,7 @@ def drive_usage_bytes(conn, visible_ids=None) -> tuple[int, int]:
     sql = (
         f"SELECT COALESCE(SUM({nbytes}), 0), "
         f"COALESCE(SUM(CASE WHEN COALESCE(trashed, 0) = 1 THEN {nbytes} ELSE 0 END), 0) "
-        "FROM gdrive_files WHERE 1=1"
+        f"FROM {merged_source(conn, 'google_drive')} WHERE 1=1"
     )
     clause, params = _acl_clause("google_drive", visible_ids=visible_ids)
     total, trashed = conn.execute(sql + clause, params).fetchone()
@@ -2625,19 +2695,18 @@ def gdrive_by_id(conn, file_id, visible_ids=None) -> sqlite3.Row | None:
     straight through the ACL clause."""
     clause, cp = _acl_clause("google_drive", visible_ids=visible_ids)
     return conn.execute(
-        f"SELECT * FROM gdrive_files WHERE id = ?{clause}", [file_id, *cp]
+        f"SELECT * FROM {merged_source(conn, 'google_drive')} WHERE id = ?{clause}",
+        [file_id, *cp],
     ).fetchone()
 
 
 def gdrive_sheets_for(conn, file_id: str) -> list[sqlite3.Row]:
-    """A spreadsheet's stored sheets in index order, or an empty list when it states no grid.
+    """A spreadsheet's sheets in index order, or an empty list when it states no grid.
 
     No ACL clause: every caller has already resolved the file through :func:`gdrive_by_id`, which
     enforces visibility, and a sheet is not separately grantable -- reading one is reading the file
     it belongs to."""
-    return conn.execute(
-        "SELECT * FROM gdrive_sheets WHERE file_id = ? ORDER BY sheet_index", [file_id]
-    ).fetchall()
+    return parts_for(conn, "google_drive", "gdrive_sheets", (file_id,), order_by="sheet_index")
 
 
 def gdrive_replace_sheets(conn, file_id: str, rows) -> None:
@@ -2672,7 +2741,7 @@ def has_visible_document(conn, source_type, container=None, visible_ids=None) ->
     ``visible_ids`` keeps :func:`_acl_clause`'s three states, the empty set included: an anonymous
     caller reaches nothing, so every container answers False rather than True.
     """
-    tbl = table(source_type)
+    tbl = merged_source(conn, source_type)
     sql = f"SELECT 1 FROM {tbl} WHERE 1=1"
     params: list = []
     sql = _scope(sql, params, grouping_col(source_type), container, None, None)
@@ -2697,7 +2766,7 @@ def count_documents(
     # column; passing it for any other source_type raises sqlite3.OperationalError. trash is
     # list_documents', and roots_only counts gmail THREADS rather than messages. It has to track
     # list_documents': a count that includes rows the listing drops makes nextPageToken lie.
-    tbl = table(source_type)
+    tbl = merged_source(conn, source_type)
     sql = f"SELECT COUNT(*) FROM {tbl} WHERE 1=1"
     params: list = []
     sql = _scope(sql, params, grouping_col(source_type), container, author_email)
@@ -2731,7 +2800,7 @@ def get_document(conn, source_type, *ident, visible_ids=None) -> sqlite3.Row | N
             f"get_document: {source_type!r} is identified by {key}, so it takes "
             f"{len(key)} value(s), not {len(ident)}"
         )
-    tbl = table(source_type)
+    tbl = merged_source(conn, source_type)
     sql = f"SELECT * FROM {tbl} WHERE " + " AND ".join(f"{c} = ?" for c in key)
     params: list = list(ident)
     clause, cparams = _acl_clause(source_type, visible_ids=visible_ids)
