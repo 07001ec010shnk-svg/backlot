@@ -45,8 +45,9 @@ is found once, by what it says now.
 ignores are listed in its own docstring; `backlot diff` cannot see them, because it compares query
 parameters and Slack's spec declares them as form fields.
 
-A spreadsheet written through `values.update`, `values:batchUpdate`, `values.clear` or
-`values:batchClear` reads back written through every Sheets read, and through Drive: `files.export`
+A spreadsheet written through `values.update`, `values:batchUpdate`, `values.append`,
+`values.clear` or `values:batchClear` reads back written through every Sheets read, and through
+Drive: `files.export`
 serialises the new cells, fullText search finds them, and `modifiedTime` moves to the write's time.
 Real's Drive shows those about a minute after the write; Backlot shows them at once. A spreadsheet
 whose corpus record states no grid reads as one sheet of its lines, and a write lands in that grid,
@@ -56,6 +57,11 @@ after which it is a grid: real has no spreadsheet that refuses a write.
 (`12.5%`, `$1,234.50`, `2024-01-15`, `10:30 PM`), a boolean, an error or text, and a cell keeps or
 replaces its format by the rules real applies, measured input by input. A formula is the exception:
 it is stored as the text typed rather than evaluated.
+
+`values.append` finds the table it writes below the way real does: from the first cell in the range
+holding a value, column by column, grown through every cell in the row or column next to it, and
+the values go on the row under it from its first column. `INSERT_ROWS` inserts whole rows there,
+and the sheet's row count grows with them.
 
 Search needed one thing more. Relevance is bm25, whose inverse document frequency is a property of
 the index a term is in — so an overlay holding a handful of rows scores everything in it at about

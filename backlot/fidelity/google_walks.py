@@ -98,6 +98,16 @@ def _sheets_writes(client: httpx.Client) -> list[tuple[str, Any]]:
                 )
             ),
         ),
+        (
+            "sheets.spreadsheets.values.append",
+            _ok(
+                client.post(
+                    f"{base}/values/Data!A1:append",
+                    params={"valueInputOption": "RAW", "includeValuesInResponse": "true"},
+                    json={"values": [["LATAM", 3, True]]},
+                )
+            ),
+        ),
         ("sheets.spreadsheets.values.clear", _ok(client.post(f"{base}/values/More!A3:clear"))),
         (
             "sheets.spreadsheets.values.batchClear",

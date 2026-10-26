@@ -6040,6 +6040,7 @@ async def sheets_get_by_data_filter(spreadsheet_id: str, request: Request):
 # and fullText search read, and `updated_ts` is `modifiedTime`, which real moves to the write's
 # own time. Real's Drive shows both about a minute later; this shows them at once.
 
+_PJ_INSERT_DATA = _pj_enum("InsertDataOption", "OVERWRITE", "INSERT_ROWS")
 _PJ_VALUE_INPUT = _pj_enum(
     "ValueInputOption", "INPUT_VALUE_OPTION_UNSPECIFIED", "RAW", "USER_ENTERED"
 )
@@ -6088,13 +6089,24 @@ _P_SHEETS_UPDATE = [
 ]
 
 
-def _sheets_write_options(request: Request) -> dict:
+def _sheets_write_options(request: Request, *, append: bool = False) -> dict:
     """The typed query values a write reads, refused as the reads' are (`_typed_query`): a bad one
     is a 400 ahead of the lookup, measured, so a reader sending `includeValuesInResponse=bogus`
-    gets it rather than its 403. Each by its last repeat, ``None`` when absent."""
+    gets it rather than its 403. Each by its last repeat, ``None`` when absent. ``append`` adds the
+    `insertDataOption` only `values.append` declares."""
+    extra = (
+        {
+            "insertDataOption": lambda raw: _sheets_enum_value(
+                raw, "insert_data_option", _PJ_INSERT_DATA
+            )
+        }
+        if append
+        else {}
+    )
     parsed = _typed_query(
         request,
         {
+            **extra,
             "valueInputOption": lambda raw: _sheets_enum_value(
                 raw, "value_input_option", _PJ_VALUE_INPUT
             ),
@@ -6161,11 +6173,7 @@ def _sheets_writing(spec: str, sheets: list[_Sheet], values: list, major: str, *
         single = classified is not None and len(classified[1]) == 1
         single = single and classified[1][0].row is not None and classified[1][0].col is not None
         r0, c0, r1, c1 = _a1_range(spec, body, sheet)
-        if major == "COLUMNS":
-            height = max((len(col) for col in values), default=0)
-            rows = [[col[i] if i < len(col) else None for col in values] for i in range(height)]
-        else:
-            rows = [list(row) for row in values]
+        rows = _sheets_rows(values, major)
         if not single:
             name = _a1_name(sheet, r0, c0, r1, c1)
             for i, row in enumerate(rows):
@@ -6179,17 +6187,31 @@ def _sheets_writing(spec: str, sheets: list[_Sheet], values: list, major: str, *
                         f"Requested writing within range [{name}], but tried writing to column "
                         f"[{_a1_col_letters(c1)}]"
                     )
-        for i, row in enumerate(rows):
-            for j, value in enumerate(row):
-                if isinstance(value, (dict, list)):
-                    raise gerr.invalid_argument(
-                        f"Invalid values[{r0 + i}][{j}]: {protojson.value_debug(value)}"
-                    )
+        _sheets_refuse_unstorable(rows, r0)
     except gerr.GoogleError as exc:
         if not prefix:
             raise
         raise gerr.invalid_argument(prefix + exc.message) from None
     return _Writing(sheet, r0, c0, None if single else (r0, c0, r1, c1), rows)
+
+
+def _sheets_rows(values: list, major: str) -> list[list]:
+    """A body's ``values`` as rows, each inner list a column under ``COLUMNS``."""
+    if major != "COLUMNS":
+        return [list(row) for row in values]
+    height = max((len(col) for col in values), default=0)
+    return [[col[i] if i < len(col) else None for col in values] for i in range(height)]
+
+
+def _sheets_refuse_unstorable(rows: list[list], r0: int) -> None:
+    """Refuse a cell that is an object or a list, naming it by its row in the sheet and its column
+    in the request (`_sheets_writing`)."""
+    for i, row in enumerate(rows):
+        for j, value in enumerate(row):
+            if isinstance(value, (dict, list)):
+                raise gerr.invalid_argument(
+                    f"Invalid values[{r0 + i}][{j}]: {protojson.value_debug(value)}"
+                )
 
 
 def _sheets_grids(sheets: list[_Sheet]) -> dict[int, list[list]]:
@@ -6470,6 +6492,113 @@ async def sheets_values_clear(spreadsheet_id: str, a1_range: str, request: Reque
         _sheets_save(auth.conn(request), row, _sheets_reloaded(sheets, grids))
     sheet, r0, c0, r1, c1 = clearing
     out = {"spreadsheetId": spreadsheet_id, "clearedRange": _a1_name(sheet, r0, c0, r1, c1)}
+    return _sheets_respond(request, out, tree)
+
+
+def _sheets_append_bounds(spec: str, sheets: list[_Sheet]):
+    """``(sheet, r0, c0, r1, c1)``: where an append searches for a table, the range cut at the
+    grid's edge. A range starting past the edge is not refused, as an update's is: measured, an
+    append to `Other!AB1` on a 26-column sheet wrote there. Its search covers nothing."""
+    sheet, body = _a1_sheet(spec, sheets)
+    try:
+        return (sheet, *_a1_range(spec, body, sheet))
+    except gerr.GoogleError:
+        classified = _a1_classify(body) if body else None
+        if classified is None:
+            raise
+        ends = classified[1]
+        r0 = min((e.row for e in ends if e.row is not None), default=0)
+        c0 = min((e.col for e in ends if e.col is not None), default=0)
+        return sheet, r0, c0, r0, c0
+
+
+def _sheets_table(grid: list[list], r0: int, c0: int, r1: int, c1: int):
+    """The table an append writes below, as inclusive ``(top, left, bottom, right)``, or None.
+
+    Measured: it starts at the first cell in the range holding a value, column by column -- in
+    `F1:G10` a table from `F5` is found ahead of a value in `G1` -- and grows
+    while a cell holding one sits in the row just above or below it or the column just left or
+    right, within its span -- so `A1`, `A2`, `B2` and `C1` make `A1:C2`, while `C2` diagonal to
+    `A1:B1` is left out. A cell a write emptied holds no value and joins nothing."""
+
+    def filled(r: int, c: int) -> bool:
+        return (
+            0 <= r < len(grid) and 0 <= c < len(grid[r]) and sheets_grid.formatted(grid[r][c]) != ""
+        )
+
+    start = next(
+        ((r, c) for c in range(c0, c1) for r in range(r0, min(r1, len(grid))) if filled(r, c)),
+        None,
+    )
+    if start is None:
+        return None
+    top, bottom, left, right = start[0], start[0], start[1], start[1]
+    grown = True
+    while grown:
+        grown = False
+        if any(filled(top - 1, c) for c in range(left, right + 1)):
+            top, grown = top - 1, True
+        if any(filled(bottom + 1, c) for c in range(left, right + 1)):
+            bottom, grown = bottom + 1, True
+        if any(filled(r, left - 1) for r in range(top, bottom + 1)):
+            left, grown = left - 1, True
+        if any(filled(r, right + 1) for r in range(top, bottom + 1)):
+            right, grown = right + 1, True
+    return top, left, bottom, right
+
+
+@router.post(
+    "/sheets/v4/spreadsheets/{spreadsheet_id}/values/{a1_range:path}:append",
+    openapi_extra={"parameters": [qp("insertDataOption"), *_P_SHEETS_UPDATE]},
+)
+async def sheets_values_append(spreadsheet_id: str, a1_range: str, request: Request):
+    """``spreadsheets.values.append``: ``{spreadsheetId, tableRange, updates}``, with ``tableRange``
+    absent when the range holds no table (`_sheets_table`).
+
+    Measured: the values go on the first row below the table, from the table's first column
+    whatever column the range named; with no table, at the range's first cell. A row is not
+    bounded by the range, and the grid grows to hold what runs past it. ``INSERT_ROWS`` inserts
+    that many rows there first, every column of them, and the sheet's row count grows by as
+    many even far from its edge; ``OVERWRITE``, the default, writes over what is there.
+    ``updatedData`` reads back ``updatedRange``, not the request range as an update's does.
+    Refused in an update's order (`sheets_values_update`)."""
+    _sheets_alt(request)
+    _require(request)
+    opts = _sheets_write_options(request, append=True)
+    body = protojson.read(await request.body(), _PJ_UPDATE, field="data").get("data", {})
+    tree, _ = _sheets_mask(request, "sheets.AppendValuesResponse")
+    row, sheets = _sheets_writable(request, spreadsheet_id)
+    option = _sheets_input_option(opts["valueInputOption"])
+    if "range" in body and body["range"] != a1_range:
+        raise gerr.invalid_argument(
+            f"Request range[{a1_range}] does not match value's range[{body['range']}]"
+        )
+    major = _sheets_major(_PJ_DIMENSION.names[body.get("major_dimension", 0)])
+    sheet, r0, c0, r1, c1 = _sheets_append_bounds(a1_range, sheets)
+    grids = _sheets_grids(sheets)
+    grid = grids[sheet.index]
+    table = _sheets_table(grid, r0, c0, r1, c1)
+    at_row, at_col = (table[2] + 1, table[1]) if table else (r0, c0)
+    rows = _sheets_rows(body.get("values", []), major)
+    _sheets_refuse_unstorable(rows, at_row)
+    inserted = bool(rows) and opts["insertDataOption"] == "INSERT_ROWS"
+    if inserted:
+        grid.extend([] for _ in range(sheet.rows - len(grid)))
+        grid[at_row:at_row] = [[] for _ in rows]
+    writing = _Writing(sheet, at_row, at_col, None, rows)
+    written = _sheets_apply(writing, grids, option, _sheets_today())
+    after = _sheets_reloaded(sheets, grids)
+    if written or inserted:
+        _sheets_save(auth.conn(request), row, after)
+    out: dict = {"spreadsheetId": spreadsheet_id}
+    if table:
+        out["tableRange"] = _a1_name(sheet, table[0], table[1], table[2] + 1, table[3] + 1)
+    updates = _sheets_update_response(spreadsheet_id, writing, written)
+    if opts["includeValuesInResponse"]:
+        updates["updatedData"] = _sheets_updated_data(
+            writing, updates["updatedRange"], after, major, opts
+        )
+    out["updates"] = updates
     return _sheets_respond(request, out, tree)
 
 

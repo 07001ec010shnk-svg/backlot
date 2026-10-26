@@ -13140,6 +13140,7 @@ def test_who_may_write_and_in_what_order_a_write_is_refused(
         ("PUT", "/values/A1", "UpdateValues"),
         ("POST", "/values:batchUpdate", "BatchUpdateValues"),
         ("POST", "/values/A1:clear", "ClearValues"),
+        ("POST", "/values/A1:append", "AppendValues"),
         ("POST", "/values:batchClear", "BatchClearValues"),
         ("POST", "/values:batchGetByDataFilter", "BatchGetValuesByDataFilter"),
         ("POST", ":getByDataFilter", "GetSpreadsheetByDataFilter"),
@@ -13341,3 +13342,131 @@ def test_a_written_cell_carries_its_format_and_an_error_its_type(wc, wh, wbook):
     assert _read_back(wc, h, wbook, "Data!B4", valueRenderOption="UNFORMATTED_VALUE") == [
         ["#N/A ()"]
     ]
+
+
+def _layout(wc, h, wbook, cells):
+    """Clear `Data` and write ``cells`` (`{"B2": "x"}`) into it."""
+    wc.post(f"{wbook}/values/Data:clear", headers=h)
+    for at, value in cells.items():
+        wc.put(f"{wbook}/values/Data!{at}", headers=h, params=_RAW, json={"values": [[value]]})
+
+
+@pytest.mark.parametrize(
+    "cells,rng,table,written",
+    [
+        # measured: the first cell holding a value, column by column, starts the table
+        ({"E5": "t", "F5": "u", "G1": "m"}, "Data!F1:G10", "Data!E5:F5", "Data!E6"),
+        ({"A5": "t", "B5": "u"}, "Data!A1:A10", "Data!A5:B5", "Data!A6"),
+        # it grows through a cell in the row or column next to it, never a diagonal one
+        ({"A1": "a", "A2": "b", "B2": "c", "C1": "d"}, "Data!A1", "Data!A1:C2", "Data!A3"),
+        ({"A1": "a", "B1": "b", "C2": "c"}, "Data!A1", "Data!A1:B1", "Data!A2"),
+        # and the values start in its first column, whatever column the range named
+        ({"A1": "a", "B1": "b", "C1": "c"}, "Data!C1", "Data!A1:C1", "Data!A2"),
+        # no value in the range: no table, and the values go to the range's first cell
+        ({"A1": "a", "B1": "b"}, "Data!D1", None, "Data!D1"),
+        ({}, "Data!A12", None, "Data!A12"),
+        # past the grid's edge is no refusal for an append
+        ({}, "Data!AB1", None, "Data!AB1"),
+    ],
+)
+def test_an_append_writes_below_the_table_it_finds(wc, wh, wbook, cells, rng, table, written):
+    h = wh[_OWNER]
+    _layout(wc, h, wbook, cells)
+    r = wc.post(
+        f"{wbook}/values/{quote(rng, safe='')}:append",
+        headers=h,
+        params=_RAW,
+        json={"values": [["new"]]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("tableRange") == table
+    assert r.json()["updates"]["updatedRange"] == written
+
+
+def test_an_appended_cell_a_write_emptied_starts_no_table(wc, wh, wbook):
+    """A format-only cell and an empty string hold no value, so neither is a table."""
+    h = wh[_OWNER]
+    _layout(wc, h, wbook, {"B1": ""})
+    wc.put(f"{wbook}/values/Data!A1", headers=h, params=_ENTERED, json={"values": [["12%"]]})
+    wc.post(f"{wbook}/values/Data!A1:clear", headers=h)
+    r = wc.post(
+        f"{wbook}/values/Data!A1:B1:append", headers=h, params=_RAW, json={"values": [["x"]]}
+    )
+    assert "tableRange" not in r.json()
+    assert r.json()["updates"]["updatedRange"] == "Data!A1"
+
+
+def test_insert_rows_moves_what_is_below_and_grows_the_grid(wc, wh, wbook):
+    """Measured: `INSERT_ROWS` inserts whole rows below the table, so a row under it moves down,
+    and the row count grows by as many even far from the sheet's edge. `updatedData` reads back
+    `updatedRange`, and with nothing to write nothing is inserted."""
+    h = wh[_OWNER]
+    _layout(wc, h, wbook, {"A1": "a", "B1": "x", "A2": "b", "A4": "below", "C4": "far"})
+    r = wc.post(
+        f"{wbook}/values/Data!A1:append",
+        headers=h,
+        params={**_RAW, "insertDataOption": "INSERT_ROWS", "includeValuesInResponse": "true"},
+        json={"values": [[None, "n1"], ["n2"]]},
+    )
+    sid = wbook.rsplit("/", 1)[1]
+    assert r.json() == {
+        "spreadsheetId": sid,
+        "tableRange": "Data!A1:B2",
+        "updates": {
+            "spreadsheetId": sid,
+            "updatedRange": "Data!A3:B4",
+            "updatedRows": 2,
+            "updatedColumns": 2,
+            "updatedCells": 2,
+            "updatedData": {
+                "range": "Data!A3:B4",
+                "majorDimension": "ROWS",
+                "values": [["", "n1"], ["n2"]],
+            },
+        },
+    }
+    assert _read_back(wc, h, wbook, "Data!A1:C6") == [
+        ["a", "x"],
+        ["b"],
+        ["", "n1"],
+        ["n2"],
+        [],
+        ["below", "", "far"],
+    ]
+    grid = wc.get(wbook, headers=h).json()["sheets"][0]["properties"]["gridProperties"]
+    assert grid == {"rowCount": 1002, "columnCount": 26}
+    wc.post(
+        f"{wbook}/values/Data!A1:append",
+        headers=h,
+        params={**_RAW, "insertDataOption": "INSERT_ROWS"},
+        json={"values": []},
+    )
+    grid = wc.get(wbook, headers=h).json()["sheets"][0]["properties"]["gridProperties"]
+    assert grid["rowCount"] == 1002
+
+
+@pytest.mark.parametrize(
+    "params,body,message",
+    [
+        (
+            {**_RAW, "insertDataOption": "BOGUS"},
+            {"values": [["x"]]},
+            "Invalid value at 'insert_data_option' "
+            '(type.googleapis.com/google.apps.sheets.v4.InsertDataOption), "BOGUS"',
+        ),
+        ({}, {"values": [["x"]]}, "'valueInputOption' is required but not specified"),
+        (
+            _RAW,
+            {"range": "Data!B1", "values": [["x"]]},
+            "Request range[Data!A1] does not match value's range[Data!B1]",
+        ),
+        (
+            _RAW,
+            {"bogus": 1},
+            "Invalid JSON payload received. Unknown name \"bogus\" at 'data': Cannot find field.",
+        ),
+    ],
+)
+def test_an_append_real_refuses_is_refused_with_reals_message(wc, wh, wbook, params, body, message):
+    r = wc.post(f"{wbook}/values/Data!A1:append", headers=wh[_OWNER], params=params, json=body)
+    assert (r.status_code, r.json()["error"]["message"]) == (400, message)

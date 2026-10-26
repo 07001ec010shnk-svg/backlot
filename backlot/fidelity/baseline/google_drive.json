@@ -999,9 +999,17 @@
       "operation": "POST /v4/spreadsheets/{}/values/{}:append",
       "id": "sheets.spreadsheets.values.append",
       "response": "sheets.AppendValuesResponse",
-      "status": "missing",
-      "kind": "missing_operation",
-      "severity": "gap"
+      "status": "implemented",
+      "params": {
+        "key": {
+          "kind": "missing_param",
+          "severity": "gap"
+        },
+        "uploadType": {
+          "kind": "missing_param",
+          "severity": "gap"
+        }
+      }
     },
     {
       "operation": "POST /v4/spreadsheets/{}/values/{}:clear",
@@ -1159,6 +1167,24 @@
     ]
   },
   "types": {
+    "sheets.AppendValuesResponse": {
+      "type_kind": "object",
+      "status": "implemented",
+      "fields": {
+        "spreadsheetId": {
+          "status": "implemented",
+          "type": "string"
+        },
+        "tableRange": {
+          "status": "implemented",
+          "type": "string"
+        },
+        "updates": {
+          "status": "implemented",
+          "type": "sheets.UpdateValuesResponse"
+        }
+      }
+    },
     "sheets.BandedRange": {
       "type_kind": "object",
       "status": "missing",

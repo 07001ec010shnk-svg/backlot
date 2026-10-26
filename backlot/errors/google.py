@@ -585,13 +585,13 @@ _UNREGISTERED_CALLER_OPERATIONS = tuple(
 
 
 # The RPC each operation's missing-credential 401 names, by its HTTP method and path, measured
-# 2026-10-26 on `sheets.googleapis.com`. Checked in order, so `:clear` is matched ahead of the
-# update it would otherwise read as.
+# 2026-10-26 on `sheets.googleapis.com`.
 _SHEETS_RPC = "google.apps.sheets.v4.SpreadsheetsService"
 _RPC_METHODS = tuple(
     (method, re.compile(pattern), (f"{_SHEETS_RPC}.{name}", "sheets.googleapis.com"))
     for method, pattern, name in (
         ("POST", r"/sheets/v4/spreadsheets/[^/]+/values/.+:clear", "ClearValues"),
+        ("POST", r"/sheets/v4/spreadsheets/[^/]+/values/.+:append", "AppendValues"),
         ("PUT", r"/sheets/v4/spreadsheets/[^/]+/values/.+", "UpdateValues"),
         ("POST", r"/sheets/v4/spreadsheets/[^/]+/values:batchUpdate", "BatchUpdateValues"),
         ("POST", r"/sheets/v4/spreadsheets/[^/]+/values:batchClear", "BatchClearValues"),
