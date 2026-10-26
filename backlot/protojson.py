@@ -29,9 +29,10 @@ class Enum(NamedTuple):
 
 
 class Field(NamedTuple):
-    """One field of a :class:`Message`. ``kind`` is ``int32``, ``string``, ``bool``, ``enum``,
-    ``message`` or ``rows`` (a repeated ``google.protobuf.ListValue``, read whole by
-    :meth:`_Writer.rows`); ``wrapper`` marks an ``Int32Value``/``StringValue`` field, whose scalar lives in a
+    """One field of a :class:`Message`. ``kind`` is ``int32``, ``double``, ``string``, ``bool``,
+    ``enum``, ``message``, ``rows`` (a repeated ``google.protobuf.ListValue``) or ``any`` (a
+    ``google.protobuf.Value`` or a map, kept as plain JSON) -- the last two read whole by
+    :meth:`_Writer.rows`; ``wrapper`` marks an ``Int32Value``/``StringValue`` field, whose scalar lives in a
     ``value`` member that the error path names."""
 
     json_name: str
@@ -116,6 +117,20 @@ def to_int32(piece: tuple[str, object]) -> int:
         return value  # type: ignore[return-value]
     if kind == "double" and value == int(value) and _INT32[0] <= value <= _INT32[1]:  # type: ignore[arg-type]
         return int(value)  # type: ignore[arg-type]
+    raise ConversionError(value_text(piece))
+
+
+def to_double(piece: tuple[str, object]) -> float:
+    """A proto3 JSON ``double``: a number, or a string spelling one, `NaN` and the infinities
+    included."""
+    kind, value = piece
+    if kind in ("int", "double"):
+        return float(value)  # type: ignore[arg-type]
+    if kind == "string":
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except ValueError:
+            pass
     raise ConversionError(value_text(piece))
 
 
@@ -290,8 +305,12 @@ class _Writer:
             return False
         top = self.stack[-1]
         field = top.message.find(name)
-        if field is None or field.kind != "rows":
+        if field is None or field.kind not in ("rows", "any"):
             return False
+        if field.kind == "any":
+            if value is not None:
+                top.out[field.name] = _plain(value)
+            return True
         at = _Frame(top, None, field, None).location()
         if value is None:
             return True
@@ -553,12 +572,16 @@ def _wrapper(field: Field) -> Message:
 def _type_name(field: Field) -> str:
     if field.kind == "enum":
         return field.enum.type_url
+    if field.kind == "double":
+        return "TYPE_DOUBLE"
     return f"TYPE_{field.kind.upper()}"
 
 
 def _convert(field: Field, piece: tuple[str, object]):
     if field.kind == "int32":
         return to_int32(piece)
+    if field.kind == "double":
+        return to_double(piece)
     if field.kind == "string":
         return to_string(piece)
     if field.kind == "bool":

@@ -108,10 +108,63 @@ def _sheets_writes(client: httpx.Client) -> list[tuple[str, Any]]:
                 )
             ),
         ),
+        (
+            "sheets.spreadsheets.values.batchUpdateByDataFilter",
+            _ok(
+                client.post(
+                    f"{base}/values:batchUpdateByDataFilter",
+                    json={
+                        "valueInputOption": "RAW",
+                        "includeValuesInResponse": True,
+                        "data": [{"dataFilter": {"a1Range": "More!A3"}, "values": [["y"]]}],
+                    },
+                )
+            ),
+        ),
+        (
+            "sheets.spreadsheets.values.batchClearByDataFilter",
+            _ok(
+                client.post(
+                    f"{base}/values:batchClearByDataFilter",
+                    json={"dataFilters": [{"a1Range": "More!A3"}]},
+                )
+            ),
+        ),
         ("sheets.spreadsheets.values.clear", _ok(client.post(f"{base}/values/More!A3:clear"))),
         (
             "sheets.spreadsheets.values.batchClear",
             _ok(client.post(f"{base}/values:batchClear", json={"ranges": ["More!A3"]})),
+        ),
+        (
+            "sheets.spreadsheets.sheets.copyTo",
+            _ok(
+                client.post(
+                    f"{base}/sheets/0:copyTo", json={"destinationSpreadsheetId": files[0]["id"]}
+                )
+            ),
+        ),
+        (
+            "sheets.spreadsheets.create",
+            _ok(
+                client.post(
+                    "/sheets/v4/spreadsheets",
+                    json={
+                        "properties": {"title": "Walk created"},
+                        "sheets": [
+                            {
+                                "properties": {
+                                    "title": "Made",
+                                    "hidden": False,
+                                    "tabColor": {"red": 1},
+                                    "rightToLeft": True,
+                                    "gridProperties": {"frozenRowCount": 1, "hideGridlines": True},
+                                }
+                            },
+                            {"properties": {"title": "Hidden", "hidden": True}},
+                        ],
+                    },
+                )
+            ),
         ),
     ]
 

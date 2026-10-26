@@ -13141,6 +13141,9 @@ def test_who_may_write_and_in_what_order_a_write_is_refused(
         ("POST", "/values:batchUpdate", "BatchUpdateValues"),
         ("POST", "/values/A1:clear", "ClearValues"),
         ("POST", "/values/A1:append", "AppendValues"),
+        ("POST", "/sheets/0:copyTo", "CopySheetToAnotherSpreadsheet"),
+        ("POST", "/values:batchUpdateByDataFilter", "BatchUpdateValuesByDataFilter"),
+        ("POST", "/values:batchClearByDataFilter", "BatchClearValuesByDataFilter"),
         ("POST", "/values:batchClear", "BatchClearValues"),
         ("POST", "/values:batchGetByDataFilter", "BatchGetValuesByDataFilter"),
         ("POST", ":getByDataFilter", "GetSpreadsheetByDataFilter"),
@@ -13470,3 +13473,307 @@ def test_insert_rows_moves_what_is_below_and_grows_the_grid(wc, wh, wbook):
 def test_an_append_real_refuses_is_refused_with_reals_message(wc, wh, wbook, params, body, message):
     r = wc.post(f"{wbook}/values/Data!A1:append", headers=wh[_OWNER], params=params, json=body)
     assert (r.status_code, r.json()["error"]["message"]) == (400, message)
+
+
+def _create(wc, h, body):
+    r = wc.post("/sheets/v4/spreadsheets", headers=h, json=body)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_a_created_spreadsheet_is_its_creators_alone_at_their_root(wc, wh):
+    """Measured: with no `sheets` the one sheet is `Sheet1`, `sheetId 0`, 1000 x 26; the Drive
+    file sits at the creator's My Drive root, listed under `'root' in parents`, with one
+    permission, the owner's, and not shared; anyone else gets the 403 and 404 a hidden file gets."""
+    from backlot import synth
+
+    h = wh[_OWNER]
+    book = _create(wc, h, {"properties": {"title": "Fresh"}})
+    sid = book["spreadsheetId"]
+    assert list(book) == ["spreadsheetId", "properties", "sheets", "spreadsheetUrl"]
+    assert book["sheets"] == [
+        {
+            "properties": {
+                "sheetId": 0,
+                "title": "Sheet1",
+                "index": 0,
+                "sheetType": "GRID",
+                "gridProperties": {"rowCount": 1000, "columnCount": 26},
+            }
+        }
+    ]
+    ouid = synth.google_user_id(_OWNER)
+    assert (
+        book["spreadsheetUrl"] == f"https://docs.google.com/spreadsheets/d/{sid}/edit?ouid={ouid}"
+    )
+    f = wc.get(f"/drive/v3/files/{sid}", headers=h, params={"fields": "name,parents,shared"}).json()
+    assert f == {"name": "Fresh", "parents": [synth.drive_root_id(_OWNER)], "shared": False}
+    roots = [
+        x["id"]
+        for q in ("'root' in parents", f"'{synth.drive_root_id(_OWNER)}' in parents")
+        for x in wc.get("/drive/v3/files", headers=h, params={"q": q}).json()["files"]
+    ]
+    assert roots.count(sid) == 2
+    perms = wc.get(f"/drive/v3/files/{sid}/permissions", headers=h).json()["permissions"]
+    assert [p["role"] for p in perms] == ["owner"]
+    other = wh["reader@acme.com"]
+    assert wc.get(f"/sheets/v4/spreadsheets/{sid}", headers=other).status_code == 403
+    assert wc.get(f"/drive/v3/files/{sid}", headers=other).status_code == 404
+    assert _create(wc, h, {})["properties"]["title"] == "Untitled spreadsheet"
+
+
+def test_a_created_spreadsheet_keeps_what_its_sheets_state(wc, wh):
+    """Measured: stated sheets each get an id of their own unless they state one; the grid size,
+    `hidden`, `tabColor` (served with a `tabColorStyle`), `rightToLeft`, frozen rows and
+    `hideGridlines` are kept; `data` is stored though the answer carries no grid; the settings
+    a request states are served back, a time zone that names none replaced by GMT. A write then
+    meets the stated grid's edge."""
+    h = wh[_OWNER]
+    book = _create(
+        wc,
+        h,
+        {
+            "properties": {"title": "Stated", "timeZone": "Asia/Seoul", "autoRecalc": "HOUR"},
+            "sheets": [
+                {
+                    "properties": {
+                        "title": "G",
+                        "sheetId": 42,
+                        "gridProperties": {"rowCount": 5, "columnCount": 3, "frozenRowCount": 1},
+                        "tabColor": {"red": 1},
+                    },
+                    "data": [
+                        {
+                            "startRow": 1,
+                            "rowData": [
+                                {
+                                    "values": [
+                                        {"userEnteredValue": {"stringValue": "hi"}},
+                                        {
+                                            "userEnteredValue": {"numberValue": 0.125},
+                                            "userEnteredFormat": {
+                                                "numberFormat": {
+                                                    "type": "PERCENT",
+                                                    "pattern": "0.00%",
+                                                }
+                                            },
+                                        },
+                                    ]
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {"properties": {"title": "H", "hidden": True}},
+                {},
+            ],
+        },
+    )
+    sid = book["spreadsheetId"]
+    sheets = [s["properties"] for s in book["sheets"]]
+    assert sheets[0] == {
+        "sheetId": 42,
+        "title": "G",
+        "index": 0,
+        "sheetType": "GRID",
+        "gridProperties": {"rowCount": 5, "columnCount": 3, "frozenRowCount": 1},
+        "tabColor": {"red": 1},
+        "tabColorStyle": {"rgbColor": {"red": 1}},
+    }
+    assert sheets[1]["hidden"] is True and sheets[1]["sheetId"] not in (0, 42)
+    assert sheets[2]["title"] == "Sheet1"
+    assert "data" not in book["sheets"][0]
+    assert (book["properties"]["timeZone"], book["properties"]["autoRecalc"]) == (
+        "Asia/Seoul",
+        "HOUR",
+    )
+    path = f"/sheets/v4/spreadsheets/{sid}"
+    assert _read_back(wc, h, path, "G!A1:B2") == [[], ["hi", "12.50%"]]
+    r = wc.put(f"{path}/values/G!D1", headers=h, params=_RAW, json={"values": [["x"]]})
+    assert r.json()["error"]["message"] == (
+        "Range (G!D1) exceeds grid limits. Max rows: 5, max columns: 3"
+    )
+    bad_zone = _create(wc, h, {"properties": {"timeZone": "Mars/Base"}})
+    assert bad_zone["properties"]["timeZone"] == "Etc/GMT"
+
+
+@pytest.mark.parametrize(
+    "body,message",
+    [
+        (
+            {
+                "sheets": [
+                    {"properties": {"title": "a", "sheetId": 7}},
+                    {"properties": {"title": "b", "sheetId": 7}},
+                ]
+            },
+            "Invalid sheets[1].id: Duplicate ids are not allowed. Multiple sheets are assigned to id 7",
+        ),
+        (
+            {"sheets": [{"properties": {"title": "a", "sheetId": -1}}]},
+            "Invalid sheets[0]: Sheet id must be non-negative.",
+        ),
+        ({"spreadsheetId": "abc"}, "Invalid spreadsheet.spreadsheetId: The id is invalid."),
+        (
+            {"bogus": 1},
+            "Invalid JSON payload received. Unknown name \"bogus\" at 'spreadsheet': Cannot find field.",
+        ),
+        ({"properties": {"locale": "xx_YY"}}, "Invalid properties: Unsupported locale: xx_YY"),
+        (
+            {"sheets": [{"properties": {"title": "o", "sheetType": "OBJECT"}}]},
+            "Object sheets must have exactly one embedded object",
+        ),
+        (
+            {
+                "sheets": [
+                    {
+                        "data": [
+                            {
+                                "rowData": [
+                                    {
+                                        "values": [
+                                            {"userEnteredValue": {"errorValue": {"type": "N_A"}}}
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            },
+            "Invalid sheets[0].data[0]: Cannot set cell to an error value",
+        ),
+        (
+            {
+                "sheets": [
+                    {
+                        "properties": {"gridProperties": {"rowCount": 2, "columnCount": 2}},
+                        "data": [
+                            {
+                                "startRow": 3,
+                                "rowData": [
+                                    {"values": [{"userEnteredValue": {"stringValue": "x"}}]}
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            },
+            "Invalid sheets[0].data[0]: GridCoordinate.rowIndex[3] is after last row in grid[1]",
+        ),
+    ],
+)
+def test_a_create_real_refuses_is_refused_with_reals_message(wc, wh, body, message):
+    r = wc.post("/sheets/v4/spreadsheets", headers=wh[_OWNER], json=body)
+    assert (r.status_code, r.json()["error"]["message"]) == (400, message)
+    assert wc.get("/_meta/overlay").json()["gdrive_files"] == []
+
+
+def test_copy_to_adds_a_copy_named_in_the_destinations_language(wc, wh, wbook):
+    """Measured: the copy goes last with an id of its own, its source's properties and cells, and
+    a title in the destination's language -- `Copy of Data`, then `Copy of Data 1`. Reading the
+    source is enough; the destination has to be the caller's to write."""
+    h = wh[_OWNER]
+    dest = _create(wc, h, {"properties": {"title": "Dest"}})["spreadsheetId"]
+    korean = _create(wc, h, {"properties": {"locale": "ko_KR"}})["spreadsheetId"]
+    copy = f"{wbook}/sheets/0:copyTo"
+    first = wc.post(copy, headers=h, json={"destinationSpreadsheetId": dest}).json()
+    again = wc.post(copy, headers=h, json={"destinationSpreadsheetId": dest}).json()
+    assert (first["title"], first["index"], again["title"]) == ("Copy of Data", 1, "Copy of Data 1")
+    assert first["sheetId"] not in (0, again["sheetId"])
+    path = f"/sheets/v4/spreadsheets/{dest}"
+    assert _read_back(wc, h, path, "'Copy of Data'!A1:B2") == [["region", "deals"], ["EMEA", "12"]]
+    ko = wc.post(copy, headers=h, json={"destinationSpreadsheetId": korean}).json()
+    assert ko["title"] == "Data의 사본"
+    reader = wh["reader@acme.com"]
+    assert wc.post(copy, headers=reader, json={"destinationSpreadsheetId": dest}).status_code == 403
+    for body, message in [
+        ({}, "Invalid destinationSpreadsheetId []"),
+        ({"destinationSpreadsheetId": "1nope"}, "Invalid destinationSpreadsheetId [1nope]"),
+    ]:
+        assert wc.post(copy, headers=h, json=body).json()["error"]["message"] == message
+    missing = wc.post(
+        f"{wbook}/sheets/9:copyTo", headers=h, json={"destinationSpreadsheetId": dest}
+    )
+    assert missing.json()["error"]["message"] == "The sheet (9) does not exist."
+
+
+def test_a_data_filter_write_is_bounded_by_what_the_filter_matches(wc, wh, wbook):
+    """Measured: a matched range is a bound even when it is one cell, a developer metadata lookup
+    leaves no entry, and each entry echoes its filter with no `spreadsheetId`."""
+    h = wh[_OWNER]
+    path = f"{wbook}/values:batchUpdateByDataFilter"
+    r = wc.post(
+        path,
+        headers=h,
+        json={
+            "valueInputOption": "RAW",
+            "data": [
+                {"dataFilter": {"a1Range": "Data!A3:B3"}, "values": [["x", "y"]]},
+                {
+                    "dataFilter": {"developerMetadataLookup": {"metadataKey": "k"}},
+                    "values": [["m"]],
+                },
+            ],
+        },
+    )
+    assert r.json()["responses"] == [
+        {
+            "updatedRange": "Data!A3:B3",
+            "updatedRows": 1,
+            "updatedColumns": 2,
+            "updatedCells": 2,
+            "dataFilter": {"a1Range": "Data!A3:B3"},
+        }
+    ]
+    over = {"gridRange": {"sheetId": 0, "startRowIndex": 6, "endRowIndex": 7, "endColumnIndex": 1}}
+    r = wc.post(
+        path,
+        headers=h,
+        json={"valueInputOption": "RAW", "data": [{"dataFilter": over, "values": [["a", "b"]]}]},
+    )
+    assert r.json()["error"]["message"] == (
+        "Invalid dataFilterValueRange[0]: dataFilterValueRange.dataFilter matched range Data!$A$7 "
+        "whose rows cannot fit the data described in data.values[0]."
+    )
+    r = wc.post(path, headers=h, json={"valueInputOption": "RAW", "data": [{"values": [["x"]]}]})
+    assert r.json()["error"]["message"] == (
+        "Invalid dataFilterValueRange[0]: dataFilterValueRange.filter is required but not specified."
+    )
+    r = wc.post(
+        f"{wbook}/values:batchClearByDataFilter",
+        headers=h,
+        json={"dataFilters": [{"a1Range": "Data!A3"}, {"gridRange": {"sheetId": 0}}]},
+    )
+    assert r.json()["clearedRanges"] == ["Data!A3", "Data!A1:Z1000"]
+    assert _read_back(wc, h, wbook, "Data!A1:B3") is None
+
+
+def test_spreadsheet_url_names_the_caller(wc, wh, wbook):
+    """Measured: `spreadsheetUrl` carries the CALLER's account id as `ouid`, the owner and a
+    reader of one spreadsheet each their own; the admin token is no account."""
+    from backlot import synth
+
+    for who in (_OWNER, "reader@acme.com"):
+        url = wc.get(wbook, headers=wh[who], params={"fields": "spreadsheetUrl"}).json()[
+            "spreadsheetUrl"
+        ]
+        assert url.endswith(f"/edit?ouid={synth.google_user_id(who)}")
+    url = wc.get(wbook, headers=wh["admin"], params={"fields": "spreadsheetUrl"}).json()[
+        "spreadsheetUrl"
+    ]
+    assert url.endswith("/edit")
+
+
+def test_a_file_shared_with_no_one_but_its_owner_is_not_shared(wc, wh):
+    """A grant to a file's own author is its owner permission, not a reader's, and shares it with
+    nobody. Measured on a created spreadsheet, whose one permission is the owner's."""
+    from tests._helpers import served_id
+
+    fid = served_id("google_drive", "wr-private")
+    h = wh["reader@acme.com"]
+    assert wc.get(f"/drive/v3/files/{fid}", headers=h, params={"fields": "shared"}).json() == {
+        "shared": False
+    }
+    perms = wc.get(f"/drive/v3/files/{fid}/permissions", headers=h).json()["permissions"]
+    assert [p["role"] for p in perms] == ["owner"]

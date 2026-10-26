@@ -975,9 +975,17 @@
       "operation": "POST /v4/spreadsheets",
       "id": "sheets.spreadsheets.create",
       "response": "sheets.Spreadsheet",
-      "status": "missing",
-      "kind": "missing_operation",
-      "severity": "gap"
+      "status": "implemented",
+      "params": {
+        "key": {
+          "kind": "missing_param",
+          "severity": "gap"
+        },
+        "uploadType": {
+          "kind": "missing_param",
+          "severity": "gap"
+        }
+      }
     },
     {
       "operation": "POST /v4/spreadsheets/{}/developerMetadata:search",
@@ -991,9 +999,17 @@
       "operation": "POST /v4/spreadsheets/{}/sheets/{}:copyTo",
       "id": "sheets.spreadsheets.sheets.copyTo",
       "response": "sheets.SheetProperties",
-      "status": "missing",
-      "kind": "missing_operation",
-      "severity": "gap"
+      "status": "implemented",
+      "params": {
+        "key": {
+          "kind": "missing_param",
+          "severity": "gap"
+        },
+        "uploadType": {
+          "kind": "missing_param",
+          "severity": "gap"
+        }
+      }
     },
     {
       "operation": "POST /v4/spreadsheets/{}/values/{}:append",
@@ -1047,9 +1063,17 @@
       "operation": "POST /v4/spreadsheets/{}/values:batchClearByDataFilter",
       "id": "sheets.spreadsheets.values.batchClearByDataFilter",
       "response": "sheets.BatchClearValuesByDataFilterResponse",
-      "status": "missing",
-      "kind": "missing_operation",
-      "severity": "gap"
+      "status": "implemented",
+      "params": {
+        "key": {
+          "kind": "missing_param",
+          "severity": "gap"
+        },
+        "uploadType": {
+          "kind": "missing_param",
+          "severity": "gap"
+        }
+      }
     },
     {
       "operation": "POST /v4/spreadsheets/{}/values:batchGetByDataFilter",
@@ -1087,9 +1111,17 @@
       "operation": "POST /v4/spreadsheets/{}/values:batchUpdateByDataFilter",
       "id": "sheets.spreadsheets.values.batchUpdateByDataFilter",
       "response": "sheets.BatchUpdateValuesByDataFilterResponse",
-      "status": "missing",
-      "kind": "missing_operation",
-      "severity": "gap"
+      "status": "implemented",
+      "params": {
+        "key": {
+          "kind": "missing_param",
+          "severity": "gap"
+        },
+        "uploadType": {
+          "kind": "missing_param",
+          "severity": "gap"
+        }
+      }
     },
     {
       "operation": "POST /v4/spreadsheets/{}:batchUpdate",
@@ -1471,6 +1503,20 @@
         }
       }
     },
+    "sheets.BatchClearValuesByDataFilterResponse": {
+      "type_kind": "object",
+      "status": "implemented",
+      "fields": {
+        "clearedRanges": {
+          "status": "implemented",
+          "type": "[string]"
+        },
+        "spreadsheetId": {
+          "status": "implemented",
+          "type": "string"
+        }
+      }
+    },
     "sheets.BatchClearValuesResponse": {
       "type_kind": "object",
       "status": "implemented",
@@ -1510,6 +1556,36 @@
         "valueRanges": {
           "status": "implemented",
           "type": "[sheets.ValueRange]"
+        }
+      }
+    },
+    "sheets.BatchUpdateValuesByDataFilterResponse": {
+      "type_kind": "object",
+      "status": "implemented",
+      "fields": {
+        "responses": {
+          "status": "implemented",
+          "type": "[sheets.UpdateValuesByDataFilterResponse]"
+        },
+        "spreadsheetId": {
+          "status": "implemented",
+          "type": "string"
+        },
+        "totalUpdatedCells": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "totalUpdatedColumns": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "totalUpdatedRows": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "totalUpdatedSheets": {
+          "status": "implemented",
+          "type": "integer"
         }
       }
     },
@@ -3046,16 +3122,12 @@
           "severity": "gap"
         },
         "frozenRowCount": {
-          "status": "missing",
-          "type": "integer",
-          "kind": "missing_field",
-          "severity": "gap"
+          "status": "implemented",
+          "type": "integer"
         },
         "hideGridlines": {
-          "status": "missing",
-          "type": "boolean",
-          "kind": "missing_field",
-          "severity": "gap"
+          "status": "implemented",
+          "type": "boolean"
         },
         "rowCount": {
           "status": "implemented",
@@ -3970,20 +4042,16 @@
           "type": "sheets.GridProperties"
         },
         "hidden": {
-          "status": "missing",
-          "type": "boolean",
-          "kind": "missing_field",
-          "severity": "gap"
+          "status": "implemented",
+          "type": "boolean"
         },
         "index": {
           "status": "implemented",
           "type": "integer"
         },
         "rightToLeft": {
-          "status": "missing",
-          "type": "boolean",
-          "kind": "missing_field",
-          "severity": "gap"
+          "status": "implemented",
+          "type": "boolean"
         },
         "sheetId": {
           "status": "implemented",
@@ -3994,16 +4062,12 @@
           "type": "string"
         },
         "tabColor": {
-          "status": "missing",
-          "type": "sheets.Color",
-          "kind": "missing_field",
-          "severity": "gap"
+          "status": "implemented",
+          "type": "sheets.Color"
         },
         "tabColorStyle": {
-          "status": "missing",
-          "type": "sheets.ColorStyle",
-          "kind": "missing_field",
-          "severity": "gap"
+          "status": "implemented",
+          "type": "sheets.ColorStyle"
         },
         "title": {
           "status": "implemented",
@@ -4508,6 +4572,36 @@
         "textFormat": {
           "status": "missing",
           "type": "sheets.TextFormat"
+        }
+      }
+    },
+    "sheets.UpdateValuesByDataFilterResponse": {
+      "type_kind": "object",
+      "status": "implemented",
+      "fields": {
+        "dataFilter": {
+          "status": "implemented",
+          "type": "sheets.DataFilter"
+        },
+        "updatedCells": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "updatedColumns": {
+          "status": "implemented",
+          "type": "integer"
+        },
+        "updatedData": {
+          "status": "implemented",
+          "type": "sheets.ValueRange"
+        },
+        "updatedRange": {
+          "status": "implemented",
+          "type": "string"
+        },
+        "updatedRows": {
+          "status": "implemented",
+          "type": "integer"
         }
       }
     },

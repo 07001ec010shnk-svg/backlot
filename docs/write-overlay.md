@@ -2,7 +2,7 @@
 
 [← README](../README.md)
 
-Backlot serves writes on Slack and on Google Sheets' `values`. They never reach the corpus.
+Backlot serves writes on Slack and on Google Sheets. They never reach the corpus.
 
 ## The corpus is not writable, and that is enforced
 
@@ -57,6 +57,13 @@ after which it is a grid: real has no spreadsheet that refuses a write.
 (`12.5%`, `$1,234.50`, `2024-01-15`, `10:30 PM`), a boolean, an error or text, and a cell keeps or
 replaces its format by the rules real applies, measured input by input. A formula is the exception:
 it is stored as the text typed rather than evaluated.
+
+`spreadsheets.create` makes a new workbook at the caller's My Drive root, owned by the caller and
+shared with nobody: it is listed under `'root' in parents`, and anyone else is refused it as a file
+they cannot see. The sheets, grid sizes and sheet properties it states are kept, and so are its
+cells. `sheets.copyTo` copies a sheet into a workbook the caller may write, titled in that
+workbook's language. `values:batchUpdateByDataFilter` and `values:batchClearByDataFilter` write and
+clear what DataFilters match.
 
 `values.append` finds the table it writes below the way real does: from the first cell in the range
 holding a value, column by column, grown through every cell in the row or column next to it, and
@@ -121,8 +128,16 @@ field list, so the ordering divergence below has no entry to live in and is stat
 - **The emoji set.** `reactions.add` takes any name; real answers `invalid_name` for one its
   workspace does not have. Validating it needs Slack's emoji list, and a partial list would
   refuse names real accepts.
-- **Formulas.** A `USER_ENTERED` string starting `=` or `+` is a formula on real, evaluated into
-  its result. Backlot stores the text typed.
+- **Formulas.** A `USER_ENTERED` string starting `=` or `+`, or a `formulaValue` a new workbook
+  states, is a formula on real, evaluated into its result. Backlot stores the text typed.
+- **What a new workbook states and Backlot cannot serve back.** Named ranges, developer metadata,
+  data sources, and every cell format but a number format are read and not kept.
+- **The English account's words.** A new workbook's default title, and the refusals real words in
+  the account's language (a sheet title taken or too long, an index past the end, every sheet
+  hidden), were measured on a Korean account, where they came back in Korean. Backlot serves
+  English, and that English is unmeasured.
+- **`spreadsheets.batchUpdate`.** Not served, so a workbook's sheets change only by
+  `spreadsheets.create` and `sheets.copyTo`.
 - **Rate limits.** Real Sheets refuses a user's writes past 60 a minute with 429
   `RESOURCE_EXHAUSTED`. Backlot does not count them.
 

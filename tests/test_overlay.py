@@ -147,8 +147,11 @@ def test_a_run_of_writes_leaves_the_corpus_file_identical(sample_settings):
         conn,
         "google_drive",
         (sheet["id"],),
-        "gdrive_sheets",
-        [{"sheet_index": 0, "sheet_id": 0, "title": "Sheet1", "grid": '[["written"]]'}],
+        {
+            "gdrive_sheets": [
+                {"sheet_index": 0, "sheet_id": 0, "title": "Sheet1", "grid": '[["w"]]'}
+            ]
+        },
         {"content": "written", "updated_ts": 4000000000},
     )
     conn.close()
@@ -167,8 +170,11 @@ def _write_sheet(conn, file_id, grid, content, updated_ts):
         conn,
         "google_drive",
         (file_id,),
-        "gdrive_sheets",
-        [{"sheet_index": 0, "sheet_id": 0, "title": "Sheet1", "grid": json.dumps(grid)}],
+        {
+            "gdrive_sheets": [
+                {"sheet_index": 0, "sheet_id": 0, "title": "Sheet1", "grid": json.dumps(grid)}
+            ]
+        },
         {"content": content, "updated_ts": updated_ts},
     )
 

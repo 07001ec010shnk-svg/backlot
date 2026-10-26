@@ -14,6 +14,7 @@ import datetime
 import functools
 import hashlib
 import json
+import locale as pylocale
 import quopri
 import re
 import string
@@ -40,6 +41,7 @@ from backlot import (
     sheets_format,
     sheets_grid,
     sheets_input,
+    sheets_workbook,
     store,
     synth,
 )
@@ -2556,6 +2558,11 @@ def _drive_q_eval(node, f: dict, me: str | None, fulltext: dict[str, set[str]]) 
     if field == "createdTime":
         return _drive_q_compare(op, f["created"], value)
     if field == "parents":
+        # `root` is the caller's My Drive root by its alias, and so is its id: a file created at
+        # the root carries the id (`_drive_root_parent`), a folder here the alias.
+        roots = _drive_roots(me)
+        if value in roots:
+            return any(p in roots for p in f["parents"])
         return value in f["parents"]
     if field == "owners":
         # `me` is the reference's alias for the caller (`'me' in owners`), resolved through the
@@ -2607,6 +2614,16 @@ def _drive_listed_trash(ids: set[str] | None, me: str | None) -> bool | str:
     `trashed`, the file's name, its folder or `not 'me' in owners`, measured 2026-10-20. The admin
     token, ``ids`` ``None``, sees every file and lists them all."""
     return True if ids is None else (me or False)
+
+
+# The `folder` a file created at a user's My Drive root is stored under: no folder at all, which
+# no corpus file has (every one lives in a folder), so the two never meet.
+_DRIVE_ROOT_FOLDER = ""
+
+
+def _drive_roots(me: str | None) -> set[str]:
+    """What names the caller's My Drive root in a `parents` term: the alias `root`, and the id."""
+    return {"root", synth.drive_root_id(me)} if me else {"root"}
 
 
 def _drive_owned_by(owner_email: str | None, me: str | None) -> bool:
@@ -3258,9 +3275,7 @@ def _drive_fill_shared(conn, files: list[dict], stored: set[str]) -> None:
 
     ``stored`` is the SET of served file ids that came from a row. An ACL grant names a file by
     that same id, so plain set membership is exact."""
-    have = store.docs_with_grants(
-        conn, "google_drive", [f["id"] for f in files if f["id"] in stored]
-    )
+    have = store.gdrive_shared(conn, [f["id"] for f in files if f["id"] in stored])
     for f in files:
         if f["id"] in stored:
             f["shared"] = f["id"] in have
@@ -3798,8 +3813,10 @@ async def drive_files_list(request: Request):
     hits = _drive_q_fulltext(conn, query, ids)
     # A parent every match has to be under; one under an `or` scopes nothing.
     parent_ids = [t.value for t in conjuncts if t.field == "parents"]
+    roots = _drive_roots(me)
+    in_root = any(pid in roots for pid in parent_ids)
     # A folder-scoped parent resolves to one container name (for the SQL-scoped paths below).
-    scoped = [pid for pid in parent_ids if pid != "root"]
+    scoped = [pid for pid in parent_ids if pid not in roots]
     container = next((n for pid in scoped if (n := _drive_folder_name_by_id(conn, pid))), None)
     # Backlot's folders all hang directly under the root, so a query scoped inside one can only
     # match files — no folder stream to build.
@@ -3811,8 +3828,22 @@ async def drive_files_list(request: Request):
 
     # The row stream as (count, fetch) so the SQL paths stay SQL-paginated: a crawl costs one page
     # of rows per request, not a full-corpus scan re-run for every page.
-    if "root" in parent_ids:
-        total_rows, fetch = 0, lambda o, n: []  # every stored file lives in a folder
+    if in_root and scoped:
+        total_rows, fetch = 0, lambda o, n: []  # a file is at the root or in a folder, not both
+    elif in_root and (scope := _drive_q_plain_folder(query)):
+        # The files at the root are the ones a write created there (`_DRIVE_ROOT_FOLDER`): every
+        # corpus file lives in a folder.
+        trash = _drive_listed_trash(ids, me) if scope == "all" else False
+        total_rows = store.count_drive_folder(conn, _DRIVE_ROOT_FOLDER, ids, trash)
+        fetch = lambda o, n: store.list_drive_folder(  # noqa: E731
+            conn, _DRIVE_ROOT_FOLDER, ids, limit=n, offset=o, trash=trash
+        )
+    elif in_root:
+        matched = _drive_q_rows(conn, query, _DRIVE_ROOT_FOLDER, ids, me, hits)
+        if not fulltext:
+            matched.sort(key=lambda r: r["id"])
+            matched.sort(key=_drive_modified, reverse=True)
+        total_rows, fetch = len(matched), lambda o, n: matched[o : o + n]  # noqa: E731
     elif container is not None and (scope := _drive_q_plain_folder(query)):
         # The common case: a client walking the tree wants just this folder's files.
         trash = _drive_listed_trash(ids, me) if scope == "all" else False
@@ -3840,11 +3871,7 @@ async def drive_files_list(request: Request):
     def objects(o: int, n: int, *, with_shared: bool = True) -> list[dict]:
         rows = fetch(o, n) if n > 0 else []
         stored.update(r["id"] for r in rows)
-        shared = (
-            store.docs_with_grants(conn, "google_drive", [r["id"] for r in rows])
-            if with_shared
-            else ()
-        )
+        shared = store.gdrive_shared(conn, [r["id"] for r in rows]) if with_shared else ()
         return [_drive_file(conn, r, shared=r["id"] in shared, me=me) for r in rows]
 
     total = total_rows + len(folders)
@@ -4595,7 +4622,19 @@ async def sheets_get(spreadsheet_id: str, request: Request):
     # thing a client can get wrong about it.
     ranges = request.query_params.getlist("ranges")
     return _sheets_respond(
-        request, _sheets_book(spreadsheet_id, row, sheets, ranges, grid, view, tree), tree
+        request,
+        _sheets_book(
+            spreadsheet_id,
+            row,
+            sheets,
+            ranges,
+            grid,
+            view,
+            tree,
+            settings=_sheets_settings(auth.conn(request), spreadsheet_id),
+            url=_sheets_url(spreadsheet_id, caller),
+        ),
+        tree,
     )
 
 
@@ -4607,6 +4646,9 @@ def _sheets_book(
     grid: bool,
     view: str,
     tree: dict | None,
+    *,
+    settings: dict,
+    url: str,
 ):
     """The `Spreadsheet` body both `spreadsheets.get` and `:getByDataFilter` answer with.
 
@@ -4635,16 +4677,8 @@ def _sheets_book(
         wanted = [(sh, per_sheet[sh.index]) for sh in sheets if sh.index in per_sheet]
     out = []
     for sh, parts in wanted:
-        entry = {
-            "properties": {
-                "sheetId": sh.sheet_id,
-                "title": sh.title,
-                "index": sh.index,
-                "sheetType": "GRID",
-                # the grid, not the data extent — see SHEETS_GRID_ROWS
-                "gridProperties": {"rowCount": sh.rows, "columnCount": sh.cols},
-            }
-        }
+        # the grid, not the data extent — see SHEETS_GRID_ROWS
+        entry = {"properties": sh.served()}
         if grid:
             entry["data"] = [
                 _sheets_empty_grid_data(part)
@@ -4654,18 +4688,19 @@ def _sheets_book(
             ]
         out.append(entry)
     # Real's order, measured 2026-10-22 with and without the grid and under `fields=*.*`.
+    stated = {**sheets_workbook.DEFAULT_PROPERTIES, **settings}
     book = {
         "spreadsheetId": spreadsheet_id,
         "properties": {
             "title": row["title"],
-            "locale": "en_US",
-            "autoRecalc": SHEETS_AUTO_RECALC,
-            "timeZone": SHEETS_TIME_ZONE,
+            "locale": stated["locale"],
+            "autoRecalc": stated["autoRecalc"],
+            "timeZone": stated["timeZone"],
             "defaultFormat": SHEETS_DEFAULT_FORMAT,
             "spreadsheetTheme": SHEETS_THEME,
         },
         "sheets": out,
-        "spreadsheetUrl": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+        "spreadsheetUrl": url,
     }
     if tree is not None or grid:
         book["commentsViewMode"] = view
@@ -4685,8 +4720,8 @@ SHEETS_SHEET_TITLE = "Sheet1"  # Backlot shapes every spreadsheet as one sheet w
 # real spreadsheet holding 14 rows: `values/<title>` echoes `A1:Z1000`, `A:A` echoes `A1:A1000`.
 # So Backlot declares the same grid. This is API scaffolding, like the synthesized `sheetId` and
 # sheet title beside it — not invented cell data, which `_sheets_grid` still refuses to manufacture.
-SHEETS_GRID_ROWS = 1000
-SHEETS_GRID_COLS = 26
+SHEETS_GRID_ROWS = sheets_workbook.GRID_ROWS
+SHEETS_GRID_COLS = sheets_workbook.GRID_COLS
 
 # A cell's `effectiveFormat`, in the order real emits it. Measured: across every cell type a
 # corpus can state it varies in ONE field, `horizontalAlignment` -- a string sits left, a number
@@ -4694,13 +4729,12 @@ SHEETS_GRID_COLS = 26
 # corpus can change. So the whole object is derived rather than stored, the way `formattedValue`
 # is.
 #
-# `userEnteredFormat` is the other half of the pair and is NOT emitted. Measured, it carries only
-# what was explicitly set on that cell -- a strict subset of `effectiveFormat`, absent entirely
-# from a cell nobody formatted. Of 17 typed cells the only ones that had one were the percent,
-# date, datetime, time and scientific cells, each carrying a lone `numberFormat` that Sheets
-# INFERRED from what was typed. A corpus states no formatting and none of those value types, so no
-# cell it can describe has anything to put there -- not because the field resists derivation, but
-# because nothing a corpus says would trigger one.
+# `userEnteredFormat` is the other half of the pair. Measured, it carries only what was explicitly
+# set on that cell -- a strict subset of `effectiveFormat`, absent entirely from a cell nobody
+# formatted. Of 17 typed cells the only ones that had one were the percent, date, datetime, time and
+# scientific cells, each carrying a lone `numberFormat` that Sheets INFERRED from what was typed.
+# A corpus states no formatting, so a corpus cell has none; a cell a write gave a number format
+# (`sheets_input.apply`) serves it (`_sheets_cell_data`).
 _CELL_FORMAT_ALIGN = {"str": "LEFT", "num": "RIGHT", "bool": "CENTER"}
 _CELL_FORMAT_BOX = {
     "backgroundColor": {"red": 1, "green": 1, "blue": 1},
@@ -4817,8 +4851,8 @@ SHEETS_THEME = {
 # `properties` fields real Sheets always carries beside `title` and `locale`. `ON_CHANGE` is the
 # recalculation setting a spreadsheet has unless someone changes it; `Etc/GMT` is the neutral zone,
 # and matches what a freshly created spreadsheet answered with.
-SHEETS_AUTO_RECALC = "ON_CHANGE"
-SHEETS_TIME_ZONE = "Etc/GMT"
+SHEETS_AUTO_RECALC = sheets_workbook.DEFAULT_PROPERTIES["autoRecalc"]
+SHEETS_TIME_ZONE = sheets_workbook.DEFAULT_PROPERTIES["timeZone"]
 
 _SHEETS_ENUM = "type.googleapis.com/google.apps.sheets.v4"
 
@@ -5357,22 +5391,7 @@ def _sheets_value_range(
     return out
 
 
-class _Sheet(NamedTuple):
-    """One sheet of a workbook, however the corpus stated it."""
-
-    sheet_id: int
-    index: int
-    title: str
-    grid: list[list]
-
-    @property
-    def rows(self) -> int:
-        """The declared grid's height — never smaller than the data, and at least the default."""
-        return max(SHEETS_GRID_ROWS, len(self.grid))
-
-    @property
-    def cols(self) -> int:
-        return max(SHEETS_GRID_COLS, max((len(r) for r in self.grid), default=0))
+_Sheet = sheets_workbook.Sheet
 
 
 def _workbook(request: Request, spreadsheet_id: str) -> tuple:
@@ -5400,8 +5419,32 @@ def _workbook(request: Request, spreadsheet_id: str) -> tuple:
     if not stored:
         return row, [_Sheet(0, 0, SHEETS_SHEET_TITLE, _sheets_grid(row["content"]))]
     return row, [
-        _Sheet(s["sheet_id"], s["sheet_index"], s["title"], json.loads(s["grid"])) for s in stored
+        _Sheet(
+            s["sheet_id"],
+            s["sheet_index"],
+            s["title"],
+            json.loads(s["grid"]),
+            json.loads(s["properties"]) if s["properties"] else {},
+        )
+        for s in stored
     ]
+
+
+def _sheets_settings(conn, spreadsheet_id: str) -> dict:
+    """A workbook's stated settings (`locale`, `timeZone`, `autoRecalc`), empty when it states
+    none, which every spreadsheet a corpus holds does (`sheets_workbook.DEFAULT_PROPERTIES`)."""
+    rows = store.parts_for(
+        conn, "google_drive", "gdrive_spreadsheets", (spreadsheet_id,), order_by="file_id"
+    )
+    return json.loads(rows[0]["properties"]) if rows else {}
+
+
+def _sheets_url(spreadsheet_id: str, caller: Caller) -> str:
+    """`spreadsheetUrl`. Measured 2026-10-26: real puts the CALLER's numeric account id on it as
+    `ouid`, the owner and a reader of one spreadsheet each getting their own. The admin/service
+    token is no Google account, and gets the bare link."""
+    url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+    return f"{url}?ouid={synth.google_user_id(caller.email)}" if caller.email else url
 
 
 def _sheets_enum_value(raw: str, field: str, enum: protojson.Enum) -> str:
@@ -5869,7 +5912,9 @@ def _sheets_check_dimension_range(dimension_range: dict, sheets: list[_Sheet]) -
         )
 
 
-def _sheets_selections(filters: list[dict], sheets: list[_Sheet], *, values_level: bool) -> list:
+def _sheets_selections(
+    filters: list[dict], sheets: list[_Sheet], *, values_level: bool, prefix: str | None = None
+) -> list:
     """What each filter selects, in the order sent: an A1 spec, an :class:`_Empty`, or ``None`` for
     a developer metadata lookup (:func:`_sheets_check_lookup`).
 
@@ -5897,7 +5942,8 @@ def _sheets_selections(filters: list[dict], sheets: list[_Sheet], *, values_leve
         except gerr.GoogleError as exc:
             if exc.status_code != 400 or not values_level:
                 raise
-            raise gerr.invalid_argument(f"Invalid dataFilter[{i}]: {exc.message}") from None
+            lead = f"Invalid dataFilter[{i}]: " if prefix is None else prefix
+            raise gerr.invalid_argument(f"{lead}{exc.message}") from None
     return selections
 
 
@@ -6024,7 +6070,19 @@ async def sheets_get_by_data_filter(spreadsheet_id: str, request: Request):
             specs.append(selection)
     grid = _gmask_wants_grid(tree, body.get("include_grid_data", False))
     return _sheets_respond(
-        request, _sheets_book(spreadsheet_id, row, sheets, specs, grid, view, tree), tree
+        request,
+        _sheets_book(
+            spreadsheet_id,
+            row,
+            sheets,
+            specs,
+            grid,
+            view,
+            tree,
+            settings=_sheets_settings(auth.conn(request), spreadsheet_id),
+            url=_sheets_url(spreadsheet_id, caller),
+        ),
+        tree,
     )
 
 
@@ -6141,7 +6199,7 @@ def _sheets_writable(request: Request, spreadsheet_id: str) -> tuple:
     ``The caller does not have permission``, measured on update, batchUpdate, clear, batchClear and
     append. Both come ahead of a missing `valueInputOption` and of any check on the range."""
     row, sheets = _workbook(request, spreadsheet_id)
-    if not _drive_owned_by(row["author_email"], _require(request).email):
+    if not _drive_owned_by(row["author_email"], _sheets_creator(request, _require(request))):
         raise gerr.permission_denied()
     return row, sheets
 
@@ -6277,6 +6335,20 @@ def _sheets_reloaded(sheets: list[_Sheet], grids: dict) -> list[_Sheet]:
     return out
 
 
+def _sheets_sheet_rows(sheets: list[_Sheet]) -> list[dict]:
+    """A workbook's sheets as `gdrive_sheets` rows."""
+    return [
+        {
+            "sheet_index": sh.index,
+            "sheet_id": sh.sheet_id,
+            "title": sh.title,
+            "grid": json.dumps(sh.grid, sort_keys=True),
+            "properties": json.dumps(sh.stated(), sort_keys=True),
+        }
+        for sh in sheets
+    ]
+
+
 def _sheets_save(conn, row, sheets: list[_Sheet]) -> None:
     """Store a written workbook: every sheet, the first one's CSV as the file's `content`, and the
     write's time as its `updated_ts`."""
@@ -6284,25 +6356,18 @@ def _sheets_save(conn, row, sheets: list[_Sheet]) -> None:
         conn,
         "google_drive",
         (row["id"],),
-        "gdrive_sheets",
-        [
-            {
-                "sheet_index": sh.index,
-                "sheet_id": sh.sheet_id,
-                "title": sh.title,
-                "grid": json.dumps(sh.grid, sort_keys=True),
-            }
-            for sh in sheets
-        ],
+        {"gdrive_sheets": _sheets_sheet_rows(sheets)},
         {"content": sheets_grid.to_csv(sheets[0].grid), "updated_ts": int(time.time())},
     )
 
 
-def _sheets_today() -> datetime.date:
+def _sheets_today(settings: dict) -> datetime.date:
     """The date a typed date without a year falls in: measured, `1/15` stored 2026-01-15 when
-    written in 2026. Taken in the spreadsheet's time zone, which every workbook here serves as
-    GMT (`SHEETS_TIME_ZONE`)."""
-    return datetime.datetime.now(datetime.UTC).date()
+    written in 2026. Taken in the spreadsheet's time zone."""
+    from zoneinfo import ZoneInfo
+
+    zone = {**sheets_workbook.DEFAULT_PROPERTIES, **settings}["timeZone"]
+    return datetime.datetime.now(ZoneInfo(zone)).date()
 
 
 def _sheets_updated_data(writing: _Writing, spec: str, sheets: list[_Sheet], major: str, opts):
@@ -6347,7 +6412,9 @@ async def sheets_values_update(spreadsheet_id: str, a1_range: str, request: Requ
     major = _sheets_major(_PJ_DIMENSION.names[body.get("major_dimension", 0)])
     writing = _sheets_writing(a1_range, sheets, body.get("values", []), major)
     grids = _sheets_grids(sheets)
-    written = _sheets_apply(writing, grids, option, _sheets_today())
+    written = _sheets_apply(
+        writing, grids, option, _sheets_today(_sheets_settings(auth.conn(request), spreadsheet_id))
+    )
     after = _sheets_reloaded(sheets, grids)
     if written:
         _sheets_save(auth.conn(request), row, after)
@@ -6413,7 +6480,7 @@ async def sheets_values_batch_update(spreadsheet_id: str, request: Request):
     if not writings:
         return _sheets_respond(request, out, tree)
     grids = _sheets_grids(sheets)
-    today = _sheets_today()
+    today = _sheets_today(_sheets_settings(auth.conn(request), spreadsheet_id))
     results = [
         (w, spec, major, _sheets_apply(w, grids, option, today)) for w, spec, major in writings
     ]
@@ -6583,10 +6650,15 @@ async def sheets_values_append(spreadsheet_id: str, a1_range: str, request: Requ
     _sheets_refuse_unstorable(rows, at_row)
     inserted = bool(rows) and opts["insertDataOption"] == "INSERT_ROWS"
     if inserted:
-        grid.extend([] for _ in range(sheet.rows - len(grid)))
-        grid[at_row:at_row] = [[] for _ in rows]
+        grid[at_row:at_row] = [[] for _ in rows] if at_row < len(grid) else []
+        grown = sheet.stated()
+        grown["gridProperties"]["rowCount"] = sheet.rows + len(rows)
+        sheet = sheet._replace(properties=grown)
+        sheets = [sheet if s.index == sheet.index else s for s in sheets]
     writing = _Writing(sheet, at_row, at_col, None, rows)
-    written = _sheets_apply(writing, grids, option, _sheets_today())
+    written = _sheets_apply(
+        writing, grids, option, _sheets_today(_sheets_settings(auth.conn(request), spreadsheet_id))
+    )
     after = _sheets_reloaded(sheets, grids)
     if written or inserted:
         _sheets_save(auth.conn(request), row, after)
@@ -6625,6 +6697,568 @@ async def sheets_values_batch_clear(spreadsheet_id: str, request: Request):
     grids = _sheets_grids(sheets)
     changed = [_sheets_clear(grids, c) for c in clearings]
     if any(changed):
+        _sheets_save(auth.conn(request), row, _sheets_reloaded(sheets, grids))
+    out["clearedRanges"] = [_a1_name(*c) for c in clearings]
+    return _sheets_respond(request, out, tree)
+
+
+# --- request bodies read from the recorded Sheets messages --------------------------------------
+#
+# `spreadsheets.create` takes a whole `Spreadsheet`, a tree of a hundred and more messages. Each is
+# read with a `protojson.Message` generated from the message the `google_drive` baseline records
+# from the discovery document (`backlot diff` keeps it current), so a name the vendor's message
+# lacks is refused where real refuses it and every name it has is read. The baseline records an
+# enum as `string`; the enums this module acts on are declared here, with the discovery
+# document's values in number order.
+
+_SHEETS_RECORDED = json.loads((_BASELINES / "google_drive.json").read_text(encoding="utf-8"))[
+    "types"
+]
+_PJ_ENUM_FIELDS = {
+    ("sheets.SheetProperties", "sheetType"): _pj_enum(
+        "SheetType", "SHEET_TYPE_UNSPECIFIED", "GRID", "OBJECT", "DATA_SOURCE"
+    ),
+    ("sheets.SpreadsheetProperties", "autoRecalc"): _pj_enum(
+        "RecalculationInterval", "RECALCULATION_INTERVAL_UNSPECIFIED", "ON_CHANGE", "MINUTE", "HOUR"
+    ),
+    ("sheets.ErrorValue", "type"): _pj_enum(
+        "ErrorType",
+        "ERROR_TYPE_UNSPECIFIED",
+        "ERROR",
+        "NULL_VALUE",
+        "DIVIDE_BY_ZERO",
+        "VALUE",
+        "REF",
+        "NAME",
+        "NUM",
+        "N_A",
+        "LOADING",
+    ),
+    ("sheets.NumberFormat", "type"): _pj_enum(
+        "NumberFormatType",
+        "NUMBER_FORMAT_TYPE_UNSPECIFIED",
+        "TEXT",
+        "NUMBER",
+        "PERCENT",
+        "CURRENCY",
+        "DATE",
+        "TIME",
+        "DATE_TIME",
+        "SCIENTIFIC",
+    ),
+}
+_PJ_SCALAR_KINDS = {"integer": "int32", "number": "double", "boolean": "bool", "string": "string"}
+
+
+@functools.cache
+def _pj_message(name: str) -> protojson.Message:
+    """The recorded message ``name`` (`sheets.SheetProperties`) as a `protojson.Message`."""
+    fields = []
+    for json_name, member in _SHEETS_RECORDED[name].get("fields", {}).items():
+        type_ = member.get("type", "any")
+        repeated = type_.startswith("[") and type_ != "[[any]]"
+        inner = type_[1:-1] if repeated else type_
+        proto = re.sub(r"(?<!^)(?=[A-Z])", "_", json_name).lower()
+        enum = _PJ_ENUM_FIELDS.get((name, json_name))
+        if enum is not None:
+            fields.append(protojson.Field(json_name, proto, "enum", enum=enum, repeated=repeated))
+        elif inner in _SHEETS_RECORDED:
+            fields.append(
+                protojson.Field(
+                    json_name, proto, "message", message=_pj_message(inner), repeated=repeated
+                )
+            )
+        elif type_ == "[[any]]":
+            fields.append(protojson.Field(json_name, proto, "rows"))
+        elif inner in _PJ_SCALAR_KINDS:
+            fields.append(
+                protojson.Field(json_name, proto, _PJ_SCALAR_KINDS[inner], repeated=repeated)
+            )
+        else:  # a map or a bare JSON value: kept as sent
+            fields.append(protojson.Field(json_name, proto, "any"))
+    return protojson.Message(f"{_SHEETS_ENUM}.{name.split('.', 1)[1]}", tuple(fields))
+
+
+# --- `spreadsheets.create` -----------------------------------------------------------------------
+
+# A new spreadsheet's title when the request names none. It follows the ACCOUNT's language, not the
+# request's `locale`: measured 2026-10-26 on a Korean account, `제목 없는 스프레드시트` under
+# `locale: en_US` too. Backlot's callers are English accounts, and this English title is unmeasured.
+SHEETS_UNTITLED = "Untitled spreadsheet"
+
+# The refusals real words in the account's language. Each was measured on a Korean account, where it
+# came back in Korean; the English sentences here are unmeasured.
+_SHEETS_TITLE_TAKEN = "A sheet with the name “{title}” already exists. Please enter another name."
+_SHEETS_TITLE_TOO_LONG = "Sheet names must be 100 characters or fewer."
+_SHEETS_INDEX_TOO_HIGH = "The new sheet index is too high."
+_SHEETS_ALL_HIDDEN = "You can't hide all the sheets in a document."
+_SHEETS_NO_COLUMNS = "You can't delete all the columns on the sheet."
+_SHEETS_NO_ROWS = "You can't delete all the rows on the sheet."
+
+_PJ_CREATE = protojson.Message(
+    f"{_SHEETS_ENUM}.CreateSpreadsheetRequest",
+    (
+        protojson.Field(
+            "spreadsheet", "spreadsheet", "message", message=_pj_message("sheets.Spreadsheet")
+        ),
+    ),
+)
+
+
+def _sheets_cell(cell: dict):
+    """A `CellData` a request states, as a stored cell: its `userEnteredValue`, and its
+    `userEnteredFormat.numberFormat` when it is one `sheets_format` can display. A formula is kept
+    as its text, as a written one is (`sheets_input`). An `errorValue` is refused by the caller."""
+    value = cell.get("user_entered_value") or {}
+    fmt = (cell.get("user_entered_format") or {}).get("number_format")
+    number_format = None
+    if fmt and fmt.get("pattern"):
+        candidate = {
+            "type": _PJ_ENUM_FIELDS[("sheets.NumberFormat", "type")].names[fmt.get("type", 0)],
+            "pattern": fmt["pattern"],
+        }
+        try:
+            sheets_format.render(0, candidate)
+            number_format = candidate
+        except ValueError:
+            pass
+    for key in ("string_value", "formula_value"):
+        if key in value:
+            text = value[key]
+            return (
+                sheets_grid.cell(text, number_format=number_format)
+                if text
+                else dict(sheets_grid.EMPTY_STRING)
+            )
+    if "number_value" in value:
+        return sheets_grid.cell(
+            sheets_grid.collapse(value["number_value"]), number_format=number_format
+        )
+    if "bool_value" in value:
+        return sheets_grid.cell(value["bool_value"], number_format=number_format)
+    return sheets_grid.cell(None, number_format=number_format) if number_format else None
+
+
+def _sheets_stated_sheet(i: int, sheet: dict, book: sheets_workbook.Workbook) -> _Sheet:
+    """One `Sheet` of a create request, checked as real checks it, as the sheet it makes."""
+    where = f"Invalid sheets[{i}]"
+    props = sheet.get("properties") or {}
+    kind = _PJ_ENUM_FIELDS[("sheets.SheetProperties", "sheetType")].names[
+        props.get("sheet_type", 0)
+    ]
+    if kind not in ("SHEET_TYPE_UNSPECIFIED", "GRID"):
+        raise gerr.invalid_argument("Object sheets must have exactly one embedded object")
+    title = props.get("title") or book.default_title()
+    if len(title) > 100:
+        raise gerr.invalid_argument(f"{where}: {_SHEETS_TITLE_TOO_LONG}")
+    if book.title_taken(title):
+        raise gerr.invalid_argument(f"{where}: {_SHEETS_TITLE_TAKEN.format(title=title)}")
+    if "sheet_id" in props:
+        if props["sheet_id"] < 0:
+            raise gerr.invalid_argument(f"{where}: Sheet id must be non-negative.")
+        if book.sheet_by_id(props["sheet_id"]) is not None:
+            raise gerr.invalid_argument(
+                f"{where}.id: Duplicate ids are not allowed. Multiple sheets are assigned to id "
+                f"{props['sheet_id']}"
+            )
+        sheet_id = props["sheet_id"]
+    else:
+        sheet_id = book.new_sheet_id(title)
+    grid = props.get("grid_properties") or {}
+    if grid.get("column_count", 0) < 0:
+        raise gerr.invalid_argument(f"{where}: {_SHEETS_NO_COLUMNS}")
+    if grid.get("row_count", 0) < 0:
+        raise gerr.invalid_argument(f"{where}: {_SHEETS_NO_ROWS}")
+    stated: dict = {
+        "gridProperties": {
+            "rowCount": grid.get("row_count") or sheets_workbook.GRID_ROWS,
+            "columnCount": grid.get("column_count") or sheets_workbook.GRID_COLS,
+            **{
+                json_name: grid[proto]
+                for json_name, proto in (
+                    ("frozenRowCount", "frozen_row_count"),
+                    ("frozenColumnCount", "frozen_column_count"),
+                    ("hideGridlines", "hide_gridlines"),
+                    ("rowGroupControlAfter", "row_group_control_after"),
+                    ("columnGroupControlAfter", "column_group_control_after"),
+                )
+                if grid.get(proto)
+            },
+        }
+    }
+    if props.get("hidden"):
+        stated["hidden"] = True
+    if props.get("tab_color"):
+        stated["tabColor"] = _sheets_json(props["tab_color"])
+        stated["tabColorStyle"] = {"rgbColor": stated["tabColor"]}
+    if props.get("right_to_left"):
+        stated["rightToLeft"] = True
+    made = _Sheet(sheet_id, len(book.sheets), title, [], stated)
+    cells: list[list] = []
+    for d, block in enumerate(sheet.get("data") or []):
+        r0, c0 = block.get("start_row", 0), block.get("start_column", 0)
+        for k, row in enumerate(block.get("row_data") or []):
+            for j, cell in enumerate(row.get("values") or []):
+                r, c = r0 + k, c0 + j
+                if r >= made.rows:
+                    raise gerr.invalid_argument(
+                        f"{where}.data[{d}]: GridCoordinate.rowIndex[{r}] is after last row in "
+                        f"grid[{made.rows - 1}]"
+                    )
+                if c >= made.cols:
+                    raise gerr.invalid_argument(
+                        f"{where}.data[{d}]: GridCoordinate.columnIndex[{c}] is after last column "
+                        f"in grid[{made.cols - 1}]"
+                    )
+                if "error_value" in (cell.get("user_entered_value") or {}):
+                    # measured 2026-10-26: a cell is not created holding an error
+                    raise gerr.invalid_argument(
+                        f"{where}.data[{d}]: Cannot set cell to an error value"
+                    )
+                stored = _sheets_cell(cell)
+                if stored is not None:
+                    _sheets_put(cells, r, c, stored)
+    width = max((len(r) for r in cells), default=0)
+    return made._replace(grid=[r + [None] * (width - len(r)) for r in cells])
+
+
+def _sheets_json(message: dict) -> dict:
+    """A message `protojson` read, back as the JSON real echoes: camelCase names, and a whole
+    double without its decimal point (`"red": 1`), as proto3 JSON prints one."""
+    return {
+        re.sub(r"_([a-z])", lambda m: m.group(1).upper(), k): (
+            _sheets_json(v) if isinstance(v, dict) else sheets_grid.collapse(v)
+        )
+        for k, v in message.items()
+    }
+
+
+def _sheets_creator(request: Request, caller: Caller) -> str:
+    """Who a created file belongs to: the caller, or for the admin/service token the service
+    account, which on real owns what it creates."""
+    return caller.email or _service_email(request)
+
+
+def _sheets_new_file_id(conn, owner: str) -> str:
+    """A Drive file id no stored file has, minted as the importer mints one
+    (`synth.gdrive_file_id`) from a seed only this creation has."""
+    while True:
+        file_id = synth.gdrive_file_id(f"created:{owner}:{time.time_ns()}")
+        if store.gdrive_by_id(conn, file_id) is None:
+            return file_id
+
+
+@router.post("/sheets/v4/spreadsheets", openapi_extra={"parameters": _P_SHEETS_STD})
+async def sheets_create(request: Request):
+    """``spreadsheets.create``: a new workbook at the caller's My Drive root, owned by the caller
+    and shared with nobody, answered as `spreadsheets.get` answers it without grid data.
+
+    Measured 2026-10-26:
+
+    * with no ``sheets`` the one sheet is ``sheetId 0``, and with ``sheets`` each gets an id of
+      its own unless it states one, a later sheet stating 0 included;
+    * a sheet with no title is named `Sheet1` in the workbook's language
+      (`sheets_workbook.Workbook.default_title`), and titles collide without regard to case;
+    * ``rowCount: 0`` is no row count, and the grid is 1000 x 26;
+    * ``data`` is stored though the answer carries no grid;
+    * an unsupported ``locale`` is refused, a ``timeZone`` that names no zone is replaced by
+      `Etc/GMT`;
+    * the Drive file's ``parents`` is the caller's root, and its one permission the owner's.
+
+    Named ranges, developer metadata, data sources and every cell format but a number format are
+    read and not kept: nothing here serves them back."""
+    _sheets_alt(request)
+    caller = _require(request)
+    body = protojson.read(await request.body(), _PJ_CREATE, field="spreadsheet").get(
+        "spreadsheet", {}
+    )
+    tree, _ = _sheets_mask(request, "sheets.Spreadsheet")
+    if _BATCH_OUTER.get() is not None:
+        raise gerr.unimplemented()
+    if body.get("spreadsheet_id"):
+        raise gerr.invalid_argument("Invalid spreadsheet.spreadsheetId: The id is invalid.")
+    conn = auth.conn(request)
+    owner = _sheets_creator(request, caller)
+    file_id = _sheets_new_file_id(conn, owner)
+    stated = body.get("properties") or {}
+    settings = dict(sheets_workbook.DEFAULT_PROPERTIES)
+    if stated.get("locale"):
+        if stated["locale"].lower() not in pylocale.locale_alias:
+            raise gerr.invalid_argument(
+                f"Invalid properties: Unsupported locale: {stated['locale']}"
+            )
+        settings["locale"] = stated["locale"]
+    if stated.get("time_zone") in _SHEETS_TIME_ZONES:
+        settings["timeZone"] = stated["time_zone"]
+    if stated.get("auto_recalc"):
+        settings["autoRecalc"] = _PJ_ENUM_FIELDS[
+            ("sheets.SpreadsheetProperties", "autoRecalc")
+        ].names[stated["auto_recalc"]]
+    book = sheets_workbook.Workbook(file_id, [], settings)
+    requested = body.get("sheets") or []
+    for i, sheet in enumerate(requested):
+        made = _sheets_stated_sheet(i, sheet, book)
+        index = (sheet.get("properties") or {}).get("index")
+        if index is not None and index > len(book.sheets):
+            raise gerr.invalid_argument(f"Invalid sheets: {_SHEETS_INDEX_TOO_HIGH}")
+        book.add_sheet(made, index)
+    if not requested:
+        book.add_sheet(_Sheet(0, 0, book.default_title(), [], {}))
+    if all(s.properties.get("hidden") for s in book.sheets):
+        raise gerr.invalid_argument(f"Invalid sheets[0]: {_SHEETS_ALL_HIDDEN}")
+    title = stated.get("title") or SHEETS_UNTITLED
+    now = int(time.time())
+    store.insert_document(
+        conn,
+        "google_drive",
+        {
+            "id": file_id,
+            "folder": _DRIVE_ROOT_FOLDER,
+            "author_email": owner,
+            "title": title,
+            "content": sheets_grid.to_csv(book.sheets[0].grid),
+            "subtype": "spreadsheet",
+            "parents": json.dumps([synth.drive_root_id(owner)]),
+            "created_ts": now,
+            "updated_ts": now,
+            "trashed": 0,
+            "title_fold": store.drive_name_fold(title),
+        },
+        grants=[("user", owner)],
+        parts={
+            "gdrive_sheets": _sheets_sheet_rows(book.sheets),
+            "gdrive_spreadsheets": [{"properties": json.dumps(settings, sort_keys=True)}],
+        },
+    )
+    row = store.gdrive_by_id(conn, file_id)
+    out = _sheets_book(
+        file_id,
+        row,
+        book.sheets,
+        [],
+        False,
+        _PJ_COMMENTS_VIEW.names[0],
+        tree,
+        settings=settings,
+        url=_sheets_url(file_id, caller),
+    )
+    return _sheets_respond(request, out, tree)
+
+
+@functools.cache
+def _sheets_time_zones() -> frozenset[str]:
+    from zoneinfo import available_timezones
+
+    return frozenset(available_timezones())
+
+
+class _TimeZones:
+    def __contains__(self, zone) -> bool:
+        return isinstance(zone, str) and zone in _sheets_time_zones()
+
+
+_SHEETS_TIME_ZONES = _TimeZones()
+
+
+# --- `sheets.copyTo` ----------------------------------------------------------------------------
+
+_PJ_COPY_TO = protojson.Message(
+    f"{_SHEETS_ENUM}.CopySheetToAnotherSpreadsheetRequest",
+    (protojson.Field("destinationSpreadsheetId", "destination_spreadsheet_id", "string"),),
+)
+
+
+@router.post(
+    "/sheets/v4/spreadsheets/{spreadsheet_id}/sheets/{sheet_id}:copyTo",
+    openapi_extra={"parameters": _P_SHEETS_STD},
+)
+async def sheets_copy_to(spreadsheet_id: str, sheet_id: str, request: Request):
+    """``spreadsheets.sheets.copyTo``: the copy's `SheetProperties`.
+
+    Measured 2026-10-26: reading the source is enough, while the destination has to be the
+    caller's to write -- one the caller cannot write or cannot see is 403, and one that does not
+    exist is 400 ``Invalid destinationSpreadsheetId [<id>]``. The copy goes last, with an id of
+    its own, the source's properties and cells, and a title in the DESTINATION's language
+    (`sheets_workbook.Workbook.copy_title`). Copying into the same workbook is allowed."""
+    _sheets_alt(request)
+    _require(request)
+    body = protojson.read(await request.body(), _PJ_COPY_TO)
+    tree, _ = _sheets_mask(request, "sheets.SheetProperties")
+    try:
+        wanted = protojson.to_int32(("string", sheet_id))
+    except protojson.ConversionError:
+        raise gerr.invalid_field_value(
+            "sheet_id", f"Invalid value at 'sheet_id' (TYPE_INT32), \"{sheet_id}\""
+        ) from None
+    _row, sheets = _workbook(request, spreadsheet_id)
+    source = next((s for s in sheets if s.sheet_id == wanted), None)
+    if source is None:
+        raise gerr.invalid_argument(f"The sheet ({wanted}) does not exist.")
+    dest_id = body.get("destination_spreadsheet_id", "")
+    conn = auth.conn(request)
+    dest_row = store.gdrive_by_id(conn, dest_id) if dest_id else None
+    if dest_row is None or (dest_row["subtype"] or "document") != "spreadsheet":
+        raise gerr.invalid_argument(f"Invalid destinationSpreadsheetId [{dest_id}]")
+    dest_row, dest_sheets = _sheets_writable(request, dest_id)
+    book = sheets_workbook.Workbook(dest_id, dest_sheets, _sheets_settings(conn, dest_id))
+    title = book.copy_title(source.title)
+    copied = _Sheet(
+        book.new_sheet_id(title),
+        len(book.sheets),
+        title,
+        [list(r) for r in source.grid],
+        source.stated(),
+    )
+    placed = book.add_sheet(copied)
+    _sheets_save(conn, dest_row, book.sheets)
+    return _sheets_respond(request, placed.served(), tree)
+
+
+# --- the two writes addressed by DataFilter -------------------------------------------------------
+
+_PJ_DATA_FILTER_VALUE_RANGE = protojson.Message(
+    f"{_SHEETS_ENUM}.DataFilterValueRange",
+    (
+        protojson.Field("dataFilter", "data_filter", "message", message=_PJ_DATA_FILTER),
+        protojson.Field("majorDimension", "major_dimension", "enum", enum=_PJ_DIMENSION),
+        protojson.Field("values", "values", "rows"),
+    ),
+)
+_PJ_BATCH_UPDATE_BY_FILTER = protojson.Message(
+    f"{_SHEETS_ENUM}.BatchUpdateValuesByDataFilterRequest",
+    (
+        protojson.Field("valueInputOption", "value_input_option", "enum", enum=_PJ_VALUE_INPUT),
+        protojson.Field(
+            "data", "data", "message", message=_PJ_DATA_FILTER_VALUE_RANGE, repeated=True
+        ),
+        protojson.Field("includeValuesInResponse", "include_values_in_response", "bool"),
+        protojson.Field(
+            "responseValueRenderOption", "response_value_render_option", "enum", enum=_PJ_RENDER
+        ),
+        protojson.Field(
+            "responseDateTimeRenderOption",
+            "response_date_time_render_option",
+            "enum",
+            enum=_PJ_DATETIME,
+        ),
+    ),
+)
+_PJ_BATCH_CLEAR_BY_FILTER = protojson.Message(
+    f"{_SHEETS_ENUM}.BatchClearValuesByDataFilterRequest", (_PJ_FILTERS,)
+)
+
+
+def _a1_absolute(sheet: _Sheet, r0: int, c0: int, r1: int, c1: int) -> str:
+    """A range with each reference absolute, the way a DataFilter write's refusal names what its
+    filter matched: `Other!$A$7`, `Other!$A$10:$B$10`."""
+    start = f"${_a1_col_letters(c0)}${r0 + 1}"
+    if r1 - r0 == 1 and c1 - c0 == 1:
+        return f"{_a1_title(sheet.title)}!{start}"
+    return f"{_a1_title(sheet.title)}!{start}:${_a1_col_letters(c1 - 1)}${r1}"
+
+
+@router.post(
+    "/sheets/v4/spreadsheets/{spreadsheet_id}/values:batchUpdateByDataFilter",
+    openapi_extra={"parameters": _P_SHEETS_STD},
+)
+async def sheets_values_batch_update_by_data_filter(spreadsheet_id: str, request: Request):
+    """``spreadsheets.values.batchUpdateByDataFilter``: `values:batchUpdate` with each range named
+    by a DataFilter.
+
+    Measured 2026-10-26: what a filter matches is always a bound, a single cell included, and
+    values past it are refused, too tall or too wide alike, as ``…matched range Other!$A$7 whose
+    rows cannot fit the data described in data.values[0].``. A developer metadata lookup matches
+    nothing and leaves no entry. Each entry echoes its filter and carries no ``spreadsheetId``,
+    and a refusal names the entry as ``Invalid dataFilterValueRange[<n>]: ``."""
+    _sheets_alt(request)
+    _require(request)
+    body = protojson.read(await request.body(), _PJ_BATCH_UPDATE_BY_FILTER)
+    tree, _ = _sheets_mask(request, "sheets.BatchUpdateValuesByDataFilterResponse")
+    row, sheets = _sheets_writable(request, spreadsheet_id)
+    named = body.get("value_input_option")
+    option = _sheets_input_option(_PJ_VALUE_INPUT.names[named] if named else None)
+    writings = []
+    for i, entry in enumerate(body.get("data", [])):
+        where = f"Invalid dataFilterValueRange[{i}]: "
+        if "data_filter" not in entry:
+            raise gerr.invalid_argument(
+                f"{where}dataFilterValueRange.filter is required but not specified."
+            )
+        (selection,) = _sheets_selections(
+            [entry["data_filter"]], sheets, values_level=True, prefix=where
+        )
+        if selection is None:
+            continue
+        sheet, r0, c0, r1, c1 = _sheets_bounds(selection, sheets)
+        major = _sheets_major(_PJ_DIMENSION.names[entry.get("major_dimension", 0)])
+        rows = _sheets_rows(entry.get("values", []), major)
+        if len(rows) > r1 - r0 or any(len(r) > c1 - c0 for r in rows):
+            raise gerr.invalid_argument(
+                f"{where}dataFilterValueRange.dataFilter matched range "
+                f"{_a1_absolute(sheet, r0, c0, r1, c1)} whose rows cannot fit the data described "
+                f"in data.values[{i}]."
+            )
+        _sheets_refuse_unstorable(rows, r0)
+        name = _a1_name(sheet, r0, c0, r1, c1)
+        writings.append((_Writing(sheet, r0, c0, (r0, c0, r1, c1), rows), name, major, entry))
+    out: dict = {"spreadsheetId": spreadsheet_id}
+    if not writings:
+        return _sheets_respond(request, out, tree)
+    grids = _sheets_grids(sheets)
+    today = _sheets_today(_sheets_settings(auth.conn(request), spreadsheet_id))
+    results = [(w, n, m, e, _sheets_apply(w, grids, option, today)) for w, n, m, e in writings]
+    after = _sheets_reloaded(sheets, grids)
+    every = {(w.sheet.index, r, c) for w, _, _, _, done in results for r, c in done}
+    if every:
+        _sheets_save(auth.conn(request), row, after)
+    totals = {
+        "totalUpdatedRows": len({(s, r) for s, r, _ in every}),
+        "totalUpdatedColumns": len({(s, c) for s, _, c in every}),
+        "totalUpdatedCells": len(every),
+        "totalUpdatedSheets": len({w.sheet.index for w, _, _, _, _ in results}),
+    }
+    out.update({k: v for k, v in totals.items() if v})
+    opts = {
+        "responseValueRenderOption": _PJ_RENDER.names[body.get("response_value_render_option", 0)],
+        "responseDateTimeRenderOption": _PJ_DATETIME.names[
+            body.get("response_date_time_render_option", 0)
+        ],
+    }
+    responses = []
+    for w, name, major, entry, done in results:
+        answer = _sheets_update_response(spreadsheet_id, w, done)
+        del answer["spreadsheetId"]
+        answer["dataFilter"] = _sheets_filter_echo(entry["data_filter"])
+        if body.get("include_values_in_response"):
+            answer["updatedData"] = _sheets_updated_data(w, name, after, major, opts)
+        responses.append(answer)
+    out["responses"] = responses
+    return _sheets_respond(request, out, tree)
+
+
+@router.post(
+    "/sheets/v4/spreadsheets/{spreadsheet_id}/values:batchClearByDataFilter",
+    openapi_extra={"parameters": _P_SHEETS_STD},
+)
+async def sheets_values_batch_clear_by_data_filter(spreadsheet_id: str, request: Request):
+    """``spreadsheets.values.batchClearByDataFilter``: ``clearedRanges`` for what the filters
+    match, in order. Measured 2026-10-26: a developer metadata lookup clears nothing and names
+    nothing, an open grid range clears the whole sheet, and a refusal names the filter as
+    ``Invalid dataFilter[<n>]: ``."""
+    _sheets_alt(request)
+    _require(request)
+    body = protojson.read(await request.body(), _PJ_BATCH_CLEAR_BY_FILTER)
+    tree, _ = _sheets_mask(request, "sheets.BatchClearValuesByDataFilterResponse")
+    row, sheets = _sheets_writable(request, spreadsheet_id)
+    selections = _sheets_selections(body.get("data_filters", []), sheets, values_level=True)
+    clearings = [
+        _sheets_bounds(s, sheets) for s in selections if s is not None and not isinstance(s, _Empty)
+    ]
+    out: dict = {"spreadsheetId": spreadsheet_id}
+    if not clearings:
+        return _sheets_respond(request, out, tree)
+    grids = _sheets_grids(sheets)
+    if any([_sheets_clear(grids, c) for c in clearings]):
         _sheets_save(auth.conn(request), row, _sheets_reloaded(sheets, grids))
     out["clearedRanges"] = [_a1_name(*c) for c in clearings]
     return _sheets_respond(request, out, tree)
@@ -6788,7 +7422,7 @@ def _drive_file(conn, row, shared: bool | None = None, me: str | None = None) ->
     # "shared" = visible to anyone besides the owner — true for org/group/multi-reader docs.
     # In a list the caller passes it in (batch-computed); for a single get, look it up here.
     if shared is None:
-        shared = bool(store.doc_grants(conn, "google_drive", row["id"]))
+        shared = bool(store.gdrive_shared(conn, [row["id"]]))
     ext = row["title"].rsplit(".", 1)[-1] if (native is None and "." in row["title"]) else None
     nbytes = len((row["content"] or "").encode("utf-8"))
     f = {
@@ -6888,9 +7522,15 @@ def _drive_permissions(conn, file_id: str, *, folder: str | None = None) -> list
             p["photoLink"] = synth.github_avatar(synth.github_user_id(email))
         return p
 
+    row = None if folder else store.get_document(conn, "google_drive", file_id)
+    owner_email = row["author_email"].lower() if row is not None else None
     perms = []
     for g in grants:
         ptype, pid = g["principal_type"], g["principal_id"]
+        if ptype == "user" and pid.lower() == owner_email:
+            # The owner's own grant is the owner permission below, not a reader's beside it:
+            # measured 2026-10-26, a file whose only grant is its owner's lists one permission.
+            continue
         if ptype == "org":  # anyone-in-org / anyone-with-link
             perms.append(full("anyoneWithLink", "anyone", "reader", anyone=True))
         elif ptype == "group":
@@ -6914,7 +7554,6 @@ def _drive_permissions(conn, file_id: str, *, folder: str | None = None) -> list
                 )
             )
     # every file has an owner
-    row = store.get_document(conn, "google_drive", file_id)
     if row is not None:
         owner = row["author_email"]
         perms.insert(

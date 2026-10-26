@@ -590,6 +590,22 @@ _SHEETS_RPC = "google.apps.sheets.v4.SpreadsheetsService"
 _RPC_METHODS = tuple(
     (method, re.compile(pattern), (f"{_SHEETS_RPC}.{name}", "sheets.googleapis.com"))
     for method, pattern, name in (
+        ("POST", r"/sheets/v4/spreadsheets", "CreateSpreadsheet"),
+        (
+            "POST",
+            r"/sheets/v4/spreadsheets/[^/]+/sheets/[^/]+:copyTo",
+            "CopySheetToAnotherSpreadsheet",
+        ),
+        (
+            "POST",
+            r"/sheets/v4/spreadsheets/[^/]+/values:batchUpdateByDataFilter",
+            "BatchUpdateValuesByDataFilter",
+        ),
+        (
+            "POST",
+            r"/sheets/v4/spreadsheets/[^/]+/values:batchClearByDataFilter",
+            "BatchClearValuesByDataFilter",
+        ),
         ("POST", r"/sheets/v4/spreadsheets/[^/]+/values/.+:clear", "ClearValues"),
         ("POST", r"/sheets/v4/spreadsheets/[^/]+/values/.+:append", "AppendValues"),
         ("PUT", r"/sheets/v4/spreadsheets/[^/]+/values/.+", "UpdateValues"),

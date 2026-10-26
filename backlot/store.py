@@ -255,9 +255,10 @@ PATCHABLE = {
 
 # Per source, the corpus tables that hold PARTS of a document rather than documents, each with the
 # columns that name the document it belongs to. The overlay mirrors each one, and a document the
-# overlay holds parts for reads them from the overlay alone (`parts_for`): a spreadsheet's sheets
-# are replaced together, so a read never mixes a written sheet with a corpus one.
-SATELLITES = {"google_drive": {"gdrive_sheets": ("file_id",)}}
+# overlay holds parts for in a table reads that table's from the overlay alone (`parts_for`): a
+# spreadsheet's sheets are written together, so a read never mixes a written sheet with a corpus
+# one, whatever the write did to which sheets there are.
+SATELLITES = {"google_drive": {"gdrive_sheets": ("file_id",), "gdrive_spreadsheets": ("file_id",)}}
 
 
 def id_columns(source_type: str) -> tuple[str, ...]:
@@ -472,12 +473,23 @@ DROP INDEX IF EXISTS idx_gdrive_served;
 --
 -- A cell in `grid` is a JSON scalar, so the type a corpus stated survives the round trip and
 -- `valueRenderOption` has something to distinguish.
+-- `properties` is the sheet's `SheetProperties` past its id, title and index -- its grid size,
+-- `hidden`, `tabColor` and the rest -- as JSON, and NULL for a sheet a corpus stated, whose grid
+-- then decides its size alone. A served write states it, so a sheet keeps the size a write gave
+-- it rather than one derived from how far its cells reach.
 CREATE TABLE IF NOT EXISTS gdrive_sheets (
     file_id TEXT NOT NULL, sheet_index INTEGER NOT NULL,
-    sheet_id INTEGER NOT NULL, title TEXT NOT NULL, grid TEXT NOT NULL,
+    sheet_id INTEGER NOT NULL, title TEXT NOT NULL, grid TEXT NOT NULL, properties TEXT,
     PRIMARY KEY (file_id, sheet_index)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gdrive_sheets_id ON gdrive_sheets(file_id, sheet_id);
+
+-- A spreadsheet's own `SpreadsheetProperties` past its title (which is the Drive file's name):
+-- `locale`, `timeZone`, `autoRecalc`, as JSON. No row is the defaults a new workbook has, which is
+-- every spreadsheet a corpus states; a workbook created through the API states its own.
+CREATE TABLE IF NOT EXISTS gdrive_spreadsheets (
+    file_id TEXT PRIMARY KEY, properties TEXT NOT NULL
+);
 
 -- `path` names the file THIS row is (only kind='file' rows have one). `changed_paths` is the other
 -- direction: a JSON list of the paths a PULL touched, so a corpus can state which files a pull
@@ -1289,10 +1301,16 @@ def _require_patchable(source_type: str, field: str) -> None:
         )
 
 
-def insert_document(conn, source_type: str, values: dict) -> None:
+def insert_document(
+    conn, source_type: str, values: dict, *, grants: list | None = None, parts: dict | None = None
+) -> None:
     """Write one document to the overlay, grant it what its container grants, and index it.
 
     ``values`` maps column name to value, and its identifier columns must already be minted.
+    ``grants`` replaces the container's with exactly these ``(principal_type, principal_id)``
+    pairs, for a document that belongs to no container that shares it: a Drive file created at the
+    root is its owner's alone. ``parts`` is written as :func:`replace_parts` writes it, in the same
+    commit.
 
     The grants copied are the container's own distinct set — the org for a public Slack channel,
     the grantee list for a private one — so a written document is exactly as visible as the
@@ -1324,16 +1342,25 @@ def insert_document(conn, source_type: str, values: dict) -> None:
             f"INSERT INTO ov.{tbl} ({', '.join(cols)}) VALUES ({','.join('?' for _ in cols)})",
             [values[c] for c in cols],
         )
-        conn.execute(
-            f"INSERT INTO ov.{names['acl']} ({key_cols}, principal_type, principal_id) "
-            f"SELECT {', '.join('?' for _ in key)}, principal_type, principal_id FROM ("
-            f"  SELECT DISTINCT principal_type, principal_id FROM main.{names['acl']} "
-            f"  WHERE {container} = ?"
-            f"  UNION SELECT DISTINCT principal_type, principal_id FROM ov.{names['acl']} "
-            f"  WHERE {container} = ?"
-            f")",
-            [*(values[c] for c in key), values[container], values[container]],
-        )
+        if grants is None:
+            conn.execute(
+                f"INSERT INTO ov.{names['acl']} ({key_cols}, principal_type, principal_id) "
+                f"SELECT {', '.join('?' for _ in key)}, principal_type, principal_id FROM ("
+                f"  SELECT DISTINCT principal_type, principal_id FROM main.{names['acl']} "
+                f"  WHERE {container} = ?"
+                f"  UNION SELECT DISTINCT principal_type, principal_id FROM ov.{names['acl']} "
+                f"  WHERE {container} = ?"
+                f")",
+                [*(values[c] for c in key), values[container], values[container]],
+            )
+        else:
+            conn.executemany(
+                f"INSERT INTO ov.{names['acl']} ({key_cols}, principal_type, principal_id) "
+                f"VALUES ({', '.join('?' for _ in key)}, ?, ?)",
+                [(*(values[c] for c in key), ptype, pid) for ptype, pid in grants],
+            )
+        if parts:
+            _replace_parts_locked(conn, source_type, tuple(values[c] for c in key), parts)
         _fts_index_overlay(conn, source_type, tuple(values[c] for c in key), values)
         conn.commit()
 
@@ -1441,29 +1468,38 @@ def parts_for(conn, source_type: str, table: str, key: tuple, *, order_by: str) 
     ).fetchall()
 
 
-def replace_parts(
-    conn, source_type: str, key: tuple, table: str, rows: list[dict], patches: dict
-) -> None:
-    """Set a document's rows in a :data:`SATELLITES` table to exactly ``rows``, and overwrite the
-    document's ``patches`` columns, in one commit under one lock.
+def replace_parts(conn, source_type: str, key: tuple, parts: dict, patches: dict) -> None:
+    """Set a document's rows in each of its :data:`SATELLITES` tables ``parts`` names to exactly
+    the rows given, and overwrite the document's ``patches`` columns, in one commit under one lock.
 
-    One commit because the two describe one state: a spreadsheet's `content` is derived from its
-    first sheet, so a reader that saw the new cells beside the old `content` would get two
-    answers for one file from Sheets and from Drive's export. ``rows`` omit the columns that name
-    the document; ``key`` supplies them, in :data:`SATELLITES` order.
+    One commit because they describe one state: a spreadsheet's `content` is derived from its first
+    sheet, so a reader that saw the new cells beside the old `content` would get two answers for
+    one file from Sheets and from Drive's export. Each row omits the columns that name the
+    document; ``key`` supplies them, in :data:`SATELLITES` order. An empty list leaves the table
+    holding none for it in the overlay, which reads as the corpus's (`parts_for`).
     """
     from backlot import overlay
 
     _require_writable(source_type)
-    ref = SATELLITES[source_type][table]
     for field in patches:
         _require_patchable(source_type, field)
-    known = {r[1] for r in conn.execute(f"PRAGMA main.table_info({table})")}
-    for row in rows:
-        if unknown := set(row) - known:
-            raise ValueError(f"{source_type}: no such column(s) {sorted(unknown)} on {table}")
-    where = " AND ".join(f"{c} = ?" for c in ref)
     with overlay.LOCK:
+        _replace_parts_locked(conn, source_type, key, parts)
+        for field, value in patches.items():
+            _patch_locked(conn, source_type, key, field, value)
+        conn.commit()
+
+
+def _replace_parts_locked(conn, source_type: str, key: tuple, parts: dict) -> None:
+    """The body of :func:`replace_parts` and of an insert that carries parts, lock held and commit
+    left to the caller."""
+    for table, rows in parts.items():
+        ref = SATELLITES[source_type][table]
+        known = {r[1] for r in conn.execute(f"PRAGMA main.table_info({table})")}
+        for row in rows:
+            if unknown := set(row) - known:
+                raise ValueError(f"{source_type}: no such column(s) {sorted(unknown)} on {table}")
+        where = " AND ".join(f"{c} = ?" for c in ref)
         conn.execute(f"DELETE FROM ov.{table} WHERE {where}", list(key))
         for row in rows:
             values = {**dict(zip(ref, key)), **row}
@@ -1472,9 +1508,6 @@ def replace_parts(
                 f"VALUES ({','.join('?' for _ in values)})",
                 list(values.values()),
             )
-        for field, value in patches.items():
-            _patch_locked(conn, source_type, key, field, value)
-        conn.commit()
 
 
 def document_by_key(conn, source_type: str, key: tuple, visible_ids=None) -> sqlite3.Row | None:
@@ -4867,6 +4900,28 @@ def doc_grants(conn, source_type, *ident) -> list[sqlite3.Row]:
         "ORDER BY principal_type, principal_id",
         ident,
     ).fetchall()
+
+
+def gdrive_shared(conn, file_ids: list) -> set:
+    """The subset of ``file_ids`` some grant shares with anyone besides the owner: a grant to the
+    file's own author is not sharing. Measured 2026-10-26, a spreadsheet created through the API,
+    whose one permission is its owner's, is `shared: false`."""
+    out: set = set()
+    acl = acl_table("google_drive")
+    for i in range(0, len(file_ids), 900):
+        chunk = list(file_ids[i : i + 900])
+        marks = ",".join("?" for _ in chunk)
+        out.update(
+            r[0]
+            for r in conn.execute(
+                f"SELECT DISTINCT a.id FROM {acl} a "
+                f"JOIN {merged_source(conn, 'google_drive')} ON gdrive_files.id = a.id "
+                f"WHERE a.id IN ({marks}) AND NOT (a.principal_type = 'user' "
+                f"AND lower(a.principal_id) = lower(gdrive_files.author_email))",
+                chunk,
+            )
+        )
+    return out
 
 
 def docs_with_grants(conn, source_type, doc_keys: list) -> set:
