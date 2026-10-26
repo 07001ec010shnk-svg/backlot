@@ -255,10 +255,10 @@ _HTML = "text/html; charset=utf-8"
 async def express(request: Request):
     """Linear's answer at a path Express does not hand Apollo Server (:func:`routes_to_apollo`),
     each of which ``backlot.main`` routes here: after the layers of :func:`_front`, Express's own,
-    as api.linear.app answered on 2026-10-25 (UTC). At `/` that is :data:`_GREETING` to a `GET` and
-    a `HEAD`, and the methods `/` takes, as `text/plain`, to an `OPTIONS`; at any other path, and to
-    any other method, it is ``finalhandler``'s 404 page (:func:`_not_found`). The body is not read:
-    `{` under `application/json` drew the 404."""
+    as api.linear.app answered on 2026-10-25 (UTC), and `PATCH /` on 2026-10-26. At `/` that is
+    :data:`_GREETING` to a `GET` and a `HEAD`, and the methods `/` takes, as `text/plain`, to an
+    `OPTIONS`; at any other path, and to any other method, it is ``finalhandler``'s 404 page
+    (:func:`_not_found`). The body is not read: `{` under `application/json` drew the 404."""
     front = _front(request)
     if front is not None:
         return front

@@ -6697,6 +6697,8 @@ _LINEAR_HTTP = [
             ("PROPFIND", "/nosuch", (), None, "key", "/nosuch"),
             ("OPTIONS", "/nosuch", (), None, "Bearer key", "/nosuch"),
             ("POST", "/", _J, _TYPENAME, "key", "/"),
+            ("PUT", "/", _J, _TYPENAME, "key", "/"),
+            ("PATCH", "/", _J, _TYPENAME, "none", "/"),
             ("DELETE", "/", (), None, "none", "/"),
             ("PROPFIND", "/", (), None, "none", "/"),
             ("GET", "/%2F", (), None, "none", "/%2F"),

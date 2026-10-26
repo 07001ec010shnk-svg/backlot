@@ -270,7 +270,8 @@ async def unrouted(request: Request):
     here: :data:`_NGINX_404` where nginx keeps the request (:func:`nginx_passes`), and Fastify's
     where it passes it on, :func:`_preflight` to an `OPTIONS` and its not-found handler's 404
     (:func:`_not_found`) to any other method, after reading the body of one of :data:`_BODIED`
-    (:func:`_fastify_read`)."""
+    (:func:`_fastify_read`). A `PROPFIND` to `/graphql/` under `a/b/c` or with `{` as JSON drew the
+    404 on 2026-10-26 (UTC), where a `POST` under `a/b/c` drew the 415."""
     if not nginx_passes(sent_path(request.scope)):
         return Response(_NGINX_404, status_code=404, headers={"content-type": "text/html"})
     if request.method == "OPTIONS":

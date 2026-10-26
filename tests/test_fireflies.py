@@ -2174,6 +2174,8 @@ _FIREFLIES_HTTP = [
             ("POST", "/graphql/", (), b"x", "none"),
             ("POST", "/graphql/", (("Content-Type", "text/plain"),), b"x", "none"),
             ("PUT", "/graphql/", (("Content-Type", "application/graphql"),), b"{ x }", "none"),
+            ("PROPFIND", "/graphql/", (("Content-Type", "a/b/c"),), b"x", "none"),
+            ("PROPFIND", "/graphql/", _J, b"{", "none"),
             ("GET", "/graphql/" + _Q, _P, None, "key"),
             ("GET", "/graphql/", (("Accept", "text/html"),), None, "none"),
             ("PUT", "/graph%71l", _J, _TYPENAME, "key"),
