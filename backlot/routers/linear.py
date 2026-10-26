@@ -100,11 +100,17 @@ def express_etag(body: bytes) -> str:
 
 
 def _origin(request: Request) -> str | None:
-    """The `Origin` ``cors`` echoes: each copy without the spaces and tabs around it, joined with
-    `, `, or None where there is none or it is empty. api.linear.app echoed ` https://example.com `
-    as `https://example.com`, two copies joined, and `null`, and echoed no empty one."""
+    """The `Origin` ``cors`` echoes: each copy without the spaces and tabs around it, the empty ones
+    ahead of the first that is not empty left off, the rest joined with `, ` and the join's trailing
+    spaces left off; or None where nothing is left. On 2026-10-26 (UTC) api.linear.app echoed
+    ` https://example.com ` as `https://example.com`, `https://example.com` and a U+00A0 as sent,
+    `https://a.example` then `https://b.example` as `https://a.example, https://b.example`, an empty
+    copy then `https://a.example` as `https://a.example`, the two the other way round as
+    `https://a.example,`, and `null`, and echoed neither one empty copy nor two."""
     copies = [value.strip(" \t") for value in request.headers.getlist("origin")]
-    return ", ".join(copies) or None
+    while copies and not copies[0]:
+        copies.pop(0)
+    return ", ".join(copies).rstrip(" ") or None
 
 
 def _express_sent(

@@ -6810,15 +6810,29 @@ def _cors(origin="https://example.com"):
     }
 
 
-_TYPENAME_ETAG = 'W/"20-/8NdYwgmGsmmlrq5Nh8mH1T+tAs"'
+_ETAG_OF_TYPENAME = 'W/"20-/8NdYwgmGsmmlrq5Nh8mH1T+tAs"'
 _TYPENAME = b'{"query":"{ __typename }"}'
-_BEARER_ETAG = 'W/"f9-BDIWTD84v19kyk2Xj/zxwnhRq74"'
+_ETAG_OF_THE_BEARER_400 = 'W/"f9-BDIWTD84v19kyk2Xj/zxwnhRq74"'
 _LINEAR_HEADERS = [
     pytest.param(
-        "POST", "", _J, _TYPENAME, "key", 200, _sent(_TYPENAME_ETAG) | _counted(2500), id="served"
+        "POST",
+        "",
+        _J,
+        _TYPENAME,
+        "key",
+        200,
+        _sent(_ETAG_OF_TYPENAME) | _counted(2500),
+        id="served",
     ),
     pytest.param(
-        "GET", _Q, _P, None, "key", 200, _sent(_TYPENAME_ETAG) | _counted(2500), id="served by GET"
+        "GET",
+        _Q,
+        _P,
+        None,
+        "key",
+        200,
+        _sent(_ETAG_OF_TYPENAME) | _counted(2500),
+        id="served by GET",
     ),
     pytest.param(
         "POST",
@@ -6947,7 +6961,7 @@ _LINEAR_HEADERS = [
             _TYPENAME,
             "Bearer key",
             400,
-            _sent(_BEARER_ETAG),
+            _sent(_ETAG_OF_THE_BEARER_400),
             id=f"Bearer at {t or '/graphql'}",
         )
         for t in ("", "/nosuch")
@@ -6959,7 +6973,7 @@ _LINEAR_HEADERS = [
         None,
         "Bearer key",
         400,
-        _sent(_BEARER_ETAG, x_content_type_options="nosniff"),
+        _sent(_ETAG_OF_THE_BEARER_400, x_content_type_options="nosniff"),
         id="Bearer at /",
     ),
     pytest.param(
@@ -7075,7 +7089,7 @@ _LINEAR_HEADERS = [
             _TYPENAME,
             "key",
             200,
-            _sent(_TYPENAME_ETAG)
+            _sent(_ETAG_OF_TYPENAME)
             | ({"vary": "Accept-Encoding"} if allowed is None else _cors(allowed)),
             id=f"Origin {label}",
         )
@@ -7089,6 +7103,17 @@ _LINEAR_HEADERS = [
                 "https://a.example, https://b.example",
             ),
             ("empty", (("Origin", ""),), None),
+            (
+                "empty, then a value",
+                (("Origin", ""), ("Origin", "https://a.example")),
+                "https://a.example",
+            ),
+            (
+                "a value, then empty",
+                (("Origin", "https://a.example"), ("Origin", "")),
+                "https://a.example,",
+            ),
+            ("empty twice", (("Origin", ""), ("Origin", "")), None),
             ("tabbed", (("Origin", "\thttps://example.com\t"),), "https://example.com"),
             ("U+00A0 after", (("Origin", "https://example.com\xa0"),), "https://example.com\xa0"),
         )
@@ -7130,7 +7155,7 @@ _LINEAR_HEADERS = [
         _TYPENAME,
         "Bearer key",
         400,
-        _sent(_BEARER_ETAG) | _cors("https://linear.app"),
+        _sent(_ETAG_OF_THE_BEARER_400) | _cors("https://linear.app"),
         id="Origin, Bearer",
     ),
     pytest.param(
