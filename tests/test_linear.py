@@ -6768,9 +6768,10 @@ def test_linear_answers_each_method_path_type_and_accept_as_linear_does(
     assert {name: r.headers.get(name) for name in expected_headers} == expected_headers
 
 
-# The headers on each kind of answer api.linear.app gave on 2026-10-25 and 2026-10-26 (UTC): the
-# request, the credential (`_LINEAR_CREDENTIALS`), the status, and each header named, None for one
-# it did not send. The `ETag`s are the ones real sent, so a row holds the body to its last byte.
+# The headers on each kind of answer, as `backlot.routers.linear._express_sent`, `express`,
+# `_preflight` and `RequestBudget` record what api.linear.app sent: the request, the credential
+# (`_LINEAR_CREDENTIALS`), the status, and each header named, None for one it did not send. The
+# `ETag`s are the ones real sent, so a row holds the body to its last byte.
 _NO_STORE = "private, no-cache, no-store, must-revalidate"
 _EXPOSED = (
     "Cache-Control,Content-Language,Content-Length,Content-Type,Expires,Last-Modified,Pragma,"
@@ -7202,7 +7203,8 @@ def test_linear_answers_carry_the_headers_linear_sends(
 
 # The seconds at which requests were taken from an API key's bucket, and
 # `x-ratelimit-requests-remaining` on the last: one; thirty over the 13.13 seconds of
-# `RequestBudget`'s measurement; 2,505 at once, past the limit; and one an hour after 2,000.
+# `RequestBudget`'s measurement; 2,505 at once, past the limit; one an hour after 2,000; and two
+# a second apart, which leave the level at 2498.69.
 _REQUEST_BUDGET = [
     pytest.param([0.0], "2499", id="one"),
     pytest.param([i * 13.13 / 29 for i in range(30)], "2479", id="thirty over 13 seconds"),
