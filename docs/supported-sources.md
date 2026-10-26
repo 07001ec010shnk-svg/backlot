@@ -171,9 +171,10 @@ the five `x-ratelimit-*`. The operations are those the GitHub baseline marks `mi
 and a tab the only whitespace in it, and a tab right after the scheme sets the header apart unless a
 comma follows anywhere in it: `Bearer` or `token` with nothing after it, and a `Basic` value that is
 not base64, are credentials that do not resolve, though that `Basic` value is no credential in a
-header a tab sets apart; a `Basic` value whose base64 holds a token as its password, or as its user
-beside an empty password or `x-oauth-basic`, is that token; and one that holds none is no credential
-at all.
+header a tab sets apart; a `Basic` value whose base64 holds, as its password or as its user beside
+an empty password or `x-oauth-basic`, a token that resolves or one shaped like real's (`ghp_`,
+`gho_`, `ghu_` or `ghs_` and 36 ASCII letters or digits) or like Backlot's (`usr-` and 20
+hexadecimal digits) is that token; and one that holds anything else is no credential at all.
 
 **Every response carries the five `x-ratelimit-*` headers** real puts on every answer, the errors
 included: `limit` at real's numbers (60 an hour for a caller with no credential, 5000 for a token,
@@ -724,7 +725,8 @@ the body left off. A path in another case is the 400 here, where real routes it 
 path, and `PROPFIND` or `QUERY` is the framework's 405 here, where real answers the URL's 400. A
 credential that is not `Bearer <token>` (no header, no scheme, `Basic`, GitHub's legacy
 `token <t>`, or a bearer with a second word after its token) is refused by naming the format, where
-a bearer whose token does not resolve is `API token is invalid.`. Each refusal named here but the
+a bearer whose token does not resolve is `API token is invalid.`, with `additional_data`
+`{"reason":"token_invalid"}` ahead of the `request_id`. Each refusal named here but the
 framework's 405 carries a `request_id` in the body and `x-notion-request-id` on the response, one
 value; real's differs per response and this one is derived from the request, so a corpus served
 twice answers the same id.
