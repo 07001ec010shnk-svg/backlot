@@ -382,11 +382,13 @@ def test_cloudflare_refuses_a_repeated_authorization(client, tokens_yaml, vendor
         assert r.status_code == status, row.id
         if status != _CLOUDFLARE:
             assert page not in r.content, row.id
+            assert "connection" not in r.headers, row.id
             if status == 200:
                 assert r.json() == {"data": {"__typename": "Query"}}, row.id
             continue
         ctype = (r.headers["content-type"], r.headers["content-length"])
         assert ctype == ("text/html", "155"), row.id
+        assert r.headers["connection"] == "close", row.id
         if method != "HEAD":
             assert r.content == page, row.id
 
