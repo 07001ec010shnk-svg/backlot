@@ -325,6 +325,20 @@ def sent_as(client, method: str, path: str, headers, content=None, bare: bool = 
     return asyncio.run(send())
 
 
+class Matching:
+    """A header value a table expects by its shape: equal to each string ``pattern`` matches in
+    full, where the value is the vendor's own each time (an id, a count, a moment)."""
+
+    def __init__(self, pattern: str):
+        self.pattern = re.compile(pattern)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, str) and self.pattern.fullmatch(other) is not None
+
+    def __repr__(self) -> str:
+        return f"Matching({self.pattern.pattern!r})"
+
+
 class Chunked(bytes):
     """A body :func:`sent_as` sends in chunks, with no `Content-Length`."""
 

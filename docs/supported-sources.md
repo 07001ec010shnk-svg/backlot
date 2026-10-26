@@ -572,8 +572,18 @@ beside an `apollo-require-preflight` or `x-apollo-operation-name` header, its ch
 browser preflighted the request. Express hands Apollo Server `/graphql` in any case, alone or with
 a slash and more after it, once Linear's front has turned a backslash into a slash, folded a run of
 slashes into one and decoded an escape of a letter, a digit or one of `-._~`, so each of those
-paths is the endpoint too; `/` answers a greeting, and any other path Express's 404 page. Root
-`Query` fields:
+paths is the endpoint too; `/` answers a greeting, and any other path Express's 404 page.
+
+Every answer past the load balancer carries `x-request-id` and, to a request with an `Origin`,
+`Access-Control-Allow-Origin` and `Access-Control-Expose-Headers`. Express's answers add
+`Cache-Control: private, no-cache, no-store, must-revalidate` and `Vary`, and all but its 404 page
+and its answers at `/` to `HEAD` and `OPTIONS` an `ETag`; Apollo Server's JSON ends in a newline.
+An answer to a document Linear ran carries `x-ratelimit-requests-limit` (2,500 an hour under an API
+key, 1,200 with no credential), `x-ratelimit-requests-remaining` and `x-ratelimit-requests-reset`.
+`x-complexity` and the four `x-ratelimit-complexity-*` headers are not sent, and a spent budget is
+not refused.
+
+Root `Query` fields:
 
 | Query field | Notes |
 |---|---|

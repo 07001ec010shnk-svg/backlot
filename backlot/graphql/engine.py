@@ -209,9 +209,13 @@ def refused(*refusals: Refusal) -> Result:
 
 
 def _refusal(
-    message: str, code: str = BAD_REQUEST, status: int = 400, thrown: bool = False
+    message: str,
+    code: str = BAD_REQUEST,
+    status: int = 400,
+    thrown: bool = False,
+    headers: tuple[tuple[str, str], ...] = (),
 ) -> Result:
-    return refused(Refusal(message, code, status=status, thrown=thrown))
+    return refused(Refusal(message, code, status=status, headers=headers, thrown=thrown))
 
 
 def _js_truthy(value: Any) -> bool:
@@ -267,6 +271,9 @@ def body_refusal(payload: Any) -> Result | None:
 #: (UTC).
 PERSISTED_QUERY_VERSION = "Unsupported persisted query version"
 PERSISTED_QUERY_MISMATCH = "provided sha does not match query"
+#: The `Cache-Control` Apollo Server sets on ``PersistedQueryNotFound``, which both vendors sent
+#: with it on 2026-10-25 (UTC), by `POST` and on Linear by `GET`.
+PERSISTED_QUERY_NOT_FOUND_HEADERS = (("cache-control", "private, no-cache, must-revalidate"),)
 
 
 def persisted_query_refusal(payload: dict) -> Result | None:
@@ -286,7 +293,12 @@ def persisted_query_refusal(payload: dict) -> Result | None:
         return _refusal(PERSISTED_QUERY_VERSION, INTERNAL_SERVER_ERROR)
     query = payload.get("query")
     if not isinstance(query, str):
-        return _refusal("PersistedQueryNotFound", PERSISTED_QUERY_NOT_FOUND, status=200)
+        return _refusal(
+            "PersistedQueryNotFound",
+            PERSISTED_QUERY_NOT_FOUND,
+            status=200,
+            headers=PERSISTED_QUERY_NOT_FOUND_HEADERS,
+        )
     # Both vendors hashed a query holding U+D800 as the same query with U+FFFD in its place on
     # 2026-10-25 (UTC), the UTF-8 Node writes for a lone surrogate.
     units = query.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")

@@ -1389,6 +1389,19 @@ def _not_found(method: str, target: str) -> bytes:
 
 
 _FIREFLIES_HTTP = [
+    # Apollo Server's `Cache-Control` on its answer to a persisted query's hash alone.
+    http_row(
+        "POST",
+        "",
+        _J,
+        b'{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"' + b"1" * 64 + b'"}}}',
+        "key",
+        200,
+        _JSON_UTF8,
+        _apollo(b"PersistedQueryNotFound", b"PERSISTED_QUERY_NOT_FOUND", status=200),
+        id="a persisted query's hash alone",
+        answered={"cache-control": "private, no-cache, must-revalidate"},
+    ),
     # Cloudflare, ahead of everything.
     http_row(
         "TRACE",

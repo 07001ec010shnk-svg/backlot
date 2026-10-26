@@ -1302,9 +1302,16 @@ async def refuse_cloudflares_methods_on_linear_and_fireflies(request: Request, c
     with Cloudflare's answer, ahead of the route and the credential. Registered before
     :func:`refuse_a_repeated_authorization_on_linear_and_fireflies`, which answers first: a
     `TRACE`, `CONNECT` or `PURGE` carrying `Authorization` twice drew its 400 from both vendors on
-    2026-10-25 (UTC)."""
+    2026-10-25 (UTC). Linear's `CONNECT` at `/` itself carries `X-Content-Type-Options: nosniff`,
+    as each answer at Linear's `/` does (``backlot.routers.linear.express``): api.linear.app sent
+    it there four times of four on 2026-10-25 and 2026-10-26, and not at `/nosuch`, nor with its
+    `TRACE` or `PURGE` at `/`."""
     status, body, headers = _CLOUDFLARE_METHOD[request.method]
-    return Response(body, status_code=status, headers=headers)
+    response = Response(body, status_code=status, headers=headers)
+    linear_root = request.scope["path"].startswith("/linear/") and sent_path(request.scope) == "/"
+    if request.method == "CONNECT" and linear_root:
+        response.headers["x-content-type-options"] = "nosniff"
+    return response
 
 
 @_middleware(
