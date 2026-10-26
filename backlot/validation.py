@@ -226,10 +226,14 @@ def _when_clause(schema: dict, schema_path, failing) -> str:
     # `{"not": {"required": [...]}}` predicates on a field's ABSENCE — how a schema says "one of
     # these two, and here is the one to require when the other is missing". Left unrendered, a
     # record that states neither was told only that the second is required and never learned that
-    # stating the first would do.
+    # stating the first would do. `{"not": {"anyOf": [{"required": [...]}, ...]}}` is the same
+    # predicate over several alternatives, in force when every one of them is absent.
     absent = cond.get("not")
-    if isinstance(absent, dict) and isinstance(absent.get("required"), list):
-        clauses += [f"{field} is absent" for field in absent["required"]]
+    if isinstance(absent, dict):
+        alternatives = absent.get("anyOf") if isinstance(absent.get("anyOf"), list) else [absent]
+        for alt in alternatives:
+            if isinstance(alt, dict) and isinstance(alt.get("required"), list):
+                clauses += [f"{field} is absent" for field in alt["required"]]
     lead = " unless " if parts[branch] == "else" else " when "
     return lead + " and ".join(clauses) if clauses else ""
 

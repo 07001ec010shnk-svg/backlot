@@ -77,7 +77,7 @@ from pathlib import Path
 
 import yaml
 
-from backlot import gsheets, store, synth
+from backlot import gdocs, gsheets, store, synth
 from backlot.config import Settings, get_settings, infer_org
 from backlot.validation import record_errors
 
@@ -164,6 +164,9 @@ def _doc_id(rec: dict) -> str:
     # ordinary -- resolve to one id, and the row-level upsert leaves only the later one.
     if rec.get("sheets") is not None:
         seed += _j(rec["sheets"])
+    # Likewise a structured document's `content` is its text alone, without the styles.
+    if rec.get("paragraphs") is not None:
+        seed += _j(rec["paragraphs"])
     return "dsid_" + hashlib.sha256(seed.encode()).hexdigest()[:32]
 
 
@@ -1070,6 +1073,37 @@ def _sheets_pairing_errors(rec: dict) -> list[str]:
     return msgs
 
 
+def _paragraphs_pairing_errors(rec: dict) -> list[str]:
+    """What a `google_drive` record's `paragraphs` may not sit beside, and what a paragraph may not
+    say, returned for the reason :func:`_sheets_pairing_errors` gives."""
+    paragraphs = rec.get("paragraphs")
+    if not isinstance(paragraphs, list):
+        return []
+    msgs = []
+    if rec.get("content") is not None:
+        msgs.append(
+            "'paragraphs' and 'content' state the same document two ways; drop 'content' — it is "
+            "derived from the paragraphs at import, one line each"
+        )
+    subtype = rec.get("subtype") or "document"
+    if subtype != "document":
+        msgs.append(f"'paragraphs' needs subtype 'document' (this is {subtype!r})")
+    for i, para in enumerate(paragraphs):
+        if not isinstance(para, dict):
+            continue
+        if ("text" in para) == ("runs" in para):
+            msgs.append(f"paragraphs[{i}]: state its text as one of 'text' or 'runs'")
+        texts = [para.get("text")] + [
+            r.get("text") for r in para.get("runs") or [] if isinstance(r, dict)
+        ]
+        if any(isinstance(t, str) and "\n" in t for t in texts):
+            msgs.append(
+                f"paragraphs[{i}]: a newline ends a paragraph, so a paragraph's text holds none; "
+                "state the next line as the next paragraph"
+            )
+    return msgs
+
+
 def _sheet_title(sheet: dict, i: int) -> str:
     """A sheet's title, defaulted by position when the corpus states none.
 
@@ -1913,7 +1947,9 @@ class _Loader:
         # get a pull-only field onto an issue correctly than a hand-written one.
         if src == "github" and (bad := _github_pairing_errors(rec)):
             raise SystemExit(f"{where}: " + "; ".join(bad))
-        if src == "google_drive" and (bad := _sheets_pairing_errors(rec)):
+        if src == "google_drive" and (
+            bad := _sheets_pairing_errors(rec) + _paragraphs_pairing_errors(rec)
+        ):
             raise SystemExit(f"{where}: " + "; ".join(bad))
         gcol = store.grouping_col(src)
         container = str(rec[gcol])  # channel / mailbox / folder / repo / project / space
@@ -1995,6 +2031,11 @@ class _Loader:
                 **rec,
                 "content": gsheets.to_csv(gsheets.normalise_grid(drive_sheets[0]["grid"])),
             }
+        # And stated paragraphs are the document, its `content` their text, for the same reason.
+        drive_paragraphs = None
+        if src == "google_drive" and rec.get("paragraphs") is not None:
+            drive_paragraphs = rec["paragraphs"]
+            rec = {**rec, "content": gdocs.text_of(drive_paragraphs)}
 
         doc_id = _doc_id(rec)
         # Recorded, not deduplicated: `seen` answers "is this document in the corpus" for the
@@ -2561,6 +2602,10 @@ class _Loader:
             file_id = self.keys[(src, doc_id)][0]
             rows = _sheet_rows(file_id, drive_sheets) if drive_sheets is not None else []
             store.gdrive_replace_sheets(conn, file_id, rows)
+            body = None
+            if drive_paragraphs is not None:
+                body = gdocs.from_paragraphs(file_id, drive_paragraphs)
+            store.gdrive_replace_doc_body(conn, file_id, body)
 
         if src in THREADED_REPLIES:
             # The root has landed, so its id is settled — every reply below points at it. Both
@@ -3837,7 +3882,7 @@ def run(
                 continue
             errs = record_errors(rec)
             if isinstance(rec, dict) and rec.get("source_type") == "google_drive":
-                errs += _sheets_pairing_errors(rec)
+                errs += _sheets_pairing_errors(rec) + _paragraphs_pairing_errors(rec)
             if isinstance(rec, dict) and rec.get("source_type") == "github":
                 errs += _github_pairing_errors(rec)
                 # Only from a record that is otherwise sound: its own `path` may be the thing that
