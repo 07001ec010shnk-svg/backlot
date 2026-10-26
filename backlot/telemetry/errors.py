@@ -19,7 +19,7 @@ failure:
 | Class | The call failed because |
 |---|---|
 | ``unsupported`` | Backlot does not do this yet: the baseline records the operation as ``missing`` or ``refused``, or the GraphQL engine refused a filter |
-| ``internal`` | of a Backlot bug: Backlot's own failure, or a 5xx other than a vendor's answer (both below) |
+| ``internal`` | of a Backlot bug: its own failure, or a 5xx other than a vendor's answer (below) |
 | ``rate_limit`` | the vendor's rate limit was reached: a 429, or a 403 with ``x-ratelimit-remaining: 0`` as GitHub sends |
 | ``auth`` | the credential was missing, wrong, or not allowed: a 401 or 403, or one in ``_AUTH`` |
 | ``client`` | the request was wrong: any other failure |
