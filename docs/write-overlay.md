@@ -2,7 +2,7 @@
 
 [← README](../README.md)
 
-Backlot serves writes on Slack and on Google Sheets. They never reach the corpus.
+Backlot supports write APIs for some vendors; each source's section of [Supported sources](supported-sources.md) lists the methods that write. A write never reaches the corpus.
 
 ## The corpus is not writable, and that is enforced
 
