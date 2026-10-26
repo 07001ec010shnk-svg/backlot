@@ -22,7 +22,7 @@ import jwt
 import pytest
 import yaml
 
-from backlot import oauth, sheets_grid, sheets_input, store, synth
+from backlot import gsheets, oauth, store, synth
 from backlot.config import Settings
 from backlot.errors import google as gerr
 from tests._helpers import (
@@ -9595,7 +9595,7 @@ def _nf(type_, pattern):
         (True, "TRUE"),
         (False, "FALSE"),
         (None, ""),
-        # General (`sheets_format.general`)
+        # General (`gsheets.general`)
         (0.30000000000000004, "0.3"),
         (1 / 3, "0.3333333333"),
         (12345678902.5, "12345678903"),
@@ -9609,44 +9609,44 @@ def _nf(type_, pattern):
         (-1e-11, "0"),
         (1e100, "1E+100"),
         # a number format, as a write leaves one
-        (sheets_grid.cell(0.125, number_format=_nf("PERCENT", "0%")), "13%"),
-        (sheets_grid.cell(0.12345, number_format=_nf("PERCENT", "0.00%")), "12.35%"),
-        (sheets_grid.cell(2.675, number_format=_nf("NUMBER", "#,##0.00")), "2.68"),
-        (sheets_grid.cell(-0.4, number_format=_nf("NUMBER", "#,##0")), "0"),
-        (sheets_grid.cell(-5.5, number_format=_nf("CURRENCY", '"$"#,##0.00')), "-$5.50"),
-        (sheets_grid.cell(1234.5, number_format=_nf("CURRENCY", '#,##0"$"')), "1,235$"),
-        (sheets_grid.cell(-0.004, number_format=_nf("CURRENCY", '"$"#,##0.00')), "$0.00"),
-        (sheets_grid.cell(9.995, number_format=_nf("SCIENTIFIC", "0.00E+00")), "1.00E+01"),
-        (sheets_grid.cell(0, number_format=_nf("SCIENTIFIC", "0.00E+00")), "0.00E+00"),
-        (sheets_grid.cell(60, number_format=_nf("DATE", "yyyy-mm-dd")), "1900-02-28"),
-        (sheets_grid.cell(2958466, number_format=_nf("DATE", "yyyy-mm-dd")), "10000-01-01"),
-        (sheets_grid.cell(45306.9999999, number_format=_nf("DATE", "yyyy-mm-dd")), "2024-01-16"),
-        (sheets_grid.cell(1, number_format=_nf("DATE", "m/d/yy")), "12/31/99"),
-        (sheets_grid.cell(45306, number_format=_nf("DATE", "ddd mmm d yyyy")), "Mon Jan 15 2024"),
-        (sheets_grid.cell(45306, number_format=_nf("DATE", "mmmm d, yyyy")), "January 15, 2024"),
-        (sheets_grid.cell(0.4380208333333333, number_format=_nf("TIME", "h:mm")), "10:30"),
-        (sheets_grid.cell(0.999999, number_format=_nf("TIME", "h:mm")), "0:00"),
-        (sheets_grid.cell(-0.25, number_format=_nf("TIME", "h:mm")), "18:00"),
+        (gsheets.cell(0.125, number_format=_nf("PERCENT", "0%")), "13%"),
+        (gsheets.cell(0.12345, number_format=_nf("PERCENT", "0.00%")), "12.35%"),
+        (gsheets.cell(2.675, number_format=_nf("NUMBER", "#,##0.00")), "2.68"),
+        (gsheets.cell(-0.4, number_format=_nf("NUMBER", "#,##0")), "0"),
+        (gsheets.cell(-5.5, number_format=_nf("CURRENCY", '"$"#,##0.00')), "-$5.50"),
+        (gsheets.cell(1234.5, number_format=_nf("CURRENCY", '#,##0"$"')), "1,235$"),
+        (gsheets.cell(-0.004, number_format=_nf("CURRENCY", '"$"#,##0.00')), "$0.00"),
+        (gsheets.cell(9.995, number_format=_nf("SCIENTIFIC", "0.00E+00")), "1.00E+01"),
+        (gsheets.cell(0, number_format=_nf("SCIENTIFIC", "0.00E+00")), "0.00E+00"),
+        (gsheets.cell(60, number_format=_nf("DATE", "yyyy-mm-dd")), "1900-02-28"),
+        (gsheets.cell(2958466, number_format=_nf("DATE", "yyyy-mm-dd")), "10000-01-01"),
+        (gsheets.cell(45306.9999999, number_format=_nf("DATE", "yyyy-mm-dd")), "2024-01-16"),
+        (gsheets.cell(1, number_format=_nf("DATE", "m/d/yy")), "12/31/99"),
+        (gsheets.cell(45306, number_format=_nf("DATE", "ddd mmm d yyyy")), "Mon Jan 15 2024"),
+        (gsheets.cell(45306, number_format=_nf("DATE", "mmmm d, yyyy")), "January 15, 2024"),
+        (gsheets.cell(0.4380208333333333, number_format=_nf("TIME", "h:mm")), "10:30"),
+        (gsheets.cell(0.999999, number_format=_nf("TIME", "h:mm")), "0:00"),
+        (gsheets.cell(-0.25, number_format=_nf("TIME", "h:mm")), "18:00"),
         (
-            sheets_grid.cell(0.937505787037037, number_format=_nf("TIME", "h:mm:ss am/pm")),
+            gsheets.cell(0.937505787037037, number_format=_nf("TIME", "h:mm:ss am/pm")),
             "10:30:01 PM",
         ),
-        (sheets_grid.cell(0, number_format=_nf("TIME", "h:mm am/pm")), "12:00 AM"),
-        (sheets_grid.cell(-0.5, number_format=_nf("TIME", "[h]:mm:ss")), "-12:00:00"),
-        (sheets_grid.cell(100.25, number_format=_nf("TIME", "[h]:mm:ss")), "2406:00:00"),
+        (gsheets.cell(0, number_format=_nf("TIME", "h:mm am/pm")), "12:00 AM"),
+        (gsheets.cell(-0.5, number_format=_nf("TIME", "[h]:mm:ss")), "-12:00:00"),
+        (gsheets.cell(100.25, number_format=_nf("TIME", "[h]:mm:ss")), "2406:00:00"),
         (
-            sheets_grid.cell(45306.4375, number_format=_nf("DATE_TIME", "m/d/yyyy h:mm")),
+            gsheets.cell(45306.4375, number_format=_nf("DATE_TIME", "m/d/yyyy h:mm")),
             "1/15/2024 10:30",
         ),
         # a boolean keeps its display under any format, an error displays its code
-        (sheets_grid.cell(True, number_format=_nf("PERCENT", "0%")), "TRUE"),
-        (sheets_grid.cell(None, error="N_A"), "#N/A"),
-        (sheets_grid.cell(None, error="NULL_VALUE"), "#NULL!"),
-        (sheets_grid.cell(None, number_format=_nf("PERCENT", "0%")), ""),
+        (gsheets.cell(True, number_format=_nf("PERCENT", "0%")), "TRUE"),
+        (gsheets.cell(None, error="N_A"), "#N/A"),
+        (gsheets.cell(None, error="NULL_VALUE"), "#NULL!"),
+        (gsheets.cell(None, number_format=_nf("PERCENT", "0%")), ""),
     ],
 )
 def test_a_cell_formats_the_way_the_real_api_displays_it(cell, want):
-    assert sheets_grid.formatted(cell) == want
+    assert gsheets.formatted(cell) == want
 
 
 _TODAY = datetime.date(2026, 10, 26)
@@ -9655,7 +9655,7 @@ _TODAY = datetime.date(2026, 10, 26)
 @pytest.mark.parametrize(
     "typed,value,shown,pattern",
     [
-        # as `sheets_input` measured them: the value stored, its display, its format
+        # as `gsheets.apply` measured them: the value stored, its display, its format
         ("42", 42, "42", None),
         ("  7  ", 7, "7", None),
         ("(5)", -5, "-5", None),
@@ -9724,11 +9724,11 @@ _TODAY = datetime.date(2026, 10, 26)
     ],
 )
 def test_a_user_entered_string_is_read_the_way_the_real_api_reads_it(typed, value, shown, pattern):
-    cell = sheets_input.apply(None, typed, "USER_ENTERED", _TODAY)
-    got = sheets_grid.cell_value(cell)
+    cell = gsheets.apply(None, typed, "USER_ENTERED", _TODAY)
+    got = gsheets.cell_value(cell)
     assert got == value and type(got) is type(value)
-    assert sheets_grid.formatted(cell) == shown
-    assert (sheets_grid.cell_format(cell) or {}).get("pattern") == pattern
+    assert gsheets.formatted(cell) == shown
+    assert (gsheets.cell_format(cell) or {}).get("pattern") == pattern
 
 
 @pytest.mark.parametrize(
@@ -9742,7 +9742,7 @@ def test_a_user_entered_string_is_read_the_way_the_real_api_reads_it(typed, valu
     ],
 )
 def test_a_typed_error_literal_is_an_error_cell(typed, error):
-    assert sheets_grid.cell_error(sheets_input.apply(None, typed, "USER_ENTERED", _TODAY)) == error
+    assert gsheets.cell_error(gsheets.apply(None, typed, "USER_ENTERED", _TODAY)) == error
 
 
 _PCT = _nf("PERCENT", "0.00%")
@@ -9753,7 +9753,7 @@ _DATE = _nf("DATE", "yyyy-mm-dd")
 @pytest.mark.parametrize(
     "existing,written,option,want",
     [
-        # `sheets_input.apply`'s rules, a cell's format against each kind of write: a format the write
+        # `gsheets.apply`'s rules, a cell's format against each kind of write: a format the write
         # infers is kept when the cell's is of its family and replaces it otherwise
         (_PCT, "12%", "USER_ENTERED", _PCT),
         (_NUM, "$5", "USER_ENTERED", _NUM),
@@ -9777,33 +9777,33 @@ _DATE = _nf("DATE", "yyyy-mm-dd")
     ],
 )
 def test_a_write_keeps_or_replaces_a_cells_number_format(existing, written, option, want):
-    cell = sheets_grid.cell(None, number_format=existing)
-    assert sheets_grid.cell_format(sheets_input.apply(cell, written, option, _TODAY)) == want
+    cell = gsheets.cell(None, number_format=existing)
+    assert gsheets.cell_format(gsheets.apply(cell, written, option, _TODAY)) == want
 
 
 def test_normalise_pads_short_rows_and_collapses_integral_floats():
     """A ragged grid is padded rather than refused -- a table whose last row is short is ordinary.
     3.0 collapses because a real sheet stores it as ``numberValue: 3``."""
-    assert sheets_grid.normalise_grid([["a", "b", "c"], ["d"], []]) == [
+    assert gsheets.normalise_grid([["a", "b", "c"], ["d"], []]) == [
         ["a", "b", "c"],
         ["d", None, None],
         [None, None, None],
     ]
-    assert sheets_grid.normalise_grid([[3.0, 3.5]]) == [[3, 3.5]]
-    assert sheets_grid.normalise_grid([]) == []
+    assert gsheets.normalise_grid([[3.0, 3.5]]) == [[3, 3.5]]
+    assert gsheets.normalise_grid([]) == []
 
 
 def test_used_extent_stops_at_the_last_row_and_column_holding_anything():
-    assert sheets_grid.used_extent([["a", None, None], [None, None, None]]) == (1, 1)
-    assert sheets_grid.used_extent([[None]]) == (0, 0)
-    assert sheets_grid.used_extent([]) == (0, 0)
+    assert gsheets.used_extent([["a", None, None], [None, None, None]]) == (1, 1)
+    assert gsheets.used_extent([[None]]) == (0, 0)
+    assert gsheets.used_extent([]) == (0, 0)
 
 
 def test_csv_export_follows_the_measured_rfc4180_rules():
     """Measured against a real export: quote on a comma, a double quote or a newline; double an
     embedded quote; keep an embedded newline bare inside the quotes; leave a TAB and surrounding
     spaces unquoted; separate rows with CRLF; emit no trailing newline."""
-    grid = sheets_grid.normalise_grid(
+    grid = gsheets.normalise_grid(
         [
             ["FIRST_SHEET_MARKER", None, None],
             ["with,comma", 'with"quote', "with\nnewline"],
@@ -9811,7 +9811,7 @@ def test_csv_export_follows_the_measured_rfc4180_rules():
             [42, True, None],
         ]
     )
-    assert sheets_grid.to_csv(grid) == (
+    assert gsheets.to_csv(grid) == (
         "FIRST_SHEET_MARKER,,\r\n"
         '"with,comma","with""quote","with\nnewline"\r\n'
         "with\ttab,trailing ,  leading\r\n"
@@ -9822,16 +9822,16 @@ def test_csv_export_follows_the_measured_rfc4180_rules():
 def test_tsv_export_collapses_a_newline_and_a_tab_to_a_space_and_never_quotes():
     """Measured: TSV has no quoting mechanism at all, so the conversion is lossy. Reproducing the
     loss is what agreeing with it means."""
-    grid = sheets_grid.normalise_grid(
+    grid = gsheets.normalise_grid(
         [["with,comma", 'with"quote', "with\nnewline"], ["with\ttab", 1, None]]
     )
-    assert sheets_grid.to_tsv(grid) == 'with,comma\twith"quote\twith newline\r\nwith tab\t1\t'
+    assert gsheets.to_tsv(grid) == 'with,comma\twith"quote\twith newline\r\nwith tab\t1\t'
 
 
 def test_an_empty_grid_serialises_to_the_empty_string():
-    assert sheets_grid.to_csv([]) == ""
-    assert sheets_grid.to_tsv([]) == ""
-    assert sheets_grid.to_csv(sheets_grid.normalise_grid([[None, None]])) == ""
+    assert gsheets.to_csv([]) == ""
+    assert gsheets.to_tsv([]) == ""
+    assert gsheets.to_csv(gsheets.normalise_grid([[None, None]])) == ""
 
 
 # --- a spreadsheet that states a real grid ------------------------------------------------------
@@ -10315,7 +10315,7 @@ def test_csv_export_of_a_gridded_spreadsheet_serialises_its_first_sheet(gc, gh, 
 @pytest.mark.parametrize("mime", ["text/tab-separated-values", "TEXT/TAB-SEPARATED-VALUES"])
 def test_tsv_export_reserialises_the_grid_rather_than_serving_content(gc, gh, hostile, mime):
     """`content` is the first sheet's CSV, so serving it for TSV too would answer commas and
-    quotes. The lossy space-substitution is `sheets_grid.to_tsv`'s own test; this is the route
+    quotes. The lossy space-substitution is `gsheets.to_tsv`'s own test; this is the route
     reaching it, spelled either way `drive_files_export` accepts."""
     r = _export(gc, gh, hostile, mime)
     assert r.text == 'with,comma\twith"quote\twith newline'

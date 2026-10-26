@@ -35,8 +35,8 @@ from starlette.routing import Match
 from backlot import (
     auth,
     collation,
+    gsheets,
     protojson,
-    sheets_grid,
     store,
     synth,
 )
@@ -4185,7 +4185,7 @@ async def drive_files_export(file_id: str, request: Request):
         stored = store.gdrive_sheets_for(conn, file_id)
         if stored:
             grid = json.loads(stored[0]["grid"])
-            return Response(sheets_grid.to_tsv(grid), headers={"content-type": requested})
+            return Response(gsheets.to_tsv(grid), headers={"content-type": requested})
     plain = target in ("text/csv", "text/tab-separated-values")
     body = row["content"] if plain else f"{row['title']}\n\n{row['content']}"
     return Response(body, headers={"content-type": requested})

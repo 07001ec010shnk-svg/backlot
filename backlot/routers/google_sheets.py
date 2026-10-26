@@ -19,11 +19,8 @@ from fastapi.responses import Response
 
 from backlot import (
     auth,
+    gsheets,
     protojson,
-    sheets_format,
-    sheets_grid,
-    sheets_input,
-    sheets_workbook,
     store,
     synth,
 )
@@ -470,7 +467,7 @@ def _sheets_book(
             ]
         out.append(entry)
     # Real's order, measured 2026-10-22 with and without the grid and under `fields=*.*`.
-    stated = {**sheets_workbook.DEFAULT_PROPERTIES, **settings}
+    stated = {**gsheets.DEFAULT_PROPERTIES, **settings}
     book = {
         "spreadsheetId": spreadsheet_id,
         "properties": {
@@ -502,8 +499,8 @@ SHEETS_SHEET_TITLE = "Sheet1"  # Backlot shapes every spreadsheet as one sheet w
 # real spreadsheet holding 14 rows: `values/<title>` echoes `A1:Z1000`, `A:A` echoes `A1:A1000`.
 # So Backlot declares the same grid. This is API scaffolding, like the synthesized `sheetId` and
 # sheet title beside it — not invented cell data, which `_sheets_grid` still refuses to manufacture.
-SHEETS_GRID_ROWS = sheets_workbook.GRID_ROWS
-SHEETS_GRID_COLS = sheets_workbook.GRID_COLS
+SHEETS_GRID_ROWS = gsheets.GRID_ROWS
+SHEETS_GRID_COLS = gsheets.GRID_COLS
 
 # A cell's `effectiveFormat`, in the order real emits it. Measured: across every cell type a
 # corpus can state it varies in ONE field, `horizontalAlignment` -- a string sits left, a number
@@ -516,7 +513,7 @@ SHEETS_GRID_COLS = sheets_workbook.GRID_COLS
 # formatted. Of 17 typed cells the only ones that had one were the percent, date, datetime, time and
 # scientific cells, each carrying a lone `numberFormat` that Sheets INFERRED from what was typed.
 # A corpus states no formatting, so a corpus cell has none; a cell a write gave a number format
-# (`sheets_input.apply`) serves it (`_sheets_cell_data`).
+# (`gsheets.apply`) serves it (`_sheets_cell_data`).
 _CELL_FORMAT_ALIGN = {"str": "LEFT", "num": "RIGHT", "bool": "CENTER"}
 _CELL_FORMAT_BOX = {
     "backgroundColor": {"red": 1, "green": 1, "blue": 1},
@@ -544,16 +541,16 @@ def _sheets_format(cell) -> dict:
     """The `effectiveFormat` a cell of this type carries: its `numberFormat` first when it has one,
     and an alignment by what it holds -- an error centred like a boolean, measured 2026-10-26.
 
-    A cell with no value and no error (`sheets_grid.CLEARED`, or a cleared cell that kept its
+    A cell with no value and no error (`gsheets.CLEARED`, or a cleared cell that kept its
     number format) carries neither `horizontalAlignment` nor `hyperlinkDisplayType`, measured the
     same day."""
-    nf = sheets_grid.cell_format(cell)
+    nf = gsheets.cell_format(cell)
     head = {"numberFormat": nf} if nf else {}
-    value = sheets_grid.cell_value(cell)
-    if sheets_grid.cell_error(cell) is None and value is None:
+    value = gsheets.cell_value(cell)
+    if gsheets.cell_error(cell) is None and value is None:
         rest = {k: v for k, v in _CELL_FORMAT_REST.items() if k != "hyperlinkDisplayType"}
         return {**head, **_CELL_FORMAT_BOX, **rest}
-    if isinstance(value, bool) or sheets_grid.cell_error(cell) is not None:
+    if isinstance(value, bool) or gsheets.cell_error(cell) is not None:
         align = _CELL_FORMAT_ALIGN["bool"]
     elif isinstance(value, (int, float)):
         align = _CELL_FORMAT_ALIGN["num"]
@@ -986,10 +983,10 @@ def _sheets_value(cell) -> dict:
 
     An error cell is ``errorValue`` with its type alone: an error typed as a literal (`#N/A`)
     carries no ``message``, measured 2026-10-26. A real cell may also hold ``formulaValue``, which
-    nothing here stores (`sheets_input`)."""
-    if (error := sheets_grid.cell_error(cell)) is not None:
+    nothing here stores (`gsheets.apply`)."""
+    if (error := gsheets.cell_error(cell)) is not None:
         return {"errorValue": {"type": error}}
-    cell = sheets_grid.cell_value(cell)
+    cell = gsheets.cell_value(cell)
     if cell is None or cell == "":
         return {}
     if isinstance(cell, bool):
@@ -1067,9 +1064,9 @@ def _sheets_cell_data(cell) -> dict:
     Keys in real's order, measured 2026-10-26: ``userEnteredValue``, ``effectiveValue``,
     ``formattedValue``, then ``userEnteredFormat`` for a cell given a number format, then
     ``effectiveFormat``. A cell a write emptied is served with its format keys alone
-    (``sheets_grid.EMPTY_STRING``, ``sheets_grid.CLEARED``)."""
+    (``gsheets.EMPTY_STRING``, ``gsheets.CLEARED``)."""
     v = _sheets_value(cell)
-    nf = sheets_grid.cell_format(cell)
+    nf = gsheets.cell_format(cell)
     if not v and not isinstance(cell, dict):
         return {}
     out = {}
@@ -1077,7 +1074,7 @@ def _sheets_cell_data(cell) -> dict:
         out = {
             "userEnteredValue": v,
             "effectiveValue": v,
-            "formattedValue": sheets_grid.formatted(cell),
+            "formattedValue": gsheets.formatted(cell),
         }
     if nf:
         out["userEnteredFormat"] = {"numberFormat": nf}
@@ -1091,7 +1088,7 @@ def _sheets_render(cell, render: str, date_time: str = "SERIAL_NUMBER"):
     Measured: ``FORMATTED_VALUE`` gives the display string, while ``UNFORMATTED_VALUE`` and
     ``FORMULA`` both give the raw typed value — a JSON number for a number, a JSON boolean for a
     boolean. The two agree for every NON-FORMULA cell on the real API, and a formula is stored as
-    its text (`sheets_input`), so they agree here for every cell.
+    its text (`gsheets.apply`), so they agree here for every cell.
 
     An empty cell is ``""`` under every option, measured — a JSON string even under
     ``UNFORMATTED_VALUE``, never null.
@@ -1099,22 +1096,22 @@ def _sheets_render(cell, render: str, date_time: str = "SERIAL_NUMBER"):
     Measured 2026-10-26: an error is its bare code under ``FORMATTED_VALUE`` and ``<code> ()``
     under the other two when it carries no message, and ``date_time=FORMATTED_STRING`` serves a
     cell with a DATE, TIME or DATE_TIME format as its display string under every option."""
-    if (error := sheets_grid.cell_error(cell)) is not None:
-        code = sheets_grid.ERROR_CODES[error]
+    if (error := gsheets.cell_error(cell)) is not None:
+        code = gsheets.ERROR_CODES[error]
         return code if render == "FORMATTED_VALUE" else f"{code} ()"
-    value = sheets_grid.cell_value(cell)
+    value = gsheets.cell_value(cell)
     if value is None:
         return ""
     if render == "FORMATTED_VALUE":
-        return sheets_grid.formatted(cell)
-    nf = sheets_grid.cell_format(cell)
+        return gsheets.formatted(cell)
+    nf = gsheets.cell_format(cell)
     if (
         date_time == "FORMATTED_STRING"
         and nf
-        and nf["type"] in sheets_format.DATE_TIME_TYPES
+        and nf["type"] in gsheets.DATE_TIME_TYPES
         and not isinstance(value, (bool, str))
     ):
-        return sheets_grid.formatted(cell)
+        return gsheets.formatted(cell)
     return value
 
 
@@ -1146,7 +1143,7 @@ def _sheets_value_range(
     return out
 
 
-_Sheet = sheets_workbook.Sheet
+_Sheet = gsheets.Sheet
 
 
 def _workbook(request: Request, spreadsheet_id: str) -> tuple:
@@ -1829,7 +1826,7 @@ async def sheets_get_by_data_filter(spreadsheet_id: str, request: Request):
 #
 # Measured against the live Sheets v4 API on 2026-10-26, as a Workspace member writing a
 # spreadsheet it owns and as one it was shared with to read. What a written string becomes is
-# `backlot.sheets_input`'s, how a number displays `backlot.sheets_format`'s; this section is the
+# `gsheets.apply`'s, how a number displays `gsheets.render`'s; this section is the
 # request, its refusals, and the counts the answer carries.
 #
 # A write replaces the workbook's sheets in the overlay together with the file's `content` and
@@ -2058,7 +2055,7 @@ def _sheets_apply(writing: _Writing, grids: dict, option: str, today) -> set[tup
                 continue
             r, c = writing.r0 + i, writing.c0 + j
             current = grid[r][c] if r < len(grid) and c < len(grid[r]) else None
-            _sheets_put(grid, r, c, sheets_input.apply(current, value, option, today))
+            _sheets_put(grid, r, c, gsheets.apply(current, value, option, today))
             written.add((r, c))
     return written
 
@@ -2086,7 +2083,7 @@ def _sheets_update_response(spreadsheet_id: str, writing: _Writing, written: set
 
 def _sheets_reloaded(sheets: list[_Sheet], grids: dict) -> list[_Sheet]:
     """The sheets as they read after a write, each grid rectangular again
-    (`sheets_grid.normalise_grid`'s invariant) and as tall as the write made it."""
+    (`gsheets.normalise_grid`'s invariant) and as tall as the write made it."""
     out = []
     for sh in sheets:
         grid = grids[sh.index]
@@ -2117,7 +2114,7 @@ def _sheets_save(conn, row, sheets: list[_Sheet]) -> None:
         "google_drive",
         (row["id"],),
         {"gdrive_sheets": _sheets_sheet_rows(sheets)},
-        {"content": sheets_grid.to_csv(sheets[0].grid), "updated_ts": int(time.time())},
+        {"content": gsheets.to_csv(sheets[0].grid), "updated_ts": int(time.time())},
     )
 
 
@@ -2126,7 +2123,7 @@ def _sheets_today(settings: dict) -> datetime.date:
     written in 2026. Taken in the spreadsheet's time zone."""
     from zoneinfo import ZoneInfo
 
-    zone = {**sheets_workbook.DEFAULT_PROPERTIES, **settings}["timeZone"]
+    zone = {**gsheets.DEFAULT_PROPERTIES, **settings}["timeZone"]
     return datetime.datetime.now(ZoneInfo(zone)).date()
 
 
@@ -2277,8 +2274,8 @@ def _sheets_clear(grids: dict, clearing) -> bool:
         row = grid[r]
         for c in range(c0, min(c1, len(row))):
             cell = row[c]
-            if sheets_grid.cell_value(cell) is not None or sheets_grid.cell_error(cell):
-                row[c] = sheets_grid.cell(None, number_format=sheets_grid.cell_format(cell))
+            if gsheets.cell_value(cell) is not None or gsheets.cell_error(cell):
+                row[c] = gsheets.cell(None, number_format=gsheets.cell_format(cell))
                 changed = True
     return changed
 
@@ -2332,9 +2329,7 @@ def _sheets_table(grid: list[list], r0: int, c0: int, r1: int, c1: int):
     `A1:B1` is left out. A cell a write emptied holds no value and joins nothing."""
 
     def filled(r: int, c: int) -> bool:
-        return (
-            0 <= r < len(grid) and 0 <= c < len(grid[r]) and sheets_grid.formatted(grid[r][c]) != ""
-        )
+        return 0 <= r < len(grid) and 0 <= c < len(grid[r]) and gsheets.formatted(grid[r][c]) != ""
 
     start = next(
         ((r, c) for c in range(c0, c1) for r in range(r0, min(r1, len(grid))) if filled(r, c)),
@@ -2552,8 +2547,8 @@ _PJ_CREATE = protojson.Message(
 def _sheets_cell(cell: dict):
     """A `CellData` a request states, as a stored cell: its `userEnteredValue`, and its
     `userEnteredFormat.numberFormat` as stated -- a type with no pattern included, which real keeps
-    that way and displays in the type's default (`sheets_format.render`). A formula is kept as a
-    written one is (`sheets_input`); an `errorValue` is refused by the caller."""
+    that way and displays in the type's default (`gsheets.render`). A formula is kept as a
+    written one is (`gsheets.apply`); an `errorValue` is refused by the caller."""
     value = cell.get("user_entered_value") or {}
     fmt = (cell.get("user_entered_format") or {}).get("number_format") or {}
     kind = _PJ_ENUM_FIELDS[("sheets.NumberFormat", "type")].names[fmt.get("type", 0)]
@@ -2567,20 +2562,18 @@ def _sheets_cell(cell: dict):
         if key in value:
             text = value[key]
             return (
-                sheets_grid.cell(text, number_format=number_format)
+                gsheets.cell(text, number_format=number_format)
                 if text
-                else dict(sheets_grid.EMPTY_STRING)
+                else dict(gsheets.EMPTY_STRING)
             )
     if "number_value" in value:
-        return sheets_grid.cell(
-            sheets_grid.collapse(value["number_value"]), number_format=number_format
-        )
+        return gsheets.cell(gsheets.collapse(value["number_value"]), number_format=number_format)
     if "bool_value" in value:
-        return sheets_grid.cell(value["bool_value"], number_format=number_format)
-    return sheets_grid.cell(None, number_format=number_format) if number_format else None
+        return gsheets.cell(value["bool_value"], number_format=number_format)
+    return gsheets.cell(None, number_format=number_format) if number_format else None
 
 
-def _sheets_stated_sheet(i: int, sheet: dict, book: sheets_workbook.Workbook) -> _Sheet:
+def _sheets_stated_sheet(i: int, sheet: dict, book: gsheets.Workbook) -> _Sheet:
     """One `Sheet` of a create request, checked as real checks it, as the sheet it makes.
 
     In real's order, measured 2026-10-26 by sending two refusals at once: the id (negative, then
@@ -2616,8 +2609,8 @@ def _sheets_stated_sheet(i: int, sheet: dict, book: sheets_workbook.Workbook) ->
         raise gerr.invalid_argument(f"{where}: {_SHEETS_NO_COLUMNS}")
     stated: dict = {
         "gridProperties": {
-            "rowCount": grid.get("row_count") or sheets_workbook.GRID_ROWS,
-            "columnCount": grid.get("column_count") or sheets_workbook.GRID_COLS,
+            "rowCount": grid.get("row_count") or gsheets.GRID_ROWS,
+            "columnCount": grid.get("column_count") or gsheets.GRID_COLS,
             **{
                 json_name: grid[proto]
                 for json_name, proto in (
@@ -2672,7 +2665,7 @@ def _sheets_json(message: dict) -> dict:
     double without its decimal point (`"red": 1`), as proto3 JSON prints one."""
     return {
         re.sub(r"_([a-z])", lambda m: m.group(1).upper(), k): (
-            _sheets_json(v) if isinstance(v, dict) else sheets_grid.collapse(v)
+            _sheets_json(v) if isinstance(v, dict) else gsheets.collapse(v)
         )
         for k, v in message.items()
     }
@@ -2703,10 +2696,10 @@ async def sheets_create(request: Request):
     * with no ``sheets`` the one sheet is ``sheetId 0``, and with ``sheets`` each gets an id of
       its own unless it states one, a later sheet stating 0 included;
     * a sheet with no title is named `Sheet1` in the workbook's language
-      (`sheets_workbook.Workbook.default_title`), and titles collide without regard to case;
+      (`gsheets.Workbook.default_title`), and titles collide without regard to case;
     * ``rowCount: 0`` is no row count, and the grid is 1000 x 26;
     * ``data`` is stored though the answer carries no grid;
-    * a ``locale`` not spelled as one of :data:`sheets_workbook.LOCALES` is refused, a ``timeZone`` that names no zone is replaced by
+    * a ``locale`` not spelled as one of :data:`gsheets.LOCALES` is refused, a ``timeZone`` that names no zone is replaced by
       `Etc/GMT`;
     * the Drive file's ``parents`` is the caller's root, and its one permission the owner's.
 
@@ -2723,9 +2716,9 @@ async def sheets_create(request: Request):
     owner = _sheets_creator(request, caller)
     file_id = _sheets_new_file_id(conn, owner)
     stated = body.get("properties") or {}
-    settings = dict(sheets_workbook.DEFAULT_PROPERTIES)
+    settings = dict(gsheets.DEFAULT_PROPERTIES)
     if stated.get("locale"):
-        if stated["locale"] not in sheets_workbook.LOCALES:
+        if stated["locale"] not in gsheets.LOCALES:
             raise gerr.invalid_argument(
                 f"Invalid properties: Unsupported locale: {stated['locale']}"
             )
@@ -2739,7 +2732,7 @@ async def sheets_create(request: Request):
     # measured: the properties are refused ahead of a stated `spreadsheetId`
     if body.get("spreadsheet_id"):
         raise gerr.invalid_argument("Invalid spreadsheet.spreadsheetId: The id is invalid.")
-    book = sheets_workbook.Workbook(file_id, [], settings)
+    book = gsheets.Workbook(file_id, [], settings)
     requested = body.get("sheets") or []
     misplaced = False
     for i, sheet in enumerate(requested):
@@ -2765,7 +2758,7 @@ async def sheets_create(request: Request):
             "folder": _DRIVE_ROOT_FOLDER,
             "author_email": owner,
             "title": title,
-            "content": sheets_grid.to_csv(book.sheets[0].grid),
+            "content": gsheets.to_csv(book.sheets[0].grid),
             "subtype": "spreadsheet",
             "parents": json.dumps([synth.drive_root_id(owner)]),
             "created_ts": now,
@@ -2828,7 +2821,7 @@ async def sheets_copy_to(spreadsheet_id: str, sheet_id: str, request: Request):
     caller's to write -- one the caller cannot write or cannot see is 403, and one that does not
     exist is 400 ``Invalid destinationSpreadsheetId [<id>]``. The copy goes last, with an id of
     its own, the source's properties and cells, and a title in the DESTINATION's language
-    (`sheets_workbook.Workbook.copy_title`). Copying into the same workbook is allowed."""
+    (`gsheets.Workbook.copy_title`). Copying into the same workbook is allowed."""
     _sheets_alt(request)
     _require(request)
     body = protojson.read(await request.body(), _PJ_COPY_TO)
@@ -2849,7 +2842,7 @@ async def sheets_copy_to(spreadsheet_id: str, sheet_id: str, request: Request):
     if dest_row is None or (dest_row["subtype"] or "document") != "spreadsheet":
         raise gerr.invalid_argument(f"Invalid destinationSpreadsheetId [{dest_id}]")
     dest_row, dest_sheets = _sheets_writable(request, dest_id)
-    book = sheets_workbook.Workbook(dest_id, dest_sheets, _sheets_settings(conn, dest_id))
+    book = gsheets.Workbook(dest_id, dest_sheets, _sheets_settings(conn, dest_id))
     title = book.copy_title(source.title)
     copied = _Sheet(
         book.new_sheet_id(title),
