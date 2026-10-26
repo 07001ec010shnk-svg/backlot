@@ -13613,6 +13613,30 @@ def test_a_created_spreadsheet_keeps_what_its_sheets_state(wc, wh):
             {"sheets": [{"properties": {"title": "a", "sheetId": -1}}]},
             "Invalid sheets[0]: Sheet id must be non-negative.",
         ),
+        (
+            {"sheets": [{"properties": {"title": "Same"}}, {"properties": {"title": "same"}}]},
+            'Invalid sheets[1]: A sheet with the name "same" already exists. Please enter another name.',
+        ),
+        (
+            {"sheets": [{"properties": {"title": "x" * 101}}]},
+            "Invalid sheets[0]: The sheet name cannot be greater than 100 characters.",
+        ),
+        (
+            {"sheets": [{"properties": {"index": 3}}]},
+            "Invalid sheets: The new sheet index is too high.",
+        ),
+        (
+            {"sheets": [{"properties": {"hidden": True}}]},
+            "Invalid sheets[0]: You can't hide all the sheets in a document.",
+        ),
+        (
+            {"sheets": [{"properties": {"gridProperties": {"columnCount": -1}}}]},
+            "Invalid sheets[0]: You can't delete all the columns on the sheet.",
+        ),
+        (
+            {"sheets": [{"properties": {"gridProperties": {"rowCount": -1}}}]},
+            "Invalid sheets[0]: You can't delete all the rows on the sheet.",
+        ),
         ({"spreadsheetId": "abc"}, "Invalid spreadsheet.spreadsheetId: The id is invalid."),
         (
             {"bogus": 1},

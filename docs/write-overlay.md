@@ -132,10 +132,6 @@ field list, so the ordering divergence below has no entry to live in and is stat
   states, is a formula on real, evaluated into its result. Backlot stores the text typed.
 - **What a new workbook states and Backlot cannot serve back.** Named ranges, developer metadata,
   data sources, and every cell format but a number format are read and not kept.
-- **The English account's words.** A new workbook's default title, and the refusals real words in
-  the account's language (a sheet title taken or too long, an index past the end, every sheet
-  hidden), were measured on a Korean account, where they came back in Korean. Backlot serves
-  English, and that English is unmeasured.
 - **`spreadsheets.batchUpdate`.** Not served, so a workbook's sheets change only by
   `spreadsheets.create` and `sheets.copyTo`.
 - **Rate limits.** Real Sheets refuses a user's writes past 60 a minute with 429

@@ -6782,14 +6782,15 @@ def _pj_message(name: str) -> protojson.Message:
 # --- `spreadsheets.create` -----------------------------------------------------------------------
 
 # A new spreadsheet's title when the request names none. It follows the ACCOUNT's language, not the
-# request's `locale`: measured 2026-10-26 on a Korean account, `제목 없는 스프레드시트` under
-# `locale: en_US` too. Backlot's callers are English accounts, and this English title is unmeasured.
+# request's `locale`: measured 2026-10-26, a Korean account got `제목 없는 스프레드시트` under
+# `locale: en_US`, and an English one this under `locale: ko_KR`. Backlot's callers are English
+# accounts.
 SHEETS_UNTITLED = "Untitled spreadsheet"
 
-# The refusals real words in the account's language. Each was measured on a Korean account, where it
-# came back in Korean; the English sentences here are unmeasured.
-_SHEETS_TITLE_TAKEN = "A sheet with the name “{title}” already exists. Please enter another name."
-_SHEETS_TITLE_TOO_LONG = "Sheet names must be 100 characters or fewer."
+# The refusals real words in the account's language, each as an English account got it, measured
+# 2026-10-26.
+_SHEETS_TITLE_TAKEN = 'A sheet with the name "{title}" already exists. Please enter another name.'
+_SHEETS_TITLE_TOO_LONG = "The sheet name cannot be greater than 100 characters."
 _SHEETS_INDEX_TOO_HIGH = "The new sheet index is too high."
 _SHEETS_ALL_HIDDEN = "You can't hide all the sheets in a document."
 _SHEETS_NO_COLUMNS = "You can't delete all the columns on the sheet."
