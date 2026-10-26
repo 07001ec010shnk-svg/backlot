@@ -96,11 +96,11 @@ _P_SHEETS_STD = [
 ]
 
 
-def _sheets_types() -> dict[str, dict[str, str | None]]:
-    """The messages a Sheets read answers with and every message they reach, each as its fields and
-    the message each holds (`None` for a scalar, an enum, a map or a list of lists): the `types`
-    `backlot diff` records in the `google_drive` baseline from the discovery document. A field only
-    Backlot serves is not one a mask may name."""
+def _google_types() -> dict[str, dict[str, str | None]]:
+    """The messages a Sheets or Docs read answers with and every message they reach, each as its
+    fields and the message each holds (`None` for a scalar, an enum, a map or a list of lists): the
+    `types` `backlot diff` records in the `google_drive` baseline from the discovery documents. A
+    field only Backlot serves is not one a mask may name."""
     types = json.loads((_BASELINES / "google_drive.json").read_text(encoding="utf-8"))["types"]
 
     def held(type_: str) -> str | None:
@@ -113,7 +113,7 @@ def _sheets_types() -> dict[str, dict[str, str | None]]:
     }
 
 
-_SHEETS_FIELDS = _sheets_types()
+_GOOGLE_FIELDS = _google_types()
 
 
 def _gmask_paths(mask: str) -> tuple[list[tuple[str, ...]], str]:
@@ -177,7 +177,7 @@ def _gmask_resolve(path: tuple[str, ...], message: str | None) -> dict | None:
     head, rest = path[0], path[1:]
     if message is None:
         return {} if all(name == "*" for name in path) else None
-    fields = _SHEETS_FIELDS[message]
+    fields = _GOOGLE_FIELDS[message]
     if head == "*":
         if not rest:
             return {}
@@ -201,11 +201,23 @@ def _gmask_merge(into: dict, selection: dict) -> None:
         _gmask_merge(into.setdefault(name, {}), sub)
 
 
-def _gmask_select(mask: str | None, message: str) -> tuple[dict | None, bool]:
+def _gmask_named(selection: dict, path: tuple[str, ...]) -> dict:
+    """The part of one path's ``selection`` the path names: down to its last name that is not
+    ``*``, so `tabs.documentTab.*` names `tabs.documentTab` and nothing under it, `*.commentId`
+    names `comments.commentId`, and `*.*` names nothing."""
+    depth = max((i + 1 for i, name in enumerate(path) if name != "*"), default=0)
+
+    def cut(tree: dict, levels: int) -> dict:
+        return {name: cut(sub, levels - 1) if levels > 1 else {} for name, sub in tree.items()}
+
+    return cut(selection, depth) if depth else {}
+
+
+def _gmask_select(mask: str | None, message: str) -> tuple[dict | None, dict]:
     """The selection tree a ``fields`` mask makes of a ``message`` response, ``{}`` at a leaf
-    meaning all of it, and whether the mask names a comment field. ``None`` for no mask, which an
-    empty one, an empty group and a ``*`` alone each are: measured 2026-10-22, `fields=*` answered
-    what no mask does, `includeGridData` deciding the grid.
+    meaning all of it, and the fields its paths name (`_gmask_named`), merged. ``None`` for no
+    mask, which an empty one, an empty group and a ``*`` alone each are: measured 2026-10-22,
+    `fields=*` answered what no mask does, `includeGridData` deciding the grid.
 
     A path that names nothing is refused, the first such in the mask's order (measured on
     `sheets.properties.title,bogus2,sheets.bogus3`: `bogus2`), so a declared field the response
@@ -215,24 +227,24 @@ def _gmask_select(mask: str | None, message: str) -> tuple[dict | None, bool]:
     answered 200 on a spreadsheet holding none. A bracket left unpaired is refused after the paths
     before it (`_gmask_paths`).
 
-    A comment field is one a path reaches by naming something: measured 2026-10-22, `comments`,
-    `comments.*`, `*.commentId` and `*.headPost` were refused for asking after comments that
-    `commentsViewMode` did not request, and `*.*`, which reaches `comments` through ``*`` alone, was
-    answered."""
+    What a path names is what the editors' own refusals read: measured 2026-10-22 on Sheets,
+    `comments`, `comments.*`, `*.commentId` and `*.headPost` were refused for asking after comments
+    that `commentsViewMode` did not request, and `*.*`, which reaches `comments` through ``*``
+    alone, was answered."""
     if not mask:
-        return None, False
+        return None, {}
     tree: dict = {}
-    comments = False
+    named: dict = {}
     paths, unpaired = _gmask_paths(mask)
     for path in paths:
         selection = _gmask_resolve(path, message)
         if selection is None:
             raise gerr.bad_field_mask(mask, ".".join(path))
-        comments |= "comments" in selection and any(name != "*" for name in path)
+        _gmask_merge(named, _gmask_named(selection, path))
         _gmask_merge(tree, selection)
     if unpaired:
         raise gerr.unbalanced_field_mask(mask, unpaired)
-    return (tree or None), comments
+    return (tree or None), named
 
 
 def _gmask_wants_grid(tree: dict | None, include_grid_data: bool) -> bool:
@@ -302,7 +314,7 @@ def _sheets_alt(request: Request) -> None:
         )
 
 
-def _sheets_mask(request: Request, message: str) -> tuple[dict | None, bool]:
+def _sheets_mask(request: Request, message: str) -> tuple[dict | None, dict]:
     """`_gmask_select` over this request's ``fields``. A read checks it once its typed values and
     body are read and before the spreadsheet is looked up: measured 2026-10-22 on the five reads, a
     mask naming nothing answered its 400 ahead of a missing spreadsheet's 404, a range that does
@@ -387,11 +399,11 @@ async def sheets_get(spreadsheet_id: str, request: Request):
             ),
         },
     )
-    tree, comments = _sheets_mask(request, "sheets.Spreadsheet")
+    tree, named = _sheets_mask(request, "sheets.Spreadsheet")
     row, sheets = _workbook(request, spreadsheet_id)
     mode = (flags["commentsViewMode"] or [_PJ_COMMENTS_VIEW.names[0]])[-1]
     owned = _drive_owned_by(row["author_email"], caller.email)
-    view = _sheets_comments_view(_PJ_COMMENTS_VIEW.names.index(mode), comments, owned)
+    view = _sheets_comments_view(_PJ_COMMENTS_VIEW.names.index(mode), "comments" in named, owned)
     # A mask that reaches the cells decides the grid, and `includeGridData` is then ignored rather
     # than consulted -- the vendor's own wording. Still parsed, so a bad value is still refused.
     grid = _gmask_wants_grid(tree, (flags["includeGridData"] or [False])[-1])
@@ -1787,11 +1799,11 @@ async def sheets_get_by_data_filter(spreadsheet_id: str, request: Request):
     _sheets_alt(request)
     caller = _require(request)
     body = protojson.read(await request.body(), _PJ_GET_BY_FILTER)
-    tree, comments = _sheets_mask(request, "sheets.Spreadsheet")
+    tree, named = _sheets_mask(request, "sheets.Spreadsheet")
     row, sheets = _workbook(request, spreadsheet_id)
     selections = _sheets_selections(body.get("data_filters", []), sheets, values_level=False)
     owned = _drive_owned_by(row["author_email"], caller.email)
-    view = _sheets_comments_view(body.get("comments_view_mode", 0), comments, owned)
+    view = _sheets_comments_view(body.get("comments_view_mode", 0), "comments" in named, owned)
     # Filters that cover the same cells share one `data` block, placed where the first of them was
     # sent, measured 2026-10-04 on the pairs with cells `sheets_values_batch_get_by_data_filter`
     # lists and on one empty range sent twice. Two empty ranges in different places stay two

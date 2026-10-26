@@ -1,6 +1,7 @@
 """Google APIs: Gmail (``/gmail/v1``), Drive (``/drive/v3``), and the Workspace editor APIs —
-Docs (``/docs/v1``), Sheets (``/sheets/v4``, in `routers.google_sheets`), Slides (``/slides/v1``) —
-for clients that read native docs structurally instead of via Drive export.
+Docs (``/docs/v1``, in `routers.google_docs`), Sheets (``/sheets/v4``, in
+`routers.google_sheets`), Slides (``/slides/v1``) — for clients that read native docs structurally
+instead of via Drive export.
 
 Client base-URL override: point the Gmail client at ``http://<host>/gmail`` and the
 Drive client at ``http://<host>/drive`` (google-api-python-client ``api_endpoint``).
@@ -35,7 +36,6 @@ from starlette.routing import Match
 from backlot import (
     auth,
     collation,
-    gdocs,
     gsheets,
     protojson,
     store,
@@ -4360,80 +4360,6 @@ def _sheets_enum_value(raw: str, field: str, enum: protojson.Enum) -> str:
         raise gerr.invalid_field_value(field, _a1_enum_error(field, enum, raw)) from None
 
 
-# `documents.get`'s two enums, names in number order. Measured 2026-10-09: `suggestionsViewMode`
-# reads `0` through `3`, `+1` and `01` (the value numbered 1) and a name in any ASCII case, and
-# refuses `4`, `-1`, `1.0`, a padded `" 1"`, empty and `NOPE`. `commentsViewMode` reads the same
-# way (2026-10-14: `3`, `+1` and `comments_view_mode_omitted` read, `4` and `-1` refused).
-# `includeTabsContent` is the boolean `_sheets_bool_value` reads (2026-10-14: `no`, `n`, `y`, `T`
-# and `F` read, `on`, `off`, `2` and `tru` refused). A value that cannot be read is a 400 before
-# the document is looked up.
-_DOCS_VIEW = "type.googleapis.com/google.apps.docs.v1"
-_DOCS_SUGGESTIONS_VIEW = protojson.Enum(
-    f"{_DOCS_VIEW}.SuggestionsViewMode",
-    (
-        "DEFAULT_FOR_CURRENT_ACCESS",
-        "SUGGESTIONS_INLINE",
-        "PREVIEW_SUGGESTIONS_ACCEPTED",
-        "PREVIEW_WITHOUT_SUGGESTIONS",
-    ),
-)
-_DOCS_COMMENTS_VIEW = protojson.Enum(
-    f"{_DOCS_VIEW}.CommentsViewMode",
-    (
-        "COMMENTS_VIEW_MODE_UNSPECIFIED",
-        "COMMENTS_VIEW_MODE_DEFAULT_FOR_CURRENT_ACCESS",
-        "COMMENTS_VIEW_MODE_OMITTED",
-        "COMMENTS_VIEW_MODE_INCLUDED",
-    ),
-)
-
-
-@router.get("/docs/v1/documents/{document_id}")
-async def docs_get(document_id: str, request: Request):
-    """The document as Docs structural elements: its stored body, or one ``paragraph`` per line of
-    its text when it states none (`backlot.gdocs`)."""
-    # The credential, then the typed values, then the lookup -- `_typed_query` records the order.
-    _require(request)
-    # Validated and then unused: the body is the same whatever a value that is read selects, where
-    # real's changes with it.
-    _typed_query(
-        request,
-        {
-            "suggestionsViewMode": lambda raw: _sheets_enum_value(
-                raw, "suggestions_view_mode", _DOCS_SUGGESTIONS_VIEW
-            ),
-            "includeTabsContent": lambda raw: _sheets_bool_value(raw, "include_tabs_content"),
-            "commentsViewMode": lambda raw: _sheets_enum_value(
-                raw, "comments_view_mode", _DOCS_COMMENTS_VIEW
-            ),
-        },
-    )
-    row = _editor_doc(request, document_id, expect="document")
-    body = store.gdrive_doc_body_for(auth.conn(request), document_id)
-    if body is None:
-        body = gdocs.from_text(row["content"] or "")
-    # Real's order for an untabbed read (docs.googleapis.com, 2026-10-16, twelve Docs, six owned by
-    # a Workspace member and six by a consumer account), the same under each `suggestionsViewMode`,
-    # `includeTabsContent=false` and a `fields` mask naming the members in another order
-    # (`documentId,title`, `revisionId,body,title`). Real also serves `headers` and `footers` after
-    # `body`, `lists` after `namedStyles` and `inlineObjects` before `documentId` when a Doc has
-    # them; this server serves none of the four.
-    return {
-        "title": row["title"],
-        "body": {"content": gdocs.indexed(body)},
-        "documentStyle": gdocs.document_style(),
-        "namedStyles": gdocs.named_styles(),
-        "revisionId": synth._digest(document_id)[:24],
-        "suggestionsViewMode": "SUGGESTIONS_INLINE",
-        "documentId": document_id,
-        # Last, where real serves it. Real's value for a read that asks for no comments, whatever
-        # `suggestionsViewMode` and `includeTabsContent` select (measured 2026-10-09 and
-        # 2026-10-15); `commentsViewMode=COMMENTS_VIEW_MODE_INCLUDED` beside the tabs and inline
-        # suggestions is answered `COMMENTS_VIEW_MODE_INCLUDED` there and this value here.
-        "commentsViewMode": "COMMENTS_VIEW_MODE_OMITTED",
-    }
-
-
 @router.get("/slides/v1/presentations/{presentation_id}")
 async def slides_get(presentation_id: str, request: Request):
     """The presentation as slides: one ``TEXT_BOX`` slide per blank-line-separated block of text."""
@@ -5056,6 +4982,6 @@ def _drive_page_size(sizes: list[int]) -> int:
     return min(size, get_settings().max_page_size)
 
 
-# The Sheets routes, registered on `router` by the module that holds them -- which imports this
-# one's helpers, so it is imported last.
-from backlot.routers import google_sheets  # noqa: E402, F401
+# The Sheets and Docs routes, registered on `router` by the modules that hold them -- which import
+# this one's helpers, so they are imported last.
+from backlot.routers import google_docs, google_sheets  # noqa: E402, F401
