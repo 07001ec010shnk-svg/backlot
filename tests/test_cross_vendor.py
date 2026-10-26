@@ -104,6 +104,11 @@ def test_unauthenticated_is_rejected(client):
     # Confluence refuses outright with its own 403. Both measured; see tests/test_atlassian.py.
     jira = client.get("/atlassian/rest/api/3/project/search")
     assert jira.status_code == 200 and jira.json()["values"] == []
+
+    # Jira search/jql requires a jql parameter
+    jira_search = client.get("/atlassian/rest/api/3/search/jql")
+    assert jira_search.status_code == 400
+    assert "jql" in jira_search.json()["errorMessages"][0]
     assert client.get("/atlassian/wiki/rest/api/space").status_code == 403
     slack = client.post("/slack/api/conversations.list").json()
     assert slack == {"ok": False, "error": "not_authed"}
