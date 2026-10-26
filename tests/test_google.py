@@ -1,6 +1,7 @@
 """Google APIs over HTTP: Gmail, Drive, and the Workspace editor reads (Docs/Sheets/Slides).
 
-One file because they are one router (``backlot/routers/google.py``) and one error envelope
+One file because they are one router (``routers.google.router``, Sheets' routes in
+``backlot/routers/google_sheets.py``) and one error envelope
 (``backlot/errors/google.py``) — Drive and Gmail share ``_gerr`` and the per-family status table, so
 splitting them would put two halves of the same contract in two places.
 """
@@ -8021,7 +8022,7 @@ def test_sheets_a_title_spelt_as_a_reference_is_quoted_in_either_notation():
     """Measured on sheets so named: `'A1'`, `'R1C1'` and `'RC'` echo quoted because the bare word
     reads as a cell, while `A` echoes bare — a lone column is no range. And a bare `R1` is the A1
     cell R1, not a row in R1C1 notation."""
-    from backlot.routers.google import _a1_classify, _a1_title
+    from backlot.routers.google_sheets import _a1_classify, _a1_title
 
     assert _a1_title("A1") == "'A1'"
     assert _a1_title("R1C1") == "'R1C1'"

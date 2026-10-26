@@ -2,7 +2,7 @@
 the rules for adding one.
 
 Every Sheets write loads a workbook, changes it here in memory, and saves it whole
-(`routers.google._sheets_save`), so an operation is a method on :class:`Workbook` rather than a
+(`routers.google_sheets._sheets_save`), so an operation is a method on :class:`Workbook` rather than a
 query. `spreadsheets.create` and `sheets.copyTo` add sheets through :meth:`Workbook.add_sheet`, as
 the requests `spreadsheets.batchUpdate` carries would.
 

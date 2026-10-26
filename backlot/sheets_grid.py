@@ -81,7 +81,7 @@ def _scalar(v):
     value the real API cannot hold.
 
     Narrow to ``float`` on purpose. Widening this to ``(int, float)`` would swallow ``bool``, which
-    is a subclass of ``int`` — the hazard ``routers.google._sheets_value`` guards against."""
+    is a subclass of ``int`` — the hazard ``routers.google_sheets._sheets_value`` guards against."""
     if not isinstance(v, float):
         return v
     return int(v) if v.is_integer() else v

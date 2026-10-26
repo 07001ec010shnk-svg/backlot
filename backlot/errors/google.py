@@ -370,7 +370,7 @@ def invalid_json(message: str) -> GoogleError:
 def internal_error() -> GoogleError:
     """Real's 500 on the Sheets data-filter reads, measured 2026-10-04: an enum number the proto
     does not declare in some fields, and a `ROW`, `COLUMN` or `SHEET` lookup beside a `spreadsheet`
-    location. ``routers.google._sheets_check_lookup`` and ``sheets_values_batch_get_by_data_filter``
+    location. ``routers.google_sheets._sheets_check_lookup`` and ``sheets_values_batch_get_by_data_filter``
     list which."""
     return GoogleError(500, "Internal error encountered.", reason="backendError", status="INTERNAL")
 
@@ -963,7 +963,7 @@ def jsonp_callback(request: Request) -> str | None:
     request out of the JSONP path along with the JSON one.
     That suppression is not Sheets' own: measured 2026-09-16, `alt=media` and `alt=zzz` beside a
     `callback` answer unwrapped on Drive, Gmail, Docs and Slides too, which is why `alt` is read
-    for every family here rather than only where ``routers.google._sheets_respond`` refuses the
+    for every family here rather than only where ``routers.google_sheets._sheets_respond`` refuses the
     value. Refusing it is still Sheets-only, and the four families that accept a format they cannot
     render where real answers a 400 are a gap of their own.
 
@@ -1220,7 +1220,7 @@ def rendered(
     Indented whatever `prettyPrint` says -- measured on Sheets, Docs, Drive, Gmail and Slides, an
     error came back two-space indented with no parameter, with `prettyPrint=false` and with
     `prettyPrint=true` alike, where a success under `prettyPrint=false` is compact. So the
-    parameter reaches the success path only (``routers.google._sheets_respond``) and nothing here
+    parameter reaches the success path only (``routers.google_sheets._sheets_respond``) and nothing here
     reads it.
 
     Wrapped only where ``validate_system_parameters`` checked `callback`, which is where a route
