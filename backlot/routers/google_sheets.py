@@ -1954,7 +1954,8 @@ def _sheets_writable(request: Request, spreadsheet_id: str) -> tuple:
     the caller 403. Of the files the caller can read, only its own may be written -- every grant
     here makes a reader (`routers.google._drive_file_capabilities`), and a reader's write is the
     same 403 ``The caller does not have permission``, measured on update, batchUpdate, clear,
-    batchClear and append. Both come ahead of a missing `valueInputOption` and of any check on the range."""
+    batchClear and append. Both come ahead of a missing `valueInputOption` and of any check on the
+    range."""
     row, sheets = _workbook(request, spreadsheet_id)
     if not _drive_owned_by(row["author_email"], _sheets_creator(request, _require(request))):
         raise gerr.permission_denied()
@@ -2699,8 +2700,8 @@ async def sheets_create(request: Request):
       (`gsheets.Workbook.default_title`), and titles collide without regard to case;
     * ``rowCount: 0`` is no row count, and the grid is 1000 x 26;
     * ``data`` is stored though the answer carries no grid;
-    * a ``locale`` not spelled as one of :data:`gsheets.LOCALES` is refused, a ``timeZone`` that names no zone is replaced by
-      `Etc/GMT`;
+    * a ``locale`` not spelled as one of :data:`gsheets.LOCALES` is refused, a ``timeZone`` that
+      names no zone is replaced by `Etc/GMT`;
     * the Drive file's ``parents`` is the caller's root, and its one permission the owner's.
 
     What a request states and this does not keep is listed in `docs/write-overlay.md`."""
