@@ -2716,6 +2716,25 @@ def _drive_trash(sql: str, params: list, trash) -> str:
     return sql + " AND (COALESCE(trashed, 0) = 0 OR lower(COALESCE(author_email, '')) = lower(?))"
 
 
+# Real Drive never reports a native Docs-editors file (a Doc, Sheet or Slide deck) under 1024 bytes:
+# measured 2026-10-26 against Drive v3 across 80 native files, the smallest `size` was 1024 and an
+# empty spreadsheet reported 1024 too.
+DRIVE_NATIVE_MIN_BYTES = 1024
+# The subtypes that floor applies to, and the subtype a Drive row stored without one is served as.
+DRIVE_NATIVE_SUBTYPES = ("document", "spreadsheet", "presentation")
+DRIVE_DEFAULT_SUBTYPE = "document"
+
+
+def drive_file_bytes(subtype: str | None, content: str | None) -> int:
+    """The ``size`` and ``quotaBytesUsed`` a non-folder Drive file serves: its UTF-8 byte length,
+    floored at :data:`DRIVE_NATIVE_MIN_BYTES` for a native file. :func:`drive_usage_bytes` sums the
+    same in SQL."""
+    nbytes = len((content or "").encode("utf-8"))
+    if (subtype or DRIVE_DEFAULT_SUBTYPE) in DRIVE_NATIVE_SUBTYPES:
+        return max(nbytes, DRIVE_NATIVE_MIN_BYTES)
+    return nbytes
+
+
 def drive_usage_bytes(conn, visible_ids=None) -> tuple[int, int]:
     """``(bytes stored, bytes in the trash)`` over the Drive files this caller can see — what
     ``about.get`` serves as ``storageQuota``. One query, so the quota costs a single scan.
@@ -2723,8 +2742,16 @@ def drive_usage_bytes(conn, visible_ids=None) -> tuple[int, int]:
     ``length(CAST(content AS BLOB))`` is deliberate: SQLite's ``length()`` on a TEXT column counts
     CHARACTERS, while the ``size`` every file resource carries is ``len(content.encode("utf-8"))``.
     Without the cast a corpus holding any non-ASCII text reports a quota smaller than the sum of
-    the sizes the same caller reads out of ``files.list`` — a divergence no client could explain."""
-    nbytes = "length(CAST(content AS BLOB))"
+    the sizes the same caller reads out of ``files.list`` — a divergence no client could explain.
+
+    A native file counts at least :data:`DRIVE_NATIVE_MIN_BYTES`, the floor its ``size`` carries,
+    so the quota stays the sum of the sizes ``files.list`` serves."""
+    raw = "COALESCE(length(CAST(content AS BLOB)), 0)"
+    native = ", ".join(f"'{s}'" for s in DRIVE_NATIVE_SUBTYPES)
+    nbytes = (
+        f"(CASE WHEN COALESCE(NULLIF(subtype, ''), '{DRIVE_DEFAULT_SUBTYPE}') IN ({native}) "
+        f"THEN MAX({raw}, {DRIVE_NATIVE_MIN_BYTES}) ELSE {raw} END)"
+    )
     sql = (
         f"SELECT COALESCE(SUM({nbytes}), 0), "
         f"COALESCE(SUM(CASE WHEN COALESCE(trashed, 0) = 1 THEN {nbytes} ELSE 0 END), 0) "

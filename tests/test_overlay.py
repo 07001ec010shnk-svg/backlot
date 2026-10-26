@@ -202,17 +202,22 @@ def test_written_sheets_are_read_for_their_file_alone_until_reset(sample_setting
 def test_a_drive_patch_reaches_every_drive_reader(sample_settings):
     # `content` and `updated_ts` are read by files.get, the folder listing's newest-first order,
     # the storage quota and search. The ledger is the oldest file in its folder, so leading the
-    # listing afterwards also shows the patched `updated_ts` comparing as an integer.
+    # listing afterwards also shows the patched `updated_ts` comparing as an integer. The written
+    # text is past the floor a native file's size carries (`store.DRIVE_NATIVE_MIN_BYTES`), so the
+    # quota moves with it.
     conn = store.connect_ro(sample_settings.db_path)
     overlay.attach(conn, overlay.name_for(object()))
     (ledger,) = _drive_files(conn, "Ledger With Gaps")
     assert store.list_drive_folder(conn, "finance")[0]["id"] != ledger["id"]
     used, _ = store.drive_usage_bytes(conn)
-    _write_sheet(conn, ledger["id"], [["zebra"]], "zebra", 4000000000)
+    text = "zebra " * 200
+    assert len(text) > store.DRIVE_NATIVE_MIN_BYTES
+    _write_sheet(conn, ledger["id"], [[text]], text, 4000000000)
     row = store.gdrive_by_id(conn, ledger["id"])
-    assert (row["content"], row["updated_ts"]) == ("zebra", 4000000000)
+    assert (row["content"], row["updated_ts"]) == (text, 4000000000)
     assert store.list_drive_folder(conn, "finance")[0]["id"] == ledger["id"]
-    assert store.drive_usage_bytes(conn)[0] == used - len(ledger["content"].encode()) + 5
+    before = store.drive_file_bytes(ledger["subtype"], ledger["content"])
+    assert store.drive_usage_bytes(conn)[0] == used - before + len(text)
     assert [h["id"] for h in store.search_documents(conn, "zebra", "google_drive")] == [
         ledger["id"]
     ]
