@@ -30,7 +30,9 @@ engine answers at 200 and marks (``backlot.graphql.engine.Result.raised``). The 
 the failure is Backlot's own, the status, the baseline's support state, the error code and the
 ``x-ratelimit-remaining`` header, so a code no rule names is classed by its status. A 501 from an
 operation Backlot serves is the vendor's own answer (Google's ``notImplemented``), so it is
-``client``, and so is each 5xx in ``_ANSWERED_5XX``, a vendor's answer to a wrong request.
+``client``, and so is a 505, S3's front door's answer to a target holding a space
+(``backlot.request_target._s3``), and each 5xx in ``_ANSWERED_5XX``, a vendor's answer to a wrong
+request.
 """
 
 from __future__ import annotations
@@ -85,6 +87,11 @@ _CONFLUENCE = [
     (r"No content found with id", "content_not_found"),
     (r"No space (found )?with key", "space_not_found"),
     (r"cql query parameter is required", "cql_required"),
+    (
+        r"Could not parse cql : |Expecting a value for operator |Missing closing parenthesis near "
+        r"|Unrecognised clause at : ",
+        "invalid_cql",
+    ),
     (r"^Unauthorized$", "unauthenticated"),
     (r"^null for uri: ", "no_endpoint"),
     (r"FORBIDDEN|^Current user not permitted to use Confluence", "forbidden"),
@@ -201,6 +208,6 @@ def error_class(
         return "rate_limit"
     if status in (401, 403) or (source == "slack" and code in _SLACK_AUTH):
         return "auth"
-    if status >= 500 and status != 501 and (source, code) not in _ANSWERED_5XX:
+    if status >= 500 and status not in (501, 505) and (source, code) not in _ANSWERED_5XX:
         return "internal"
     return "client"
