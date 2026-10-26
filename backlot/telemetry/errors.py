@@ -19,7 +19,7 @@ failure:
 | Class | The call failed because |
 |---|---|
 | ``unsupported`` | Backlot does not do this yet: the baseline records the operation as ``missing`` or ``refused``, or the GraphQL engine refused a filter |
-| ``internal`` | of a Backlot bug: its own failure, or a 5xx other than a vendor's answer (below) |
+| ``internal`` | of a Backlot bug: Backlot's own failure, or a 5xx other than a vendor's answer (both below) |
 | ``rate_limit`` | the vendor's rate limit was reached: a 429, or a 403 with ``x-ratelimit-remaining: 0`` as GitHub sends |
 | ``auth`` | the credential was missing, wrong, or not allowed: a 401 or 403, or Slack's auth errors, which it sends with a 200 |
 | ``client`` | the request was wrong: any other failure |
@@ -29,7 +29,9 @@ engine answers at 200 and marks (``backlot.graphql.engine.Result.raised``). The 
 the failure is Backlot's own, the status, the baseline's support state, the error code and the
 ``x-ratelimit-remaining`` header, so a code no rule names is classed by its status. A 501 from an
 operation Backlot serves is the vendor's own answer (Google's ``notImplemented``), so it is
-``client``, and so is each 5xx in ``_ANSWERED_5XX``, a vendor's answer to a wrong request.
+``client``, and so is a 505, S3's front door's answer to a target holding a space
+(``backlot.request_target._s3``), and each 5xx in ``_ANSWERED_5XX``, a vendor's answer to a wrong
+request.
 """
 
 from __future__ import annotations
@@ -84,6 +86,11 @@ _CONFLUENCE = [
     (r"No content found with id", "content_not_found"),
     (r"No space (found )?with key", "space_not_found"),
     (r"cql query parameter is required", "cql_required"),
+    (
+        r"Could not parse cql : |Expecting a value for operator |Missing closing parenthesis near "
+        r"|Unrecognised clause at : ",
+        "invalid_cql",
+    ),
     (r"^Unauthorized$", "unauthenticated"),
     (r"^null for uri: ", "no_endpoint"),
     (r"FORBIDDEN|^Current user not permitted to use Confluence", "forbidden"),
@@ -196,6 +203,6 @@ def error_class(
         return "rate_limit"
     if status in (401, 403) or (source == "slack" and code in _SLACK_AUTH):
         return "auth"
-    if status >= 500 and status != 501 and (source, code) not in _ANSWERED_5XX:
+    if status >= 500 and status not in (501, 505) and (source, code) not in _ANSWERED_5XX:
         return "internal"
     return "client"

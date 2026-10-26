@@ -4,6 +4,8 @@ test starts one."""
 
 from __future__ import annotations
 
+import ast
+import asyncio
 import base64
 import gzip
 import json
@@ -14,10 +16,12 @@ import threading
 import time
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
-from backlot import store
+import backlot
+from backlot import store, telemetry
 from backlot.config import get_settings
 from backlot.server import HELLO_CORPUS
 from backlot.telemetry import clients, enabled, errors, naming, notice, recorder
@@ -189,6 +193,23 @@ def test_each_way_to_start_a_server_can_turn_it_off(monkeypatch, hello, capsys):
     assert seen == [True, False, True, False, None, True, "0", False]
 
 
+def test_the_fidelity_probes_start_their_servers_with_telemetry_off():
+    # `backlot diff` starts a server to probe; its calls are not anyone's use of Backlot.
+    probes = Path(backlot.__file__).parent / "fidelity"
+    calls = [
+        (path.name, node)
+        for path in sorted(probes.rglob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", getattr(node.func, "id", None))
+        in ("serve", "serve_or_connect")
+    ]
+    assert calls
+    for name, call in calls:
+        off = [k for k in call.keywords if k.arg == "telemetry"]
+        assert off and isinstance(off[0].value, ast.Constant) and off[0].value.value is False, name
+
+
 def test_each_client_rule_names_the_headers_it_was_measured_from():
     assert [rule.label.partition("/")[0] for rule in clients._CLIENTS] == [
         "google-api-python-client",
@@ -234,6 +255,7 @@ def test_each_client_rule_names_the_headers_it_was_measured_from():
         ("slack", "implemented", 200, "internal_error", False, "client"),
         ("linear", "implemented", 200, "unsupported_filter", False, "unsupported"),
         ("gmail", "implemented", 501, "notImplemented", False, "client"),
+        ("s3", "implemented", 505, "HttpVersionNotSupported", False, "client"),
         ("gmail", "implemented", 503, "backendError", False, "internal"),
         ("fireflies", "unknown", 500, "INTERNAL_SERVER_ERROR", False, "client"),
         ("linear", "unknown", 500, "INTERNAL_SERVER_ERROR", False, "internal"),
@@ -640,10 +662,17 @@ def test_a_call_is_named_by_the_baseline(client, method, path, kwargs, expected)
             ("mutation", "unknown", 400, "GRAPHQL_VALIDATION_FAILED", "client"),
         ),
         ("{ issues {", None, ("unparsed", "unknown", 400, "GRAPHQL_PARSE_FAILED", "client")),
+        # Introspection is no vendor operation, so it is `extra` alone and leaves a field it
+        # rides with to name the support.
         (
             "{ __schema { queryType { name } } }",
             None,
-            ("query.__schema", "implemented", 200, None, None),
+            ("query.__schema", "extra", 200, None, None),
+        ),
+        (
+            "{ __typename issues(first: 1) { nodes { id } } }",
+            None,
+            ("query.__typename,issues", "implemented", 200, None, None),
         ),
     ],
 )
@@ -748,6 +777,10 @@ OLD_VERSION = {"X-GitHub-Api-Version": "1999-01-01"}
         ("GET", f"{W}/content?spaceKey=NOPE", {}, "space_not_found"),
         ("GET", f"{W}/space/NOPE", {}, "space_not_found"),
         ("GET", f"{W}/search", {}, "cql_required"),
+        ("GET", f"{W}/search?cql=%22", {}, "invalid_cql"),
+        ("GET", f"{W}/search?cql=type%3D", {}, "invalid_cql"),
+        ("GET", f"{W}/search?cql=%28type%3Dpage", {}, "invalid_cql"),
+        ("GET", f"{W}/search?cql=type%3Dpage+b", {}, "invalid_cql"),
         (
             "GET",
             f"{W}/space",
@@ -947,6 +980,47 @@ def test_a_403_with_a_window_left_is_auth(client):
 )
 def test_backlots_own_routes_are_not_counted(client, path, counted):
     assert len(_calls(lambda: client.get(path, headers=ADMIN))) == counted
+
+
+def test_a_request_carrying_the_internal_header_is_not_counted(client):
+    schema = {"query": "{ __schema { queryType { name } } }"}
+    marked = LINEAR | {telemetry.INTERNAL: "mcp"}
+    assert _calls(lambda: client.post("/linear/graphql", headers=marked, json=schema)) == []
+    # Without the header, the same document is a call like any other.
+    (call,) = _calls(lambda: client.post("/linear/graphql", headers=LINEAR, json=schema))
+    assert call["backlot.operation"] == "query.__schema"
+
+
+def test_backlot_mcp_counts_its_tool_calls_and_not_the_schema_it_reads_at_start(
+    client, monkeypatch
+):
+    pytest.importorskip("fastmcp")
+    import httpx2
+    from fastmcp import Client
+
+    import backlot.mcp
+
+    def read(url, *, headers=None, body=None):
+        return client.post("/linear/graphql", headers=headers, json=body).json()
+
+    asgi = httpx2.AsyncClient
+    monkeypatch.setattr(backlot.mcp, "_fetch_json", read)
+    monkeypatch.setattr(
+        httpx2,
+        "AsyncClient",
+        lambda **kw: asgi(transport=httpx2.ASGITransport(app=client.app), **kw),
+    )
+    creds = backlot.mcp.Credentials(
+        token=LINEAR["Authorization"], email=None, s3_access_key_id="k", s3_secret_access_key="s"
+    )
+
+    async def go():
+        server = backlot.mcp.graphql_server("http://testserver", creds, "linear", depth=1)
+        async with Client(server) as c:
+            await c.call_tool("teams", {})
+
+    calls = _calls(lambda: asyncio.run(go()))
+    assert [c["backlot.operation"] for c in calls] == ["query.teams"]
 
 
 def test_each_part_of_a_google_batch_is_a_call_of_its_own(client):

@@ -2312,6 +2312,78 @@ def linear_visible_labels(conn, visible_ids=None) -> list[str]:
     ]
 
 
+# A team key starts with a letter, and the number has no leading zero: `KEY-019` and `019` named
+# no issue on api.linear.app on 2026-10-22. The key and the number are ASCII, as real reads them:
+# `KEY-19` followed by U+0663 (an Arabic-Indic three) named KEY-19 on 2026-10-25, where `\d` would
+# read it as a digit.
+_LINEAR_SEARCH_KEY = r"[A-Za-z][A-Za-z0-9]*"
+_LINEAR_SEARCH_NUM = r"[1-9][0-9]*"
+# The identifier with its hyphen or one space at the start of the term, and then the term's end or
+# a character outside A-Z, a-z and 0-9.
+_LINEAR_SEARCH_OPENING = re.compile(
+    rf"({_LINEAR_SEARCH_KEY})[- ]({_LINEAR_SEARCH_NUM})(?![A-Za-z0-9])"
+)
+# The identifier with no separator, the number being the trailing digits, so `KEY19` is key `KEY`
+# and number `19` rather than key `KEY1` and number `9`.
+_LINEAR_SEARCH_JOINED = re.compile(rf"([A-Za-z][A-Za-z0-9]*?)({_LINEAR_SEARCH_NUM})")
+# What a term with a key loses from each end: what JavaScript's `String.prototype.trim` takes. On
+# 2026-10-25 api.linear.app read `KEY19` after a tab, U+00A0, U+2028, U+3000 or U+FEFF as KEY-19,
+# and after U+001C, U+001F, U+0085, U+180E or U+200B as no issue; `str.strip()` takes U+001C to
+# U+001F and U+0085 and leaves U+FEFF.
+_LINEAR_SEARCH_TRIMMED = "\t\n\x0b\x0c\r \xa0\u1680\u2028\u2029\u202f\u205f\u3000\ufeff" + "".join(
+    map(chr, range(0x2000, 0x200B))
+)
+# The number alone, with at most one space and that on one side.
+_LINEAR_SEARCH_BARE = re.compile(rf" ?({_LINEAR_SEARCH_NUM})|({_LINEAR_SEARCH_NUM}) ")
+
+
+def _linear_search_identifier(term: str) -> tuple[str | None, str] | None:
+    """The issue a ``searchIssues`` term names, as ``(key, number)`` with ``key`` None for a number
+    alone, or None when it names none.
+
+    Measured on api.linear.app on 2026-10-22 and 2026-10-25, over one team's issues. For a term with
+    a key, what :data:`_LINEAR_SEARCH_TRIMMED` holds goes from either end (`   KEY-19`, `KEY 19  `,
+    a tab or a no-break space before `KEY19`), and so does one pair of `"` or of `'` around the
+    whole of it (`"KEY-19"`, `'KEY-19'`, `"KEY19"`), where one quote alone, two pairs, brackets or
+    backticks around it named no issue. `KEY-N` or `KEY N` names that issue when the term ends there
+    or goes on with a character outside A-Z, a-z and 0-9: `KEY-19.`, `KEY-19;`, `KEY-19!`,
+    `KEY-19-`, `KEY-19_`, `KEY-19é`, `KEY 19,`, `KEY-19 probe` and `KEY-19.probe` named KEY-19, and
+    `KEY-19x`, `KEY 19x`, `KEY  19` and `KEY<TAB>19` none. `KEYN` names it only as the whole term
+    (`KEY19.` and `KEY19 probe` named none). The number alone names it with at most one space, on
+    one side: `19`, ` 19` and `19 ` named KEY-19, and ` 19 `, `  19`, `19.`, `"19"` and `19` after a
+    tab none."""
+    text = term.strip(_LINEAR_SEARCH_TRIMMED)
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    named = _LINEAR_SEARCH_OPENING.match(text) or _LINEAR_SEARCH_JOINED.fullmatch(text)
+    if named:
+        return named.group(1), named.group(2)
+    bare = _LINEAR_SEARCH_BARE.fullmatch(term)
+    if bare:
+        return None, bare.group(1) or bare.group(2)
+    return None
+
+
+def _linear_identifier_ids(conn, key: str | None, number: str) -> list[str]:
+    """Ids whose identifier ends in ``-number``, and whose key is ``key`` when one is given.
+
+    A bare number is every issue the later ACL and ``team`` clauses still allow. The workspace
+    measured on 2026-10-22 had one team, so which team a bare number belongs to is unmeasured;
+    dropping one of two visible issues numbered the same would be the guess that hides a match
+    the caller can already see. ``teamId`` still narrows them, through the clause the search
+    applies after this."""
+    sql = (
+        "SELECT id FROM linear_issues "
+        "WHERE instr(identifier, '-') > 0 "
+        "AND substr(identifier, instr(identifier, '-') + 1) = ?"
+    )
+    params: list = [number]
+    if key is not None:
+        sql += " AND lower(substr(identifier, 1, instr(identifier, '-') - 1)) = lower(?)"
+        params.append(key)
+    return [row[0] for row in conn.execute(sql, params)]
+
+
 def search_linear_issues(
     conn,
     term: str,
@@ -2326,17 +2398,17 @@ def search_linear_issues(
     """``searchIssues``: every matching issue as ``(id, score)`` in the order served, and the count
     ``totalCount`` reports.
 
-    An issue matches when its identifier is ``term`` (any case), when a space-separated word of
-    ``term`` starts a word of its title or description, read through the porter-stemmed index with
-    a hyphenated word as the phrase it spells (measured 2026-10-22: `prob`, `pro` and `chil` matched
-    where `robe` did not, and `BRE-2` did not match a title holding `(child 2)`), or, with
-    ``include_comments``, when one of its comments contains a word. That count leaves
-    ``prefilter`` out, as api.linear.app's did on 2026-10-22: a `filter` narrowed the nodes and left
-    `totalCount` at the unfiltered total.
+    An issue matches when the term names its identifier (see :func:`_linear_search_identifier`),
+    when a space-separated word of ``term`` starts a word of its title or description, read
+    through the porter-stemmed index with a hyphenated word as the phrase it spells (measured
+    2026-10-22: `prob`, `pro` and `chil` matched where `robe` did not, and `BRE-2` did not match
+    a title holding `(child 2)`), or, with ``include_comments``, when one of its comments
+    contains a word. That count leaves ``prefilter`` out, as api.linear.app's did on 2026-10-22:
+    a `filter` narrowed the nodes and left `totalCount` at the unfiltered total.
 
     ``score`` is 1 for the identifier, as real's was, and ``|bm25| / (1 + |bm25|)`` for an index
     match, so it falls between 0 and 1 and orders as the rank does; a comment-only match scores 0.
-    Real's own scores are not reproducible."""
+    Real's own word scores are not reproducible."""
     words = re.findall(r"\w+", term.lower())
     # Each kind of match is collected on its own and the candidates are scoped afterwards: an FTS
     # MATCH joined into a scan of the issues is re-run per issue.
@@ -2358,17 +2430,8 @@ def search_linear_issues(
             f"SELECT DISTINCT issue_id FROM linear_comments WHERE {found}", words
         ):
             ranks.setdefault(row[0], None)
-    key, sep, suffix = term.strip().partition("-")
-    spellings = list(
-        dict.fromkeys((term.strip(), f"{key.upper()}{sep}{suffix}", term.strip().upper()))
-    )
-    exact = {
-        r[0]
-        for r in conn.execute(
-            f"SELECT id FROM linear_issues WHERE identifier IN ({','.join('?' * len(spellings))})",
-            spellings,
-        )
-    }
+    named = _linear_search_identifier(term)
+    exact = set(_linear_identifier_ids(conn, *named)) if named is not None else set()
     for issue_id in exact:
         ranks.setdefault(issue_id, None)
     where = " WHERE id IN (SELECT value FROM json_each(?))"
@@ -2537,6 +2600,25 @@ def _drive_trash(sql: str, params: list, trash) -> str:
     return sql + " AND (COALESCE(trashed, 0) = 0 OR lower(COALESCE(author_email, '')) = lower(?))"
 
 
+# Real Drive never reports a native Docs-editors file (a Doc, Sheet or Slide deck) under 1024 bytes:
+# measured 2026-10-26 against Drive v3 across 80 native files, the smallest `size` was 1024 and an
+# empty spreadsheet reported 1024 too.
+DRIVE_NATIVE_MIN_BYTES = 1024
+# The subtypes that floor applies to, and the subtype a Drive row stored without one is served as.
+DRIVE_NATIVE_SUBTYPES = ("document", "spreadsheet", "presentation")
+DRIVE_DEFAULT_SUBTYPE = "document"
+
+
+def drive_file_bytes(subtype: str | None, content: str | None) -> int:
+    """The ``size`` and ``quotaBytesUsed`` a non-folder Drive file serves: its UTF-8 byte length,
+    floored at :data:`DRIVE_NATIVE_MIN_BYTES` for a native file. :func:`drive_usage_bytes` sums the
+    same in SQL."""
+    nbytes = len((content or "").encode("utf-8"))
+    if (subtype or DRIVE_DEFAULT_SUBTYPE) in DRIVE_NATIVE_SUBTYPES:
+        return max(nbytes, DRIVE_NATIVE_MIN_BYTES)
+    return nbytes
+
+
 def drive_usage_bytes(conn, visible_ids=None) -> tuple[int, int]:
     """``(bytes stored, bytes in the trash)`` over the Drive files this caller can see — what
     ``about.get`` serves as ``storageQuota``. One query, so the quota costs a single scan.
@@ -2544,8 +2626,16 @@ def drive_usage_bytes(conn, visible_ids=None) -> tuple[int, int]:
     ``length(CAST(content AS BLOB))`` is deliberate: SQLite's ``length()`` on a TEXT column counts
     CHARACTERS, while the ``size`` every file resource carries is ``len(content.encode("utf-8"))``.
     Without the cast a corpus holding any non-ASCII text reports a quota smaller than the sum of
-    the sizes the same caller reads out of ``files.list`` — a divergence no client could explain."""
-    nbytes = "length(CAST(content AS BLOB))"
+    the sizes the same caller reads out of ``files.list`` — a divergence no client could explain.
+
+    A native file counts at least :data:`DRIVE_NATIVE_MIN_BYTES`, the floor its ``size`` carries,
+    so the quota stays the sum of the sizes ``files.list`` serves."""
+    raw = "COALESCE(length(CAST(content AS BLOB)), 0)"
+    native = ", ".join(f"'{s}'" for s in DRIVE_NATIVE_SUBTYPES)
+    nbytes = (
+        f"(CASE WHEN COALESCE(NULLIF(subtype, ''), '{DRIVE_DEFAULT_SUBTYPE}') IN ({native}) "
+        f"THEN MAX({raw}, {DRIVE_NATIVE_MIN_BYTES}) ELSE {raw} END)"
+    )
     sql = (
         f"SELECT COALESCE(SUM({nbytes}), 0), "
         f"COALESCE(SUM(CASE WHEN COALESCE(trashed, 0) = 1 THEN {nbytes} ELSE 0 END), 0) "
